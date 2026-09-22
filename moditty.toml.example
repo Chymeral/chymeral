@@ -1,0 +1,27 @@
+[terminal.font]
+source = "system"
+family = "monospace"
+size = 16.0
+line_height = 20.0
+cell_width = "auto"
+
+# Para cargar cualquier fuente que admita el motor desde un archivo local:
+# source = "file"
+# path = "/ruta/absoluta/a/mi-fuente.otf"
+# face_index = 0
+
+[terminal.foreground]
+# Color predeterminado del texto que no especifica un color ANSI.
+color = "#E5E7EB"
+
+[terminal.background]
+kind = "color"
+color = "#090B0F"
+opacity = 0.92
+
+# Para usar una imagen en lugar del color:
+# kind = "image"
+# path = "fondos/aurora.gif"
+# opacity = 0.72
+# fit = "cover"
+# fit también puede ser "contain" o "stretch"
