@@ -11,6 +11,8 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::UserEvent;
 
+const OUTPUT_QUEUE_CAPACITY: usize = 64;
+
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -22,9 +24,7 @@ impl Pty {
     pub fn spawn(size: PtySize, event_proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size).context("could not create a PTY")?;
-        let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-        let mut command = CommandBuilder::new(shell);
-        command.arg("-l");
+        let mut command = default_shell_command();
         command.env("TERM", "xterm-256color");
 
         let child = pair
@@ -41,7 +41,7 @@ impl Pty {
             .master
             .take_writer()
             .context("could not write to the PTY")?;
-        let (sender, output) = mpsc::channel();
+        let (sender, output) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
 
         thread::Builder::new()
             .name("moditty-pty-reader".to_owned())
@@ -89,6 +89,25 @@ impl Pty {
 
     pub fn drain_output(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
         std::iter::from_fn(|| self.output.try_recv().ok())
+    }
+}
+
+fn default_shell_command() -> CommandBuilder {
+    if let Some(shell) = env::var_os("MODITTY_SHELL") {
+        return CommandBuilder::new(shell);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        CommandBuilder::new(env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+        let mut command = CommandBuilder::new(shell);
+        command.arg("-l");
+        command
     }
 }
 

@@ -1,3 +1,6 @@
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+compile_error!("Moditty currently supports only Linux and Windows.");
+
 mod background;
 mod config;
 mod pty;
@@ -14,8 +17,8 @@ use portable_pty::PtySize;
 use wgpu::{
     CommandEncoderDescriptor, CompositeAlphaMode, DeviceDescriptor, Instance, InstanceDescriptor,
     LoadOp, MultisampleState, Operations, PresentMode, RenderPassColorAttachment,
-    RenderPassDescriptor, RequestAdapterOptions, SurfaceColorSpace, SurfaceConfiguration,
-    TextureFormat, TextureUsages, TextureViewDescriptor,
+    RenderPassDescriptor, RequestAdapterOptions, SurfaceCapabilities, SurfaceColorSpace,
+    SurfaceConfiguration, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 use winit::{
     application::ApplicationHandler,
@@ -35,7 +38,8 @@ use crate::{
 
 const WINDOW_WIDTH: u32 = 960;
 const WINDOW_HEIGHT: u32 = 640;
-const PADDING: u32 = 12;
+const PADDING: f64 = 12.0;
+const MAX_PTY_CHUNKS_PER_UPDATE: usize = 64;
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -48,6 +52,7 @@ struct WindowState {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: SurfaceConfiguration,
+    scale_factor: f64,
     font: FontAppearance,
     foreground: Rgb,
     font_family: String,
@@ -71,7 +76,8 @@ impl WindowState {
         appearance: Appearance,
     ) -> Result<Self> {
         let physical_size = window.inner_size();
-        let (columns, rows) = grid_size(physical_size, &appearance.font);
+        let scale_factor = window.scale_factor();
+        let (columns, rows) = grid_size(physical_size, &appearance.font, scale_factor);
         let terminal = Terminal::new(
             columns,
             rows,
@@ -97,6 +103,7 @@ impl WindowState {
             .create_surface(window.clone())
             .context("could not create a rendering surface")?;
         let surface_capabilities = surface.get_capabilities(&adapter);
+        let surface_format = select_surface_format(&surface_capabilities)?;
         let alpha_mode = if appearance.background.requires_window_transparency() {
             surface_capabilities
                 .alpha_modes
@@ -116,10 +123,10 @@ impl WindowState {
         }
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
-            format: TextureFormat::Bgra8UnormSrgb,
+            format: surface_format,
             width: physical_size.width.max(1),
             height: physical_size.height.max(1),
-            present_mode: PresentMode::Fifo,
+            present_mode: select_present_mode(&surface_capabilities)?,
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -136,7 +143,7 @@ impl WindowState {
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
         let mut text_buffer = Buffer::new(
             &mut font_system,
-            Metrics::new(appearance.font.size, appearance.font.line_height),
+            physical_font_metrics(&appearance.font, scale_factor),
         );
         text_buffer.set_wrap(Wrap::None);
         let background =
@@ -148,6 +155,7 @@ impl WindowState {
             queue,
             surface,
             surface_config,
+            scale_factor,
             font: appearance.font,
             foreground: appearance.foreground.color,
             font_family,
@@ -167,13 +175,20 @@ impl WindowState {
     }
 
     fn read_pty_output(&mut self) -> bool {
-        let chunks: Vec<_> = self.pty.drain_output().collect();
+        let chunks: Vec<_> = self
+            .pty
+            .drain_output()
+            .take(MAX_PTY_CHUNKS_PER_UPDATE)
+            .collect();
         if chunks.is_empty() {
             return false;
         }
 
         for chunk in chunks {
             self.terminal.advance(&chunk);
+            for response in self.terminal.take_responses() {
+                self.write_input(&response);
+            }
         }
         self.sync_terminal_text();
         true
@@ -185,8 +200,9 @@ impl WindowState {
         }
 
         let spans = self.terminal.render_spans();
-        let width = self.surface_config.width.saturating_sub(PADDING * 2) as f32;
-        let height = self.surface_config.height.saturating_sub(PADDING * 2) as f32;
+        let padding = physical_padding(self.scale_factor);
+        let width = self.surface_config.width.saturating_sub(padding * 2) as f32;
+        let height = self.surface_config.height.saturating_sub(padding * 2) as f32;
         self.text_buffer.set_size(Some(width), Some(height));
         let default_attributes = Attrs::new().family(Family::Name(&self.font_family));
         self.text_buffer.set_rich_text(
@@ -231,7 +247,7 @@ impl WindowState {
         self.surface_config.height = size.height;
         self.surface.configure(&self.device, &self.surface_config);
 
-        let (columns, rows) = grid_size(size, &self.font);
+        let (columns, rows) = grid_size(size, &self.font, self.scale_factor);
         self.terminal.resize(columns, rows);
         if let Err(error) = self.pty.resize(pty_size(columns, rows, size)) {
             eprintln!("Moditty: {error:#}");
@@ -239,6 +255,13 @@ impl WindowState {
         self.background.resize(&self.queue, &self.surface_config);
         self.sync_terminal_text();
         self.window.request_redraw();
+    }
+
+    fn scale_factor_changed(&mut self, scale_factor: f64) {
+        self.scale_factor = scale_factor;
+        self.text_buffer
+            .set_metrics(physical_font_metrics(&self.font, scale_factor));
+        self.resize(self.window.inner_size());
     }
 
     fn write_input(&self, bytes: &[u8]) {
@@ -264,16 +287,24 @@ impl WindowState {
             &self.viewport,
             [TextArea {
                 buffer: &self.text_buffer,
-                left: PADDING as f32,
-                top: PADDING as f32,
+                left: physical_padding(self.scale_factor) as f32,
+                top: physical_padding(self.scale_factor) as f32,
                 scale: 1.0,
                 bounds: TextBounds {
-                    left: PADDING as i32,
-                    top: PADDING as i32,
-                    right: i32::try_from(self.surface_config.width.saturating_sub(PADDING))
-                        .unwrap_or(i32::MAX),
-                    bottom: i32::try_from(self.surface_config.height.saturating_sub(PADDING))
-                        .unwrap_or(i32::MAX),
+                    left: i32::try_from(physical_padding(self.scale_factor)).unwrap_or(i32::MAX),
+                    top: i32::try_from(physical_padding(self.scale_factor)).unwrap_or(i32::MAX),
+                    right: i32::try_from(
+                        self.surface_config
+                            .width
+                            .saturating_sub(physical_padding(self.scale_factor)),
+                    )
+                    .unwrap_or(i32::MAX),
+                    bottom: i32::try_from(
+                        self.surface_config
+                            .height
+                            .saturating_sub(physical_padding(self.scale_factor)),
+                    )
+                    .unwrap_or(i32::MAX),
                 },
                 default_color: Color::rgb(
                     self.foreground.red,
@@ -421,8 +452,8 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Resized(size) => self.with_state(|state| state.resize(size)),
-            WindowEvent::ScaleFactorChanged { .. } => {
-                self.with_state(|state| state.resize(state.window.inner_size()))
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.with_state(|state| state.scale_factor_changed(scale_factor))
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(bytes) = terminal_input(&event, self.modifiers) {
@@ -455,16 +486,50 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
     }
 }
 
-fn grid_size(size: PhysicalSize<u32>, font: &FontAppearance) -> (u16, u16) {
-    let width = size.width.saturating_sub(PADDING * 2);
-    let height = size.height.saturating_sub(PADDING * 2);
-    let columns = ((width as f32 / font.resolved_cell_width()).floor() as u32).max(1);
-    let rows = ((height as f32 / font.line_height).floor() as u32).max(1);
+fn grid_size(size: PhysicalSize<u32>, font: &FontAppearance, scale_factor: f64) -> (u16, u16) {
+    let padding = physical_padding(scale_factor);
+    let width = size.width.saturating_sub(padding * 2);
+    let height = size.height.saturating_sub(padding * 2);
+    let scale_factor = scale_factor as f32;
+    let columns =
+        ((width as f32 / (font.resolved_cell_width() * scale_factor)).floor() as u32).max(1);
+    let rows = ((height as f32 / (font.line_height * scale_factor)).floor() as u32).max(1);
 
     (
         u16::try_from(columns).unwrap_or(u16::MAX),
         u16::try_from(rows).unwrap_or(u16::MAX),
     )
+}
+
+fn physical_font_metrics(font: &FontAppearance, scale_factor: f64) -> Metrics {
+    let scale_factor = scale_factor as f32;
+    Metrics::new(font.size * scale_factor, font.line_height * scale_factor)
+}
+
+fn physical_padding(scale_factor: f64) -> u32 {
+    (PADDING * scale_factor)
+        .round()
+        .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+fn select_surface_format(capabilities: &SurfaceCapabilities) -> Result<TextureFormat> {
+    capabilities
+        .formats
+        .iter()
+        .copied()
+        .find(TextureFormat::is_srgb)
+        .or_else(|| capabilities.formats.first().copied())
+        .context("the selected GPU surface does not expose a usable texture format")
+}
+
+fn select_present_mode(capabilities: &SurfaceCapabilities) -> Result<PresentMode> {
+    capabilities
+        .present_modes
+        .iter()
+        .copied()
+        .find(|mode| *mode == PresentMode::Fifo)
+        .or_else(|| capabilities.present_modes.first().copied())
+        .context("the selected GPU surface does not expose a presentation mode")
 }
 
 fn pty_size(columns: u16, rows: u16, size: PhysicalSize<u32>) -> PtySize {
@@ -518,6 +583,7 @@ fn text_input(character: &str, modifiers: ModifiersState) -> Option<Vec<u8>> {
 
 fn named_key_input(key: NamedKey) -> Option<Vec<u8>> {
     let bytes = match key {
+        NamedKey::Space => b" ".as_slice(),
         NamedKey::Enter => b"\r".as_slice(),
         NamedKey::Tab => b"\t".as_slice(),
         NamedKey::Backspace => b"\x7f".as_slice(),
@@ -547,21 +613,46 @@ fn configure_font_system(font: &FontAppearance) -> Result<(FontSystem, String)> 
                 .db_mut()
                 .load_font_file(path)
                 .with_context(|| format!("could not load font file {}", path.display()))?;
-            font_system
+            let selected_face = font_system
                 .db()
                 .faces()
                 .skip(existing_faces)
                 .find(|face| face.index == *face_index)
-                .or_else(|| font_system.db().faces().nth(existing_faces))
-                .and_then(|face| face.families.first())
-                .map(|(family, _)| family.clone())
+                .cloned()
                 .with_context(|| {
                     format!(
-                        "font file {} did not provide a usable face at index {}",
+                        "font file {} does not contain face index {}",
                         path.display(),
                         face_index
                     )
-                })?
+                })?;
+            let family = selected_face
+                .families
+                .first()
+                .map(|(family, _)| family.clone())
+                .with_context(|| {
+                    format!(
+                        "font file {} does not provide a usable family for face index {}",
+                        path.display(),
+                        face_index
+                    )
+                })?;
+            let conflicting_faces = font_system
+                .db()
+                .faces()
+                .filter(|face| {
+                    face.id != selected_face.id
+                        && face
+                            .families
+                            .iter()
+                            .any(|(candidate, _)| candidate == &family)
+                })
+                .map(|face| face.id)
+                .collect::<Vec<_>>();
+            for face in conflicting_faces {
+                font_system.db_mut().remove_face(face);
+            }
+            family
         }
     };
 
@@ -580,4 +671,48 @@ fn main() -> Result<()> {
     event_loop
         .run_app(&mut app)
         .context("event loop terminated unexpectedly")
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::{PresentMode, SurfaceCapabilities, TextureFormat};
+    use winit::dpi::PhysicalSize;
+    use winit::keyboard::NamedKey;
+
+    use crate::{
+        config::Appearance, grid_size, named_key_input, select_present_mode, select_surface_format,
+    };
+
+    #[test]
+    fn keeps_the_same_grid_for_the_same_logical_window_size() {
+        let font = Appearance::default().font;
+
+        assert_eq!(
+            grid_size(PhysicalSize::new(960, 640), &font, 1.0),
+            grid_size(PhysicalSize::new(1920, 1280), &font, 2.0),
+        );
+    }
+
+    #[test]
+    fn prefers_an_srgb_surface_format_and_fifo_presentation() {
+        let capabilities = SurfaceCapabilities {
+            formats: vec![TextureFormat::Rgba8Unorm, TextureFormat::Bgra8UnormSrgb],
+            present_modes: vec![PresentMode::Immediate, PresentMode::Fifo],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_surface_format(&capabilities).unwrap(),
+            TextureFormat::Bgra8UnormSrgb,
+        );
+        assert_eq!(
+            select_present_mode(&capabilities).unwrap(),
+            PresentMode::Fifo
+        );
+    }
+
+    #[test]
+    fn sends_space_for_the_named_space_key() {
+        assert_eq!(named_key_input(NamedKey::Space), Some(vec![b' ']));
+    }
 }

@@ -305,12 +305,16 @@ impl Grid {
     }
 
     fn cursor_down(&mut self, count: u16) {
-        self.cursor.row = (self.cursor.row + count).min(self.rows - 1);
+        self.cursor.row = self.cursor.row.saturating_add(count).min(self.rows - 1);
         self.wrap_pending = false;
     }
 
     fn cursor_forward(&mut self, count: u16) {
-        self.cursor.column = (self.cursor.column + count).min(self.columns - 1);
+        self.cursor.column = self
+            .cursor
+            .column
+            .saturating_add(count)
+            .min(self.columns - 1);
         self.wrap_pending = false;
     }
 
@@ -370,7 +374,11 @@ impl Grid {
     }
 
     fn erase_characters(&mut self, count: u16) {
-        let end = (self.cursor.column + count.saturating_sub(1)).min(self.columns - 1);
+        let end = self
+            .cursor
+            .column
+            .saturating_add(count.saturating_sub(1))
+            .min(self.columns - 1);
         for column in self.cursor.column..=end {
             self.clear_cell(column, self.cursor.row);
         }
@@ -479,7 +487,7 @@ impl Grid {
             );
         }
 
-        let next_column = self.cursor.column + width;
+        let next_column = self.cursor.column.saturating_add(width);
         if next_column >= self.columns {
             self.cursor.column = self.columns - 1;
             self.wrap_pending = true;
@@ -719,6 +727,7 @@ struct TerminalState {
     active: ActiveScreen,
     primary_cursor_before_alternate: Cursor,
     title: String,
+    responses: Vec<Vec<u8>>,
 }
 
 impl TerminalState {
@@ -729,6 +738,7 @@ impl TerminalState {
             active: ActiveScreen::Primary,
             primary_cursor_before_alternate: Cursor::default(),
             title: String::new(),
+            responses: Vec::new(),
         }
     }
 
@@ -757,6 +767,7 @@ impl TerminalState {
         self.active = ActiveScreen::Primary;
         self.primary_cursor_before_alternate = Cursor::default();
         self.title.clear();
+        self.responses.clear();
     }
 
     fn enter_alternate_screen(&mut self) {
@@ -836,6 +847,13 @@ impl Perform for TerminalState {
                 'l' if parameters.contains(&7) => self.active_grid_mut().auto_wrap = false,
                 _ => {}
             }
+            return;
+        }
+
+        if action == 'n' && parameters.as_slice() == [6] {
+            let cursor = self.active_grid().cursor;
+            self.responses
+                .push(format!("\x1b[{};{}R", cursor.row + 1, cursor.column + 1).into_bytes());
             return;
         }
 
@@ -928,6 +946,10 @@ impl Terminal {
         std::mem::take(&mut self.dirty)
     }
 
+    pub(crate) fn take_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.state.responses)
+    }
+
     pub(crate) fn render_spans(&self) -> Vec<TextSpan> {
         self.state.active_grid().text_spans(true)
     }
@@ -978,6 +1000,14 @@ mod tests {
         terminal.advance(b"abcde\x1b[1;3H!\x1b[0K");
 
         assert_eq!(row(&terminal, 0), "ab!  ");
+    }
+
+    #[test]
+    fn responds_to_cursor_position_requests() {
+        let mut terminal = terminal(5, 3);
+        terminal.advance(b"\x1b[2;3H\x1b[6n");
+
+        assert_eq!(terminal.take_responses(), vec![b"\x1b[2;3R".to_vec()]);
     }
 
     #[test]
@@ -1051,5 +1081,14 @@ mod tests {
         assert_eq!(spans[0].text, "red");
         assert!(spans[1].text.starts_with("plainagain"));
         assert_eq!(spans[1].color, foreground);
+    }
+
+    #[test]
+    fn clamps_large_csi_counts_without_overflowing() {
+        let mut terminal = terminal(5, 2);
+        terminal.advance(b"\x1b[4C\x1b[65535C!\x1b[2;5H\x1b[65535B?");
+
+        assert_eq!(row(&terminal, 0), "    !");
+        assert_eq!(row(&terminal, 1), "    ?");
     }
 }

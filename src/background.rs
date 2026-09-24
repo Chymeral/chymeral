@@ -7,7 +7,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use image::{AnimationDecoder, DynamicImage, codecs::gif::GifDecoder};
+use image::{
+    AnimationDecoder, DynamicImage, ImageDecoder, ImageReader, Limits, codecs::gif::GifDecoder,
+};
 use wgpu::{
     AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
     BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, BlendState,
@@ -22,6 +24,11 @@ use wgpu::{
 };
 
 use crate::config::{Background, ImageFit, Rgb};
+
+const MAX_IMAGE_DIMENSION: u32 = 8_192;
+const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_GIF_FRAMES: usize = 300;
+const MAX_GIF_BYTES: u64 = 128 * 1024 * 1024;
 
 const IMAGE_SHADER: &str = r#"
 struct ImageTransform {
@@ -162,7 +169,11 @@ impl ImageBackground {
         opacity: f32,
         fit: ImageFit,
     ) -> Result<Self> {
-        let decoded = DecodedImage::load(path, opacity)?;
+        let max_dimension = device
+            .limits()
+            .max_texture_dimension_2d
+            .min(MAX_IMAGE_DIMENSION);
+        let decoded = DecodedImage::load(path, opacity, max_dimension)?;
         let texture = device.create_texture(&TextureDescriptor {
             label: Some("moditty background image"),
             size: decoded.size,
@@ -294,54 +305,74 @@ struct ImageFrame {
 }
 
 impl DecodedImage {
-    fn load(path: &Path, opacity: f32) -> Result<Self> {
+    fn load(path: &Path, opacity: f32, max_dimension: u32) -> Result<Self> {
         let is_gif = path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"));
         if is_gif {
-            return Self::load_gif(path, opacity);
+            return Self::load_gif(path, opacity, max_dimension);
         }
 
-        let image = image::open(path)
+        let mut reader = ImageReader::open(path)
+            .with_context(|| format!("could not open background image {}", path.display()))?;
+        reader.limits(image_limits(max_dimension));
+        let image = reader
+            .decode()
             .with_context(|| format!("could not decode background image {}", path.display()))?;
         Self::from_static_image(image, opacity)
     }
 
-    fn load_gif(path: &Path, opacity: f32) -> Result<Self> {
+    fn load_gif(path: &Path, opacity: f32, max_dimension: u32) -> Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("could not open background image {}", path.display()))?;
-        let decoder = GifDecoder::new(BufReader::new(file))
+        let mut decoder = GifDecoder::new(BufReader::new(file))
             .with_context(|| format!("could not decode GIF background {}", path.display()))?;
-        let frames = decoder
-            .into_frames()
-            .collect_frames()
-            .with_context(|| format!("could not read GIF frames from {}", path.display()))?;
-        let Some(first_frame) = frames.first() else {
-            bail!("background GIF {} contains no frames", path.display());
-        };
-        let width = first_frame.buffer().width();
-        let height = first_frame.buffer().height();
-        if width == 0 || height == 0 {
-            bail!("background GIF {} has an empty frame", path.display());
-        }
+        decoder
+            .set_limits(image_limits(max_dimension))
+            .with_context(|| format!("background GIF {} exceeds image limits", path.display()))?;
 
-        let mut decoded_frames = Vec::with_capacity(frames.len());
-        for frame in frames {
+        let mut width = 0;
+        let mut height = 0;
+        let mut total_bytes = 0_u64;
+        let mut decoded_frames = Vec::new();
+        for frame in decoder.into_frames() {
+            if decoded_frames.len() == MAX_GIF_FRAMES {
+                bail!(
+                    "background GIF {} exceeds the {MAX_GIF_FRAMES}-frame limit",
+                    path.display()
+                );
+            }
+            let frame = frame
+                .with_context(|| format!("could not read GIF frames from {}", path.display()))?;
             let delay = frame_delay(frame.delay().numer_denom_ms());
             let buffer = frame.into_buffer();
-            if buffer.width() != width || buffer.height() != height {
+            if decoded_frames.is_empty() {
+                width = buffer.width();
+                height = buffer.height();
+                if width == 0 || height == 0 {
+                    bail!("background GIF {} has an empty frame", path.display());
+                }
+            } else if buffer.width() != width || buffer.height() != height {
                 bail!(
                     "background GIF {} has inconsistent frame dimensions",
                     path.display()
                 );
             }
             let mut pixels = buffer.into_raw();
+            total_bytes = total_bytes
+                .checked_add(u64::try_from(pixels.len()).unwrap_or(u64::MAX))
+                .filter(|total| *total <= MAX_GIF_BYTES)
+                .context("background GIF exceeds the memory limit")?;
             premultiply_alpha(&mut pixels, opacity);
             decoded_frames.push(ImageFrame {
                 pixels,
                 duration: delay,
             });
+        }
+
+        if decoded_frames.is_empty() {
+            bail!("background GIF {} contains no frames", path.display());
         }
 
         Ok(Self {
@@ -376,6 +407,14 @@ impl DecodedImage {
             }],
         })
     }
+}
+
+fn image_limits(max_dimension: u32) -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(max_dimension);
+    limits.max_image_height = Some(max_dimension);
+    limits.max_alloc = Some(MAX_IMAGE_BYTES);
+    limits
 }
 
 fn background_bind_group_layout(device: &Device) -> BindGroupLayout {
@@ -497,7 +536,7 @@ fn transform_bytes(transform: [f32; 4]) -> [u8; 16] {
 }
 
 fn premultiply_alpha(pixels: &mut [u8], opacity: f32) {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let alpha = f32::from(pixel[3]) / 255.0 * opacity;
         pixel[0] = (f32::from(pixel[0]) * alpha).round() as u8;
         pixel[1] = (f32::from(pixel[1]) * alpha).round() as u8;
@@ -521,7 +560,7 @@ mod tests {
 
     use image::{Delay, Frame, Rgba, RgbaImage, codecs::gif::GifEncoder};
 
-    use super::{DecodedImage, ImageFit, image_transform, premultiply_alpha};
+    use super::{DecodedImage, ImageFit, MAX_IMAGE_DIMENSION, image_transform, premultiply_alpha};
 
     #[test]
     fn cover_crops_the_wider_axis() {
@@ -568,7 +607,7 @@ mod tests {
             .encode_frames([first, second])
             .unwrap();
 
-        let decoded = DecodedImage::load(&path, 0.5).unwrap();
+        let decoded = DecodedImage::load(&path, 0.5, MAX_IMAGE_DIMENSION).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         assert_eq!(decoded.frames.len(), 2);

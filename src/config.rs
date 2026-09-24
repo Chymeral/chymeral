@@ -151,23 +151,23 @@ fn config_path() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        return home_directory().map(|home| {
-            home.join("Library")
-                .join("Application Support")
-                .join("moditty")
-                .join("moditty.toml")
-        });
-    }
+    platform_config_path()
+}
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home_directory().map(|home| home.join(".config")))
-            .map(|directory| directory.join("moditty").join("moditty.toml"))
-    }
+#[cfg(target_os = "windows")]
+fn platform_config_path() -> Option<PathBuf> {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| home_directory().map(|home| home.join("AppData").join("Roaming")))
+        .map(|directory| directory.join("moditty").join("moditty.toml"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_config_path() -> Option<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_directory().map(|home| home.join(".config")))
+        .map(|directory| directory.join("moditty").join("moditty.toml"))
 }
 
 fn home_directory() -> Option<PathBuf> {
@@ -180,12 +180,14 @@ fn parse(contents: &str, base_directory: &Path) -> Result<Appearance> {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default)]
     terminal: RawTerminal,
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTerminal {
     #[serde(default)]
     font: RawFont,
@@ -206,6 +208,7 @@ impl RawTerminal {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFont {
     #[serde(default)]
     source: RawFontSource,
@@ -315,6 +318,7 @@ impl RawCellWidth {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawBackground {
     #[serde(default)]
     kind: RawBackgroundKind,
@@ -379,6 +383,7 @@ enum RawBackgroundKind {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawForeground {
     color: Option<String>,
 }
@@ -533,6 +538,20 @@ mod tests {
                 [terminal.font]
                 cell_width = "adaptive"
             "#,
+                Path::new("/tmp/moditty-config"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_configuration_keys() {
+        assert!(
+            parse(
+                r##"
+                [terminal.foreground]
+                colour = "#DDEEFF"
+            "##,
                 Path::new("/tmp/moditty-config"),
             )
             .is_err()

@@ -737,29 +737,29 @@ con teclado funcional y resize.
 
 ### Estado de M1
 
-M1 está orientado a Linux y macOS. Ejecutar:
+M1 está orientado a Linux y Windows. En Windows requiere Windows 10 1809 o posterior, o Windows 11, para disponer de ConPTY. macOS queda fuera del alcance mientras no exista una infraestructura de prueba mantenida. Ejecutar:
 
 ```text
 cargo run
 ```
 
-La implementación actual abre una ventana, crea un PTY POSIX con el shell definido en `$SHELL` (o `/bin/sh`), usa `TERM=xterm-256color`, procesa su salida en un estado y grid propios y la renderiza con `wgpu` y `glyphon`.
+La implementación actual abre una ventana, crea una sesión de terminal con el shell definido en `$SHELL` (o `/bin/sh`) en Linux y `COMSPEC` (o `cmd.exe`) en Windows, usa `TERM=xterm-256color`, procesa su salida en un estado y grid propios y la renderiza con `wgpu` y `glyphon`. `MODITTY_SHELL` permite indicar un ejecutable alternativo en ambas plataformas.
 
 Incluye entrada de texto UTF-8, atajos de control, teclas de navegación habituales, resize de ventana y PTY, título OSC 0/2, pantalla alternativa y scrollback interno acotado.
 
 El intérprete implementa los controles de línea, tabulación y retroceso, cursor CSI, regiones de scroll, inserción, borrado, pantalla alternativa y colores SGR de 8/16/256 colores, RGB y negrita.
 
-Todavía no es una emulación VT completa: selección, navegación visual del scrollback, colores de fondo, decoraciones, protocolos de mouse y respuestas de dispositivo quedan fuera de M1.
+Todavía no es una emulación VT completa: selección, navegación visual del scrollback, colores de fondo, decoraciones, protocolos de mouse y respuestas de dispositivo quedan fuera de M1. La única excepción es `CSI 6 n`, respondida como DSR de posición de cursor para completar el protocolo de inicio de ConPTY en Windows.
 
 ### Configuración gráfica base
 
-Moditty carga opcionalmente `moditty.toml` desde `MODITTY_CONFIG`. Si esa variable no existe, busca `moditty/moditty.toml` bajo `XDG_CONFIG_HOME` (o `~/.config`) en Linux y `~/Library/Application Support` en macOS. La plantilla del repositorio está en `moditty.toml.example`.
+Moditty carga opcionalmente `moditty.toml` desde `MODITTY_CONFIG`. Si esa variable no existe, busca `moditty/moditty.toml` bajo `XDG_CONFIG_HOME` (o `~/.config`) en Linux y `%APPDATA%` en Windows. La plantilla del repositorio está en `moditty.toml.example`. Las claves desconocidas se rechazan para evitar configuraciones con errores tipográficos.
 
-La fuente puede venir del sistema o de cualquier archivo que el motor de fuentes pueda cargar. Moditty no rechaza fuentes por no ser monoespaciadas; el grid conserva celdas lógicas fijas y `cell_width` permite ajustar su ancho visual. Las fuentes corruptas o incompatibles producen un error al iniciar.
+La fuente puede venir del sistema o de cualquier archivo que el motor de fuentes pueda cargar. En una colección, `face_index` selecciona exactamente la cara indicada. Moditty no rechaza fuentes por no ser monoespaciadas; el grid conserva celdas lógicas fijas, aunque los avances visuales de una fuente proporcional pueden no coincidir con sus celdas. `size`, `line_height` y `cell_width` usan píxeles lógicos y se escalan con el DPI del monitor. Las fuentes corruptas o incompatibles producen un error al iniciar.
 
 El color predeterminado de texto se define con `terminal.foreground.color` en formato `#RRGGBB`. Los programas que emiten colores ANSI mantienen sus propios colores; `SGR 0` y `SGR 39` restauran el color configurado. El texto y cursor son opacos: `opacity` no se aplica a ellos.
 
-El fondo admite un color hexadecimal `#RRGGBB` o una imagen PNG, JPEG o GIF. Los GIF se animan según sus frames; `opacity` se aplica solo al fondo, multiplicándose con el alfa propio de la imagen. Las opciones `cover`, `contain` y `stretch` controlan su ajuste.
+El fondo admite un color hexadecimal `#RRGGBB` o una imagen PNG, JPEG o GIF. Los GIF se animan según sus frames; `opacity` se aplica solo al fondo, multiplicándose con el alfa propio de la imagen. Las opciones `cover`, `contain` y `stretch` controlan su ajuste. Para evitar agotar recursos, cada imagen queda limitada a 8192×8192 píxeles y 64 MiB decodificados; un GIF admite hasta 300 frames y 128 MiB en total.
 
 Cuando el fondo tiene alfa, Moditty solicita una ventana transparente al compositor. Si el compositor no expone una superficie compatible, la aplicación continúa con una superficie opaca.
 

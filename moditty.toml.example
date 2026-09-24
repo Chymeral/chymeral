@@ -1,6 +1,7 @@
 [terminal.font]
 source = "system"
 family = "monospace"
+# Medidas en píxeles lógicos: se adaptan automáticamente al DPI del monitor.
 size = 16.0
 line_height = 20.0
 cell_width = "auto"
@@ -8,6 +9,7 @@ cell_width = "auto"
 # Para cargar cualquier fuente que admita el motor desde un archivo local:
 # source = "file"
 # path = "/ruta/absoluta/a/mi-fuente.otf"
+# En Windows también se acepta, por ejemplo, "C:/Users/yo/Fuentes/mi-fuente.otf".
 # face_index = 0
 
 [terminal.foreground]
