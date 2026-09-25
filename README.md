@@ -443,33 +443,49 @@ el runtime y los programas no reciben tipos de `winit`.
 
 No usar ECS inicialmente.
 
-El modelo debe comenzar siendo sencillo.
+M3 introduce un scene graph interno, sin renderer ni editor visual. Es una
+estructura backend-agnóstica que organiza pertenencia, visibilidad y orden de
+superposición para los recursos y la interacción que llegarán en milestones
+posteriores.
 
-Conceptualmente:
+Cada `Node` tiene un `NodeId` estable, un padre opcional, hijos ordenados,
+una traslación local, bounds locales, visibilidad y `z_index`. Los nodos raíz
+pertenecen directamente a la escena. Las posiciones usan píxeles lógicos y la
+traslación de un hijo es relativa a su padre.
 
 ```rust
 struct Node {
-    id: NodeId,
+    parent: Option<NodeId>,
+    children: Vec<NodeId>,
     transform: Transform,
     bounds: Rect,
     visible: bool,
     z_index: i32,
-    ...
 }
 ```
 
-Los objetos deben ser referenciados mediante handles estables.
-
-Ejemplo:
+Los objetos se referencian mediante handles generacionales, no referencias
+Rust directas hacia las estructuras internas:
 
 ```text
-NodeId {
-    index,
-    generation
-}
+NodeId { index, generation }
 ```
 
-Nunca permitir que un plugin obtenga referencias Rust directas hacia estructuras internas.
+Al eliminar un nodo, también se eliminan sus descendientes. Si el slot interno
+se reutiliza, cambia su generación y el `NodeId` anterior queda inválido.
+Reparentar un nodo lo añade al final de los hijos del nuevo padre; no se
+permiten ciclos. Un nodo invisible oculta su subárbol del orden de pintura.
+
+El scene graph usa contextos de apilamiento jerárquicos. Cada padre se pinta
+antes que su subárbol; los hijos se ordenan por `z_index` ascendente y, ante
+empate, por su orden de inserción. Un subárbol completo se pinta antes de pasar
+al siguiente hermano. La misma regla se aplica entre raíces. Así, una raíz de
+`z_index` alto puede actuar como overlay global, mientras que los contenidos de
+un panel o popup permanecen agrupados frente a sus hermanos.
+
+M3 no añade imágenes, texto de escena, texturas, hit testing, colisiones,
+layouts, widgets ni APIs de plugins. Esos sistemas consumirán esta estructura
+sin alterar sus invariantes.
 
 ## Interacción y colisiones
 
