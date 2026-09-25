@@ -3,15 +3,24 @@ compile_error!("Moditty currently supports only Linux and Windows.");
 
 mod background;
 mod config;
+mod diagnostics;
 mod pty;
 mod terminal;
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
+};
+use moditty::runtime::{
+    EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent, KeyState,
+    Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton, PointerEvent, Program,
+    Runtime, RuntimeCommand, RuntimeResult, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
 };
 use portable_pty::PtySize;
 use wgpu::{
@@ -23,15 +32,16 @@ use wgpu::{
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
-    event::{ElementState, KeyEvent, WindowEvent},
+    event::{ElementState, KeyEvent as WinitKeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    keyboard::{Key, ModifiersState, NamedKey},
+    keyboard::{Key as WinitKey, ModifiersState, NamedKey as WinitNamedKey},
     window::{Window, WindowId},
 };
 
 use crate::{
     background::BackgroundRenderer,
     config::{Appearance, FontAppearance, FontSource, Rgb},
+    diagnostics::{Diagnostics, DiagnosticsShortcuts},
     pty::Pty,
     terminal::{Terminal, TextColor},
 };
@@ -40,10 +50,55 @@ const WINDOW_WIDTH: u32 = 960;
 const WINDOW_HEIGHT: u32 = 640;
 const PADDING: f64 = 12.0;
 const MAX_PTY_CHUNKS_PER_UPDATE: usize = 64;
+const RESIZE_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
+const RUNTIME_TICK_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug)]
 pub enum UserEvent {
     PtyOutput,
+    PtyClosed,
+}
+
+#[derive(Default)]
+struct TerminalProgram {
+    pending_input: Vec<Vec<u8>>,
+}
+
+impl TerminalProgram {
+    fn take_pending_input(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_input)
+    }
+}
+
+impl Program for TerminalProgram {
+    fn init(&mut self, _: &mut InitContext) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn start(&mut self) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn on_event(&mut self, event: &EngineEvent) -> RuntimeResult<()> {
+        if let EngineEvent::Key(event) = event
+            && let Some(bytes) = terminal_input(event)
+        {
+            self.pending_input.push(bytes);
+        }
+        Ok(())
+    }
+
+    fn on_command(&mut self, _: &RuntimeCommand) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn tick(&mut self, _: Duration) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn frame(&mut self, _: Duration) -> RuntimeResult<()> {
+        Ok(())
+    }
 }
 
 struct WindowState {
@@ -59,6 +114,10 @@ struct WindowState {
     background: BackgroundRenderer,
     terminal: Terminal,
     pty: Pty,
+    runtime: Runtime<TerminalProgram>,
+    diagnostics: Diagnostics,
+    pending_resize: Option<PhysicalSize<u32>>,
+    next_resize_update: Option<Instant>,
     font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
@@ -74,6 +133,7 @@ impl WindowState {
         event_loop: &ActiveEventLoop,
         event_proxy: EventLoopProxy<UserEvent>,
         appearance: Appearance,
+        diagnostics_shortcuts: DiagnosticsShortcuts,
     ) -> Result<Self> {
         let physical_size = window.inner_size();
         let scale_factor = window.scale_factor();
@@ -88,6 +148,9 @@ impl WindowState {
             },
         );
         let pty = Pty::spawn(pty_size(columns, rows, physical_size), event_proxy)?;
+        let runtime = Runtime::new(TerminalProgram::default(), RUNTIME_TICK_INTERVAL)?;
+        let diagnostics =
+            Diagnostics::new(diagnostics_shortcuts, Instant::now(), runtime.metrics());
         let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
             event_loop.owned_display_handle(),
         )));
@@ -162,6 +225,10 @@ impl WindowState {
             background,
             terminal,
             pty,
+            runtime,
+            diagnostics,
+            pending_resize: None,
+            next_resize_update: None,
             font_system,
             swash_cache,
             viewport,
@@ -170,7 +237,10 @@ impl WindowState {
             text_buffer,
             window,
         };
-        state.sync_terminal_text();
+        state
+            .runtime
+            .initialize(InitContext::default(), Instant::now())?;
+        state.sync_terminal_text(false);
         Ok(state)
     }
 
@@ -190,13 +260,18 @@ impl WindowState {
                 self.write_input(&response);
             }
         }
-        self.sync_terminal_text();
+        if self.pending_resize.is_none() {
+            self.sync_terminal_text(false);
+        }
         true
     }
 
-    fn sync_terminal_text(&mut self) {
-        if !self.terminal.take_dirty() {
+    fn sync_terminal_text(&mut self, force: bool) {
+        if self.diagnostics.is_active() || (!force && !self.terminal.take_dirty()) {
             return;
+        }
+        if force {
+            self.terminal.take_dirty();
         }
 
         let spans = self.terminal.render_spans();
@@ -238,10 +313,61 @@ impl WindowState {
         }
     }
 
+    fn sync_diagnostics_text(&mut self) {
+        let (_, rows) = grid_size(
+            PhysicalSize::new(self.surface_config.width, self.surface_config.height),
+            &self.font,
+            self.scale_factor,
+        );
+        let Some(text) = self
+            .diagnostics
+            .render_text(self.runtime.metrics(), usize::from(rows))
+        else {
+            return;
+        };
+
+        let padding = physical_padding(self.scale_factor);
+        let width = self.surface_config.width.saturating_sub(padding * 2) as f32;
+        let height = self.surface_config.height.saturating_sub(padding * 2) as f32;
+        self.text_buffer.set_size(Some(width), Some(height));
+        let attributes = Attrs::new()
+            .family(Family::Name(&self.font_family))
+            .color(Color::rgb(
+                self.foreground.red,
+                self.foreground.green,
+                self.foreground.blue,
+            ));
+        self.text_buffer.set_rich_text(
+            std::iter::once((text.as_str(), attributes.clone())),
+            &attributes,
+            Shaping::Advanced,
+            None,
+        );
+        self.text_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.window.set_title("Moditty — Diagnostics");
+    }
+
     fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
         }
+
+        self.pending_resize = Some(size);
+        self.apply_pending_resize(Instant::now());
+    }
+
+    fn apply_pending_resize(&mut self, now: Instant) {
+        if self
+            .next_resize_update
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        let Some(size) = self.pending_resize.take() else {
+            return;
+        };
+        self.next_resize_update = Some(now + RESIZE_UPDATE_INTERVAL);
 
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
@@ -253,8 +379,12 @@ impl WindowState {
             eprintln!("Moditty: {error:#}");
         }
         self.background.resize(&self.queue, &self.surface_config);
-        self.sync_terminal_text();
+        self.sync_terminal_text(false);
         self.window.request_redraw();
+    }
+
+    fn next_resize_deadline(&self) -> Option<Instant> {
+        self.pending_resize.as_ref().and(self.next_resize_update)
     }
 
     fn scale_factor_changed(&mut self, scale_factor: f64) {
@@ -270,8 +400,61 @@ impl WindowState {
         }
     }
 
+    fn enqueue_event(&mut self, event: EngineEvent) {
+        self.diagnostics.record_event(&event, Instant::now());
+        if self.runtime.enqueue_event(event) {
+            self.window.request_redraw();
+        }
+    }
+
+    fn handle_key_event(&mut self, event: EngineKeyEvent) {
+        let was_active = self.diagnostics.is_active();
+        if self
+            .diagnostics
+            .handle_key(&event, Instant::now(), self.runtime.metrics())
+        {
+            if was_active && !self.diagnostics.is_active() {
+                self.sync_terminal_text(true);
+            }
+            self.window.request_redraw();
+            return;
+        }
+        self.enqueue_event(EngineEvent::Key(event));
+    }
+
+    fn run_runtime_frame(&mut self, now: Instant) -> Result<()> {
+        self.runtime.run_frame(now)?;
+        self.diagnostics.record_metrics(self.runtime.metrics(), now);
+        self.flush_runtime_input();
+        Ok(())
+    }
+
+    fn run_runtime_update(&mut self, now: Instant) -> Result<()> {
+        self.runtime.run_update(now)?;
+        self.diagnostics.record_metrics(self.runtime.metrics(), now);
+        self.flush_runtime_input();
+        Ok(())
+    }
+
+    fn flush_runtime_input(&mut self) {
+        let pending_input = self.runtime.program_mut().take_pending_input();
+        if self.diagnostics.is_active() {
+            return;
+        }
+        for bytes in pending_input {
+            self.write_input(&bytes);
+        }
+    }
+
     fn redraw(&mut self) -> Result<()> {
+        if self.pending_resize.is_some() {
+            return Ok(());
+        }
+        self.run_runtime_frame(Instant::now())?;
         self.read_pty_output();
+        if self.diagnostics.is_active() {
+            self.sync_diagnostics_text();
+        }
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -379,17 +562,25 @@ impl WindowState {
 struct ModittyApp {
     state: Option<WindowState>,
     modifiers: ModifiersState,
+    pointer_position: Vec2,
     event_proxy: EventLoopProxy<UserEvent>,
     appearance: Appearance,
+    diagnostics_shortcuts: DiagnosticsShortcuts,
 }
 
 impl ModittyApp {
-    fn new(event_proxy: EventLoopProxy<UserEvent>, appearance: Appearance) -> Self {
+    fn new(
+        event_proxy: EventLoopProxy<UserEvent>,
+        appearance: Appearance,
+        diagnostics_shortcuts: DiagnosticsShortcuts,
+    ) -> Self {
         Self {
             state: None,
             modifiers: ModifiersState::default(),
+            pointer_position: Vec2::default(),
             event_proxy,
             appearance,
+            diagnostics_shortcuts,
         }
     }
 
@@ -425,6 +616,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
             event_loop,
             event_proxy,
             self.appearance.clone(),
+            self.diagnostics_shortcuts.clone(),
         )) {
             Ok(state) => {
                 state.window.request_redraw();
@@ -437,13 +629,20 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
         }
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyOutput => self.with_state(|state| {
                 if state.read_pty_output() {
+                    state.enqueue_event(EngineEvent::Terminal(TerminalEvent::OutputAvailable));
                     state.window.request_redraw();
                 }
             }),
+            UserEvent::PtyClosed => {
+                self.with_state(|state| {
+                    state.enqueue_event(EngineEvent::Terminal(TerminalEvent::Exited));
+                });
+                event_loop.exit();
+            }
         }
     }
 
@@ -455,34 +654,110 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.with_state(|state| state.scale_factor_changed(scale_factor))
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if let Some(bytes) = terminal_input(&event, self.modifiers) {
-                    self.with_state(|state| state.write_input(&bytes));
+            WindowEvent::KeyboardInput { event, .. } => {
+                let event = engine_key_event(&event, self.modifiers);
+                self.with_state(|state| state.handle_key_event(event));
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer_position = Vec2 {
+                    x: position.x,
+                    y: position.y,
+                };
+                let event = EngineEvent::Pointer(PointerEvent::Move {
+                    position: self.pointer_position,
+                    modifiers: engine_modifiers(self.modifiers),
+                });
+                self.with_state(|state| state.enqueue_event(event));
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let event = match state {
+                    ElementState::Pressed => PointerEvent::Press {
+                        button: engine_pointer_button(button),
+                        position: self.pointer_position,
+                        modifiers: engine_modifiers(self.modifiers),
+                    },
+                    ElementState::Released => PointerEvent::Release {
+                        button: engine_pointer_button(button),
+                        position: self.pointer_position,
+                        modifiers: engine_modifiers(self.modifiers),
+                    },
+                };
+                self.with_state(|state| state.enqueue_event(EngineEvent::Pointer(event)));
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (delta, unit) = engine_scroll_delta(delta);
+                let event = EngineEvent::Scroll(ScrollEvent {
+                    position: self.pointer_position,
+                    delta,
+                    unit,
+                    modifiers: engine_modifiers(self.modifiers),
+                });
+                self.with_state(|state| state.enqueue_event(event));
+            }
+            WindowEvent::Focused(focused) => {
+                let event = EngineEvent::Focus(engine_focus(focused));
+                self.with_state(|state| state.enqueue_event(event));
+            }
+            WindowEvent::RedrawRequested => {
+                let mut runtime_error = None;
+                self.with_state(|state| {
+                    if let Err(error) = state.redraw() {
+                        if state.runtime.is_faulted() {
+                            runtime_error = Some(error);
+                        } else {
+                            eprintln!("Moditty: {error:#}");
+                        }
+                    }
+                });
+                if let Some(error) = runtime_error {
+                    eprintln!("Moditty: {error:#}");
+                    event_loop.exit();
                 }
             }
-            WindowEvent::RedrawRequested => self.with_state(|state| {
-                if let Err(error) = state.redraw() {
-                    eprintln!("Moditty: {error:#}");
-                }
-            }),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let mut runtime_error = None;
         self.with_state(|state| {
+            let now = Instant::now();
+            state.apply_pending_resize(now);
             if state
-                .background
-                .advance_animation(&state.queue, std::time::Instant::now())
+                .runtime
+                .next_tick_deadline()
+                .is_some_and(|deadline| deadline <= now)
+                && let Err(error) = state.run_runtime_update(now)
+            {
+                runtime_error = Some(error);
+                return;
+            }
+            if state.background.advance_animation(&state.queue, now)
+                && state.pending_resize.is_none()
             {
                 state.window.request_redraw();
             }
-            if let Some(deadline) = state.background.next_animation_frame() {
+            if state.diagnostics.needs_continuous_redraw() && state.pending_resize.is_none() {
+                state.window.request_redraw();
+            }
+            let deadline = [
+                state.background.next_animation_frame(),
+                state.next_resize_deadline(),
+                state.runtime.next_tick_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            if let Some(deadline) = deadline {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             } else {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
         });
+        if let Some(error) = runtime_error {
+            eprintln!("Moditty: {error:#}");
+            event_loop.exit();
+        }
     }
 }
 
@@ -541,20 +816,142 @@ fn pty_size(columns: u16, rows: u16, size: PhysicalSize<u32>) -> PtySize {
     }
 }
 
-fn terminal_input(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<u8>> {
-    let mut bytes = match &event.logical_key {
-        Key::Character(character) => text_input(character, modifiers)?,
-        Key::Named(named) => named_key_input(*named)?,
+fn engine_key_event(event: &WinitKeyEvent, modifiers: ModifiersState) -> EngineKeyEvent {
+    EngineKeyEvent {
+        key: engine_key(&event.logical_key),
+        text: event.text.as_ref().map(ToString::to_string),
+        state: match event.state {
+            ElementState::Pressed => KeyState::Pressed,
+            ElementState::Released => KeyState::Released,
+        },
+        modifiers: engine_modifiers(modifiers),
+        repeat: event.repeat,
+    }
+}
+
+fn engine_key(key: &WinitKey) -> EngineKey {
+    match key {
+        WinitKey::Character(character) => EngineKey::Character(character.to_string()),
+        WinitKey::Named(key) => EngineKey::Named(engine_named_key(key)),
+        WinitKey::Dead(character) => EngineKey::Dead(*character),
+        WinitKey::Unidentified(_) => EngineKey::Unidentified,
+    }
+}
+
+fn engine_named_key(key: &WinitNamedKey) -> EngineNamedKey {
+    match key {
+        WinitNamedKey::Alt => EngineNamedKey::Alt,
+        WinitNamedKey::Backspace => EngineNamedKey::Backspace,
+        WinitNamedKey::Delete => EngineNamedKey::Delete,
+        WinitNamedKey::End => EngineNamedKey::End,
+        WinitNamedKey::Enter => EngineNamedKey::Enter,
+        WinitNamedKey::Escape => EngineNamedKey::Escape,
+        WinitNamedKey::Home => EngineNamedKey::Home,
+        WinitNamedKey::Insert => EngineNamedKey::Insert,
+        WinitNamedKey::PageDown => EngineNamedKey::PageDown,
+        WinitNamedKey::PageUp => EngineNamedKey::PageUp,
+        WinitNamedKey::Space => EngineNamedKey::Space,
+        WinitNamedKey::Tab => EngineNamedKey::Tab,
+        WinitNamedKey::ArrowDown => EngineNamedKey::ArrowDown,
+        WinitNamedKey::ArrowLeft => EngineNamedKey::ArrowLeft,
+        WinitNamedKey::ArrowRight => EngineNamedKey::ArrowRight,
+        WinitNamedKey::ArrowUp => EngineNamedKey::ArrowUp,
+        key => EngineNamedKey::Other(format!("{key:?}")),
+    }
+}
+
+fn engine_modifiers(modifiers: ModifiersState) -> EngineModifiers {
+    EngineModifiers {
+        shift: modifiers.shift_key(),
+        control: modifiers.control_key(),
+        alt: modifiers.alt_key(),
+        super_key: modifiers.super_key(),
+    }
+}
+
+fn engine_pointer_button(button: MouseButton) -> PointerButton {
+    match button {
+        MouseButton::Left => PointerButton::Primary,
+        MouseButton::Right => PointerButton::Secondary,
+        MouseButton::Middle => PointerButton::Middle,
+        MouseButton::Back => PointerButton::Back,
+        MouseButton::Forward => PointerButton::Forward,
+        MouseButton::Other(button) => PointerButton::Other(button),
+    }
+}
+
+fn engine_scroll_delta(delta: MouseScrollDelta) -> (Vec2, ScrollUnit) {
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => (
+            Vec2 {
+                x: f64::from(x),
+                y: f64::from(y),
+            },
+            ScrollUnit::Line,
+        ),
+        MouseScrollDelta::PixelDelta(delta) => (
+            Vec2 {
+                x: delta.x,
+                y: delta.y,
+            },
+            ScrollUnit::Pixel,
+        ),
+    }
+}
+
+fn engine_focus(focused: bool) -> FocusEvent {
+    if focused {
+        FocusEvent::Gained
+    } else {
+        FocusEvent::Lost
+    }
+}
+
+fn terminal_input(event: &EngineKeyEvent) -> Option<Vec<u8>> {
+    if event.state != KeyState::Pressed {
+        return None;
+    }
+    terminal_input_with_text(&event.key, event.text.as_deref(), event.modifiers)
+}
+
+fn terminal_input_with_text(
+    logical_key: &EngineKey,
+    text: Option<&str>,
+    modifiers: EngineModifiers,
+) -> Option<Vec<u8>> {
+    if matches!(logical_key, EngineKey::Character(_)) && accepts_text_input(text, modifiers) {
+        return text.map(|text| text.as_bytes().to_vec());
+    }
+
+    let mut bytes = match logical_key {
+        EngineKey::Character(character) => text_input(character, modifiers)?,
+        EngineKey::Named(named) => named_key_input(named)?,
         _ => return None,
     };
 
-    if modifiers.alt_key() && !matches!(event.logical_key, Key::Named(NamedKey::Alt)) {
+    if modifiers.alt_key() && !matches!(logical_key, EngineKey::Named(EngineNamedKey::Alt)) {
         bytes.insert(0, b'\x1b');
     }
     Some(bytes)
 }
 
-fn text_input(character: &str, modifiers: ModifiersState) -> Option<Vec<u8>> {
+fn accepts_text_input(text: Option<&str>, modifiers: EngineModifiers) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    if text.is_empty() || modifiers.super_key() {
+        return false;
+    }
+    if !modifiers.control_key() && !modifiers.alt_key() {
+        return true;
+    }
+
+    modifiers.control_key()
+        && modifiers.alt_key()
+        && text.chars().all(|character| !character.is_control())
+}
+
+fn text_input(character: &str, modifiers: EngineModifiers) -> Option<Vec<u8>> {
     if character.is_empty() || modifiers.super_key() {
         return None;
     }
@@ -581,23 +978,23 @@ fn text_input(character: &str, modifiers: ModifiersState) -> Option<Vec<u8>> {
     }
 }
 
-fn named_key_input(key: NamedKey) -> Option<Vec<u8>> {
+fn named_key_input(key: &EngineNamedKey) -> Option<Vec<u8>> {
     let bytes = match key {
-        NamedKey::Space => b" ".as_slice(),
-        NamedKey::Enter => b"\r".as_slice(),
-        NamedKey::Tab => b"\t".as_slice(),
-        NamedKey::Backspace => b"\x7f".as_slice(),
-        NamedKey::Escape => b"\x1b".as_slice(),
-        NamedKey::ArrowUp => b"\x1b[A".as_slice(),
-        NamedKey::ArrowDown => b"\x1b[B".as_slice(),
-        NamedKey::ArrowRight => b"\x1b[C".as_slice(),
-        NamedKey::ArrowLeft => b"\x1b[D".as_slice(),
-        NamedKey::Home => b"\x1b[H".as_slice(),
-        NamedKey::End => b"\x1b[F".as_slice(),
-        NamedKey::Insert => b"\x1b[2~".as_slice(),
-        NamedKey::Delete => b"\x1b[3~".as_slice(),
-        NamedKey::PageUp => b"\x1b[5~".as_slice(),
-        NamedKey::PageDown => b"\x1b[6~".as_slice(),
+        EngineNamedKey::Space => b" ".as_slice(),
+        EngineNamedKey::Enter => b"\r".as_slice(),
+        EngineNamedKey::Tab => b"\t".as_slice(),
+        EngineNamedKey::Backspace => b"\x7f".as_slice(),
+        EngineNamedKey::Escape => b"\x1b".as_slice(),
+        EngineNamedKey::ArrowUp => b"\x1b[A".as_slice(),
+        EngineNamedKey::ArrowDown => b"\x1b[B".as_slice(),
+        EngineNamedKey::ArrowRight => b"\x1b[C".as_slice(),
+        EngineNamedKey::ArrowLeft => b"\x1b[D".as_slice(),
+        EngineNamedKey::Home => b"\x1b[H".as_slice(),
+        EngineNamedKey::End => b"\x1b[F".as_slice(),
+        EngineNamedKey::Insert => b"\x1b[2~".as_slice(),
+        EngineNamedKey::Delete => b"\x1b[3~".as_slice(),
+        EngineNamedKey::PageUp => b"\x1b[5~".as_slice(),
+        EngineNamedKey::PageDown => b"\x1b[6~".as_slice(),
         _ => return None,
     };
     Some(bytes.to_vec())
@@ -667,7 +1064,11 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("could not create the event loop")?;
-    let mut app = ModittyApp::new(event_loop.create_proxy(), loaded_config.appearance);
+    let mut app = ModittyApp::new(
+        event_loop.create_proxy(),
+        loaded_config.appearance,
+        loaded_config.diagnostics,
+    );
     event_loop
         .run_app(&mut app)
         .context("event loop terminated unexpectedly")
@@ -675,12 +1076,24 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use wgpu::{PresentMode, SurfaceCapabilities, TextureFormat};
-    use winit::dpi::PhysicalSize;
-    use winit::keyboard::NamedKey;
+    use winit::{
+        dpi::PhysicalSize,
+        event::{MouseButton, MouseScrollDelta},
+        keyboard::{Key as WinitKey, ModifiersState, NamedKey as WinitNamedKey},
+    };
 
     use crate::{
-        config::Appearance, grid_size, named_key_input, select_present_mode, select_surface_format,
+        TerminalProgram, config::Appearance, engine_focus, engine_key, engine_modifiers,
+        engine_pointer_button, engine_scroll_delta, grid_size, named_key_input, pty_size,
+        select_present_mode, select_surface_format, terminal_input, terminal_input_with_text,
+    };
+    use moditty::runtime::{
+        EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent,
+        KeyState, Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton, Runtime,
+        ScrollUnit, Vec2,
     };
 
     #[test]
@@ -713,6 +1126,160 @@ mod tests {
 
     #[test]
     fn sends_space_for_the_named_space_key() {
-        assert_eq!(named_key_input(NamedKey::Space), Some(vec![b' ']));
+        assert_eq!(named_key_input(&EngineNamedKey::Space), Some(vec![b' ']));
+    }
+
+    #[test]
+    fn sends_terminal_sequences_for_named_keys() {
+        for (key, sequence) in [
+            (EngineNamedKey::Enter, b"\r".as_slice()),
+            (EngineNamedKey::Tab, b"\t".as_slice()),
+            (EngineNamedKey::Backspace, b"\x7f".as_slice()),
+            (EngineNamedKey::ArrowUp, b"\x1b[A".as_slice()),
+            (EngineNamedKey::ArrowDown, b"\x1b[B".as_slice()),
+            (EngineNamedKey::ArrowRight, b"\x1b[C".as_slice()),
+            (EngineNamedKey::ArrowLeft, b"\x1b[D".as_slice()),
+        ] {
+            assert_eq!(
+                terminal_input_with_text(&EngineKey::Named(key), None, EngineModifiers::default(),),
+                Some(sequence.to_vec()),
+            );
+        }
+    }
+
+    #[test]
+    fn prefers_the_named_backspace_sequence_over_backend_control_text() {
+        assert_eq!(
+            terminal_input_with_text(
+                &EngineKey::Named(EngineNamedKey::Backspace),
+                Some("\x08"),
+                EngineModifiers::default(),
+            ),
+            Some(vec![0x7f]),
+        );
+    }
+
+    #[test]
+    fn sends_text_control_and_alt_input() {
+        assert_eq!(
+            terminal_input_with_text(
+                &EngineKey::Character("é".into()),
+                Some("é"),
+                EngineModifiers::default(),
+            ),
+            Some("é".as_bytes().to_vec()),
+        );
+        assert_eq!(
+            terminal_input_with_text(
+                &EngineKey::Character("c".into()),
+                Some("\u{3}"),
+                EngineModifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            ),
+            Some(vec![3]),
+        );
+        assert_eq!(
+            terminal_input_with_text(
+                &EngineKey::Character("x".into()),
+                Some("x"),
+                EngineModifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            ),
+            Some(vec![b'\x1b', b'x']),
+        );
+    }
+
+    #[test]
+    fn preserves_composed_and_alt_gr_text() {
+        assert_eq!(
+            terminal_input_with_text(
+                &EngineKey::Character("a".into()),
+                Some("´a"),
+                EngineModifiers::default(),
+            ),
+            Some("´a".as_bytes().to_vec()),
+        );
+        assert_eq!(
+            terminal_input_with_text(
+                &EngineKey::Character("@".into()),
+                Some("@"),
+                EngineModifiers {
+                    control: true,
+                    alt: true,
+                    ..Default::default()
+                },
+            ),
+            Some(vec![b'@']),
+        );
+    }
+
+    #[test]
+    fn normalizes_backend_input_without_exposing_backend_types() {
+        assert_eq!(
+            engine_key(&WinitKey::Character("é".into())),
+            EngineKey::Character("é".into())
+        );
+        assert_eq!(
+            engine_key(&WinitKey::Named(WinitNamedKey::Enter)),
+            EngineKey::Named(EngineNamedKey::Enter)
+        );
+        assert_eq!(
+            engine_modifiers(ModifiersState::SHIFT | ModifiersState::CONTROL),
+            EngineModifiers {
+                shift: true,
+                control: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            engine_pointer_button(MouseButton::Other(7)),
+            PointerButton::Other(7)
+        );
+        assert_eq!(
+            engine_scroll_delta(MouseScrollDelta::LineDelta(1.5, -2.0)),
+            (Vec2 { x: 1.5, y: -2.0 }, ScrollUnit::Line)
+        );
+        assert_eq!(engine_focus(true), FocusEvent::Gained);
+        assert_eq!(engine_focus(false), FocusEvent::Lost);
+    }
+
+    #[test]
+    fn routes_canonical_key_events_through_the_runtime_to_the_terminal() {
+        let now = Instant::now();
+        let mut runtime =
+            Runtime::new(TerminalProgram::default(), Duration::from_millis(16)).unwrap();
+        runtime.initialize(InitContext::default(), now).unwrap();
+        let pressed = EngineKeyEvent {
+            key: EngineKey::Character("a".into()),
+            text: Some("a".into()),
+            state: KeyState::Pressed,
+            modifiers: EngineModifiers::default(),
+            repeat: false,
+        };
+        let released = EngineKeyEvent {
+            state: KeyState::Released,
+            ..pressed.clone()
+        };
+
+        assert!(runtime.enqueue_event(EngineEvent::Key(pressed)));
+        assert!(runtime.enqueue_event(EngineEvent::Key(released.clone())));
+        runtime.run_update(now).unwrap();
+
+        assert_eq!(runtime.program_mut().take_pending_input(), vec![vec![b'a']]);
+        assert_eq!(terminal_input(&released), None);
+    }
+
+    #[test]
+    fn derives_pty_dimensions_from_the_terminal_grid() {
+        let size = pty_size(80, 24, PhysicalSize::new(960, 640));
+
+        assert_eq!(size.cols, 80);
+        assert_eq!(size.rows, 24);
+        assert_eq!(size.pixel_width, 960);
+        assert_eq!(size.pixel_height, 640);
     }
 }

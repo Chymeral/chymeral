@@ -373,6 +373,72 @@ scene
 mods
 ```
 
+## Ciclo de vida del runtime
+
+El runtime de un Mod o programa tiene tres rutas internas. Son contratos de
+ejecución, no una exigencia de usar tres hilos del sistema.
+
+```text
+Init     init() → start()
+Event    press(), release(), scroll(), …
+Runtime  tick(dt), frame(dt)
+```
+
+`init()` se invoca una vez antes de iniciar el Mod o programa. Permite cargar
+argumentos, configuración, comandos y recursos iniciales, pero todavía no debe
+recibir órdenes ni eventos de usuario.
+
+`start()` se invoca una única vez después de que `init()` haya terminado con
+éxito y el Mod o programa esté preparado para recibir órdenes. Ningún evento ni
+llamada de runtime se entrega antes de `start()`.
+
+La ruta `Event` entrega las entradas discretas mediante la API canónica del
+runtime, por ejemplo `press()`, `release()` y `scroll()`. Estas entradas se
+originan en `EngineEvent`, no en tipos de `winit` u otro backend.
+
+La ruta `Runtime` mantiene la ejecución continua: `tick(dt)` actualiza la
+lógica y `frame(dt)` prepara o renderiza un cuadro. Un frame puede no contener
+ningún tick o contener varios; ambos deben operar únicamente después de
+`start()`.
+
+M2 concreta ese contrato con un `Program` interno:
+
+```rust
+trait Program {
+    fn init(&mut self, context: &mut InitContext) -> RuntimeResult<()>;
+    fn start(&mut self) -> RuntimeResult<()>;
+    fn on_event(&mut self, event: &EngineEvent) -> RuntimeResult<()>;
+    fn on_command(&mut self, command: &RuntimeCommand) -> RuntimeResult<()>;
+    fn tick(&mut self, dt: Duration) -> RuntimeResult<()>;
+    fn frame(&mut self, dt: Duration) -> RuntimeResult<()>;
+}
+```
+
+`InitContext` contiene los argumentos y comandos iniciales. Tras un `init()` y
+`start()` correctos, los comandos iniciales se encolan para `on_command()`.
+Un error en cualquiera de esas dos llamadas impide que el programa entre en
+ejecución.
+
+Un error de `on_event()`, `on_command()`, `tick()` o `frame()` es terminal para
+el runtime activo: pasa a `RuntimeState::Faulted(RuntimeFault)`, conserva la
+fase y el error, descarta los mensajes pendientes y cancela sus ticks. Desde
+ese momento no acepta ni entrega más eventos o comandos. M2 sólo tiene un
+programa activo, por lo que el host registra el fallo y cierra limpiamente la
+aplicación; el aislamiento de extensiones llegará junto al sistema de plugins.
+
+`RuntimeCommand` es un canal separado de `EngineEvent`: una orden controla al
+programa, mientras que un evento describe una entrada o suceso. Internamente
+ambos comparten una única cola FIFO, por lo que se despachan al programa activo
+en el orden exacto en que llegan. Cada iteración del scheduler vacía esa cola y
+ejecuta cero o más `tick(dt)` de intervalo fijo. Cuando ocurre un redibujado,
+después de esos pasos se invoca un único `frame(dt)`. El scheduler limita la
+recuperación a ocho ticks por iteración y descarta retraso sobrante para no
+bloquear la interfaz tras una pausa larga.
+
+Los tipos canónicos actuales incluyen teclado, puntero, scroll, foco, terminal
+y eventos personalizados. Los adaptadores de plataforma viven en el backend;
+el runtime y los programas no reciben tipos de `winit`.
+
 ## Scene graph
 
 No usar ECS inicialmente.
@@ -745,7 +811,7 @@ cargo run
 
 La implementación actual abre una ventana, crea una sesión de terminal con el shell definido en `$SHELL` (o `/bin/sh`) en Linux y `COMSPEC` (o `cmd.exe`) en Windows, usa `TERM=xterm-256color`, procesa su salida en un estado y grid propios y la renderiza con `wgpu` y `glyphon`. `MODITTY_SHELL` permite indicar un ejecutable alternativo en ambas plataformas.
 
-Incluye entrada de texto UTF-8, atajos de control, teclas de navegación habituales, resize de ventana y PTY, título OSC 0/2, pantalla alternativa y scrollback interno acotado.
+Incluye entrada de texto UTF-8, atajos de control, teclas de navegación habituales, resize de ventana y PTY, título OSC 0/2, pantalla alternativa y scrollback interno acotado. Cuando el shell termina, Moditty cierra la ventana.
 
 El intérprete implementa los controles de línea, tabulación y retroceso, cursor CSI, regiones de scroll, inserción, borrado, pantalla alternativa y colores SGR de 8/16/256 colores, RGB y negrita.
 
@@ -763,13 +829,21 @@ El fondo admite un color hexadecimal `#RRGGBB` o una imagen PNG, JPEG o GIF. Los
 
 Cuando el fondo tiene alfa, Moditty solicita una ventana transparente al compositor. Si el compositor no expone una superficie compatible, la aplicación continúa con una superficie opaca.
 
+### Diagnóstico del runtime
+
+Las vistas internas de diagnóstico permiten comprobar visualmente la integración de M2 sin alterar la sesión del shell. Se activan desde `[input.shortcuts]` en `moditty.toml`; los valores predeterminados son `Ctrl+Shift+E` para eventos, `Ctrl+Shift+T` para ticks y `Ctrl+Shift+F` para frames. Cada atajo debe incluir al menos un modificador y una única letra ASCII.
+
+La vista es modal y permanece abierta hasta pulsar `Escape`. Limpia sólo la representación visual de Moditty: el PTY continúa procesando la salida del shell, pero los caracteres escritos mientras el diagnóstico está activo no se envían a éste. Al volver, se muestra la terminal en su estado actual.
+
+`events` muestra los sucesos canónicos de teclado, puntero, scroll, foco y terminal. El texto imprimible y los eventos personalizados se redactan. `ticks` y `frames` muestran contadores, `dt`, ticks asociados al frame y ticks descartados por recuperación. Cada vista conserva un buffer circular de las últimas 128 entradas relevantes.
+
 ## Orden aproximado de desarrollo
 
 Después del terminal mínimo:
 
 ```text
 M1  terminal mínima funcional
-M2  sistema EngineEvent propio
+M2  EngineEvent propio + ciclo de vida del runtime
 M3  NodeId + scene graph
 M4  recursos gráficos y TextureId
 M5  ImageNode

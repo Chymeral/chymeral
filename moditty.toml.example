@@ -27,3 +27,11 @@ opacity = 0.92
 # opacity = 0.72
 # fit = "cover"
 # fit también puede ser "contain" o "stretch"
+
+[input.shortcuts]
+# Atajos internos de diagnóstico. Cada uno abre una vista modal; Escape vuelve
+# a la terminal. Los caracteres escritos mientras la vista está abierta no se
+# envían al shell.
+diagnostics_events = "Ctrl+Shift+E"
+diagnostics_ticks = "Ctrl+Shift+T"
+diagnostics_frames = "Ctrl+Shift+F"

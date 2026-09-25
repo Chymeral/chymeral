@@ -507,11 +507,12 @@ impl Grid {
         }
     }
 
-    fn text_spans(&self, include_cursor: bool) -> Vec<TextSpan> {
+    fn text_spans(&self, include_cursor: bool, trim_trailing_blanks: bool) -> Vec<TextSpan> {
         let mut spans = Vec::new();
 
         for row in 0..self.rows {
-            for column in 0..self.columns {
+            let columns = self.rendered_columns(row, include_cursor, trim_trailing_blanks);
+            for column in 0..columns {
                 let cell = &self.row(row)[usize::from(column)];
                 if include_cursor && self.cursor_visible && self.cursor == (Cursor { column, row })
                 {
@@ -527,6 +528,21 @@ impl Grid {
         }
 
         spans
+    }
+
+    fn rendered_columns(&self, row: u16, include_cursor: bool, trim_trailing_blanks: bool) -> u16 {
+        if !trim_trailing_blanks {
+            return self.columns;
+        }
+
+        (0..self.columns)
+            .rev()
+            .find(|&column| {
+                let cell = &self.row(row)[usize::from(column)];
+                (include_cursor && self.cursor_visible && self.cursor == (Cursor { column, row }))
+                    || (!cell.continuation && cell.text != " ")
+            })
+            .map_or(0, |column| column + 1)
     }
 
     fn append_span(spans: &mut Vec<TextSpan>, text: &str, style: TextStyle) {
@@ -546,7 +562,7 @@ impl Grid {
 
     #[cfg(test)]
     fn text(&self, include_cursor: bool) -> String {
-        self.text_spans(include_cursor)
+        self.text_spans(include_cursor, false)
             .into_iter()
             .map(|span| span.text)
             .collect()
@@ -951,7 +967,7 @@ impl Terminal {
     }
 
     pub(crate) fn render_spans(&self) -> Vec<TextSpan> {
-        self.state.active_grid().text_spans(true)
+        self.state.active_grid().text_spans(true, true)
     }
 
     #[cfg(test)]
@@ -961,7 +977,7 @@ impl Terminal {
 
     #[cfg(test)]
     pub fn visible_spans(&self) -> Vec<TextSpan> {
-        self.state.active_grid().text_spans(false)
+        self.state.active_grid().text_spans(false, false)
     }
 
     pub fn title(&self) -> &str {
@@ -1081,6 +1097,19 @@ mod tests {
         assert_eq!(spans[0].text, "red");
         assert!(spans[1].text.starts_with("plainagain"));
         assert_eq!(spans[1].color, foreground);
+    }
+
+    #[test]
+    fn omits_invisible_trailing_cells_from_render_spans() {
+        let mut terminal = terminal(8, 2);
+        terminal.advance(b"text\x1b[2;4H");
+        let rendered: String = terminal
+            .render_spans()
+            .into_iter()
+            .map(|span| span.text)
+            .collect();
+
+        assert_eq!(rendered, "text\n   ▏");
     }
 
     #[test]

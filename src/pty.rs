@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use winit::event_loop::EventLoopProxy;
 
 use crate::UserEvent;
@@ -16,7 +16,7 @@ const OUTPUT_QUEUE_CAPACITY: usize = 64;
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Mutex<Box<dyn Write + Send>>,
-    child: Box<dyn Child + Send + Sync>,
+    child_killer: Box<dyn ChildKiller + Send + Sync>,
     output: mpsc::Receiver<Vec<u8>>,
 }
 
@@ -27,10 +27,11 @@ impl Pty {
         let mut command = default_shell_command();
         command.env("TERM", "xterm-256color");
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(command)
             .context("could not start the user shell")?;
+        let child_killer = child.clone_killer();
         drop(pair.slave);
 
         let mut reader = pair
@@ -42,6 +43,7 @@ impl Pty {
             .take_writer()
             .context("could not write to the PTY")?;
         let (sender, output) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
+        let reader_proxy = event_proxy.clone();
 
         thread::Builder::new()
             .name("moditty-pty-reader".to_owned())
@@ -54,7 +56,7 @@ impl Pty {
                             if sender.send(buffer[..count].to_vec()).is_err() {
                                 break;
                             }
-                            if event_proxy.send_event(UserEvent::PtyOutput).is_err() {
+                            if reader_proxy.send_event(UserEvent::PtyOutput).is_err() {
                                 break;
                             }
                         }
@@ -63,11 +65,19 @@ impl Pty {
                 }
             })
             .context("could not start the PTY reader")?;
+        let monitor_proxy = event_proxy;
+        thread::Builder::new()
+            .name("moditty-pty-monitor".to_owned())
+            .spawn(move || {
+                let _ = child.wait();
+                let _ = monitor_proxy.send_event(UserEvent::PtyClosed);
+            })
+            .context("could not start the PTY monitor")?;
 
         Ok(Self {
             master: pair.master,
             writer: Mutex::new(writer),
-            child,
+            child_killer,
             output,
         })
     }
@@ -113,6 +123,6 @@ fn default_shell_command() -> CommandBuilder {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        let _ = self.child_killer.kill();
     }
 }

@@ -6,6 +6,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::diagnostics::{DiagnosticsShortcuts, Shortcut};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
     pub red: u8,
@@ -116,6 +118,7 @@ pub enum ImageFit {
 
 pub struct LoadedConfig {
     pub appearance: Appearance,
+    pub diagnostics: DiagnosticsShortcuts,
     pub path: Option<PathBuf>,
 }
 
@@ -123,6 +126,7 @@ pub fn load() -> Result<LoadedConfig> {
     let Some(path) = config_path() else {
         return Ok(LoadedConfig {
             appearance: Appearance::default(),
+            diagnostics: DiagnosticsShortcuts::default(),
             path: None,
         });
     };
@@ -130,6 +134,7 @@ pub fn load() -> Result<LoadedConfig> {
     if !path.exists() {
         return Ok(LoadedConfig {
             appearance: Appearance::default(),
+            diagnostics: DiagnosticsShortcuts::default(),
             path: None,
         });
     }
@@ -137,11 +142,12 @@ pub fn load() -> Result<LoadedConfig> {
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("could not read configuration file {}", path.display()))?;
     let base_directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let appearance = parse(&contents, base_directory)
+    let parsed = parse_config(&contents, base_directory)
         .with_context(|| format!("invalid configuration in {}", path.display()))?;
 
     Ok(LoadedConfig {
-        appearance,
+        appearance: parsed.appearance,
+        diagnostics: parsed.diagnostics,
         path: Some(path),
     })
 }
@@ -174,9 +180,22 @@ fn home_directory() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
 
+#[cfg(test)]
 fn parse(contents: &str, base_directory: &Path) -> Result<Appearance> {
+    Ok(parse_config(contents, base_directory)?.appearance)
+}
+
+struct ParsedConfig {
+    appearance: Appearance,
+    diagnostics: DiagnosticsShortcuts,
+}
+
+fn parse_config(contents: &str, base_directory: &Path) -> Result<ParsedConfig> {
     let raw: RawConfig = toml::from_str(contents).context("could not parse TOML")?;
-    raw.terminal.into_appearance(base_directory)
+    Ok(ParsedConfig {
+        appearance: raw.terminal.into_appearance(base_directory)?,
+        diagnostics: raw.input.shortcuts.into_shortcuts()?,
+    })
 }
 
 #[derive(Default, Deserialize)]
@@ -184,6 +203,75 @@ fn parse(contents: &str, base_directory: &Path) -> Result<Appearance> {
 struct RawConfig {
     #[serde(default)]
     terminal: RawTerminal,
+    #[serde(default)]
+    input: RawInput,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInput {
+    #[serde(default)]
+    shortcuts: RawShortcuts,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawShortcuts {
+    #[serde(default = "default_events_shortcut")]
+    diagnostics_events: String,
+    #[serde(default = "default_ticks_shortcut")]
+    diagnostics_ticks: String,
+    #[serde(default = "default_frames_shortcut")]
+    diagnostics_frames: String,
+}
+
+impl Default for RawShortcuts {
+    fn default() -> Self {
+        Self {
+            diagnostics_events: default_events_shortcut(),
+            diagnostics_ticks: default_ticks_shortcut(),
+            diagnostics_frames: default_frames_shortcut(),
+        }
+    }
+}
+
+impl RawShortcuts {
+    fn into_shortcuts(self) -> Result<DiagnosticsShortcuts> {
+        let shortcuts = DiagnosticsShortcuts {
+            events: parse_shortcut(
+                "input.shortcuts.diagnostics_events",
+                &self.diagnostics_events,
+            )?,
+            ticks: parse_shortcut("input.shortcuts.diagnostics_ticks", &self.diagnostics_ticks)?,
+            frames: parse_shortcut(
+                "input.shortcuts.diagnostics_frames",
+                &self.diagnostics_frames,
+            )?,
+        };
+        if shortcuts.events == shortcuts.ticks
+            || shortcuts.events == shortcuts.frames
+            || shortcuts.ticks == shortcuts.frames
+        {
+            bail!("input.shortcuts diagnostics shortcuts must be distinct");
+        }
+        Ok(shortcuts)
+    }
+}
+
+fn default_events_shortcut() -> String {
+    "Ctrl+Shift+E".to_owned()
+}
+
+fn default_ticks_shortcut() -> String {
+    "Ctrl+Shift+T".to_owned()
+}
+
+fn default_frames_shortcut() -> String {
+    "Ctrl+Shift+F".to_owned()
+}
+
+fn parse_shortcut(name: &str, value: &str) -> Result<Shortcut> {
+    Shortcut::parse(value).map_err(|error| anyhow::anyhow!("{name}: {error}"))
 }
 
 #[derive(Default, Deserialize)]
@@ -436,8 +524,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, parse, parse_hex_color,
+        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, parse, parse_config,
+        parse_hex_color,
     };
+    use crate::diagnostics::Shortcut;
 
     #[test]
     fn loads_an_arbitrary_font_file_and_relative_image() {
@@ -552,6 +642,56 @@ mod tests {
                 [terminal.foreground]
                 colour = "#DDEEFF"
             "##,
+                Path::new("/tmp/moditty-config"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn loads_diagnostics_shortcuts() {
+        let config = parse_config(
+            r#"
+                [input.shortcuts]
+                diagnostics_events = "Alt+E"
+                diagnostics_ticks = "Ctrl+T"
+                diagnostics_frames = "Super+F"
+            "#,
+            Path::new("/tmp/moditty-config"),
+        )
+        .unwrap();
+
+        assert_eq!(config.diagnostics.events, Shortcut::parse("Alt+E").unwrap());
+        assert_eq!(config.diagnostics.ticks, Shortcut::parse("Ctrl+T").unwrap());
+        assert_eq!(
+            config.diagnostics.frames,
+            Shortcut::parse("Super+F").unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_an_unmodified_diagnostics_shortcut() {
+        assert!(
+            parse_config(
+                r#"
+                [input.shortcuts]
+                diagnostics_events = "E"
+            "#,
+                Path::new("/tmp/moditty-config"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_diagnostics_shortcuts() {
+        assert!(
+            parse_config(
+                r#"
+                [input.shortcuts]
+                diagnostics_events = "Ctrl+Shift+E"
+                diagnostics_ticks = "Ctrl+Shift+E"
+            "#,
                 Path::new("/tmp/moditty-config"),
             )
             .is_err()
