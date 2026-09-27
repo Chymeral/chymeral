@@ -28,6 +28,14 @@ opacity = 0.92
 # fit = "cover"
 # fit también puede ser "contain" o "stretch"
 
+# Pantalla de inicio estética opcional. La imagen se muestra centrada sobre la
+# terminal y desaparece automáticamente. M5 admite PNG y JPEG estáticos.
+[appearance.startup_splash]
+enabled = false
+# image = "images/moditty-splash.png"
+# duration_ms = 1500
+# opacity = 1.0
+
 [input.shortcuts]
 # Atajos internos de diagnóstico. Cada uno abre una vista modal; Escape vuelve
 # a la terminal. Los caracteres escritos mientras la vista está abierta no se

@@ -3,6 +3,8 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+use crate::resources::TextureId;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId {
     index: usize,
@@ -13,6 +15,7 @@ pub struct NodeId {
 pub enum GeometryError {
     NonFiniteCoordinate,
     NegativeExtent,
+    ExtentOverflow,
 }
 
 impl Display for GeometryError {
@@ -20,11 +23,37 @@ impl Display for GeometryError {
         match self {
             Self::NonFiniteCoordinate => formatter.write_str("geometry coordinates must be finite"),
             Self::NegativeExtent => formatter.write_str("rectangle extents cannot be negative"),
+            Self::ExtentOverflow => {
+                formatter.write_str("rectangle origin and extent must produce finite bounds")
+            }
         }
     }
 }
 
 impl Error for GeometryError {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    pub fn new(x: f64, y: f64) -> Result<Self, GeometryError> {
+        if !x.is_finite() || !y.is_finite() {
+            return Err(GeometryError::NonFiniteCoordinate);
+        }
+        Ok(Self { x, y })
+    }
+
+    pub const fn x(self) -> f64 {
+        self.x
+    }
+
+    pub const fn y(self) -> f64 {
+        self.y
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Transform {
@@ -65,6 +94,15 @@ impl Rect {
         if width < 0.0 || height < 0.0 {
             return Err(GeometryError::NegativeExtent);
         }
+        let right = x + width;
+        let bottom = y + height;
+        if !right.is_finite()
+            || !bottom.is_finite()
+            || (width > 0.0 && right <= x)
+            || (height > 0.0 && bottom <= y)
+        {
+            return Err(GeometryError::ExtentOverflow);
+        }
         Ok(Self {
             x,
             y,
@@ -88,6 +126,31 @@ impl Rect {
     pub const fn height(self) -> f64 {
         self.height
     }
+
+    pub const fn is_empty(self) -> bool {
+        self.width == 0.0 || self.height == 0.0
+    }
+
+    pub fn contains(self, point: Point) -> bool {
+        point.x >= self.x && point.x < self.right() && point.y >= self.y && point.y < self.bottom()
+    }
+
+    pub fn intersects(self, other: Self) -> bool {
+        !self.is_empty()
+            && !other.is_empty()
+            && self.x < other.right()
+            && self.right() > other.x
+            && self.y < other.bottom()
+            && self.bottom() > other.y
+    }
+
+    fn right(self) -> f64 {
+        self.x + self.width
+    }
+
+    fn bottom(self) -> f64 {
+        self.y + self.height
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -109,11 +172,59 @@ impl Default for NodeProperties {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageNode {
+    texture: TextureId,
+    opacity: f32,
+}
+
+impl ImageNode {
+    pub fn new(texture: TextureId, opacity: f32) -> Result<Self, ImageNodeError> {
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+            return Err(ImageNodeError::InvalidOpacity);
+        }
+        Ok(Self { texture, opacity })
+    }
+
+    pub const fn texture(self) -> TextureId {
+        self.texture
+    }
+
+    pub const fn opacity(self) -> f32 {
+        self.opacity
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageNodeError {
+    InvalidOpacity,
+}
+
+impl Display for ImageNodeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidOpacity => {
+                formatter.write_str("image opacity must be between 0.0 and 1.0")
+            }
+        }
+    }
+}
+
+impl Error for ImageNodeError {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum NodeContent {
+    #[default]
+    Empty,
+    Image(ImageNode),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     parent: Option<NodeId>,
     children: Vec<NodeId>,
     properties: NodeProperties,
+    content: NodeContent,
 }
 
 impl Node {
@@ -128,12 +239,17 @@ impl Node {
     pub const fn properties(&self) -> NodeProperties {
         self.properties
     }
+
+    pub const fn content(&self) -> NodeContent {
+        self.content
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneError {
     InvalidNode(NodeId),
     WouldCreateCycle { node: NodeId, parent: NodeId },
+    WorldBoundsOverflow(NodeId),
 }
 
 impl Display for SceneError {
@@ -142,6 +258,9 @@ impl Display for SceneError {
             Self::InvalidNode(_) => formatter.write_str("node handle is no longer valid"),
             Self::WouldCreateCycle { .. } => {
                 formatter.write_str("a scene node cannot parent one of its descendants")
+            }
+            Self::WorldBoundsOverflow(_) => {
+                formatter.write_str("node transforms produce non-finite world bounds")
             }
         }
     }
@@ -215,6 +334,52 @@ impl Scene {
         Ok(())
     }
 
+    pub fn set_content(&mut self, node: NodeId, content: NodeContent) -> Result<(), SceneError> {
+        self.require_node_mut(node)?.content = content;
+        Ok(())
+    }
+
+    pub fn clear_content(&mut self, node: NodeId) -> Result<(), SceneError> {
+        self.set_content(node, NodeContent::Empty)
+    }
+
+    pub fn world_bounds(&self, node: NodeId) -> Result<Rect, SceneError> {
+        let bounds = self.require_node(node)?.properties.bounds;
+        let mut x = bounds.x();
+        let mut y = bounds.y();
+        let mut current = Some(node);
+        while let Some(current_node) = current {
+            let current_node_ref = self.require_node(current_node)?;
+            x += current_node_ref.properties.transform.x();
+            y += current_node_ref.properties.transform.y();
+            if !x.is_finite() || !y.is_finite() {
+                return Err(SceneError::WorldBoundsOverflow(node));
+            }
+            current = current_node_ref.parent;
+        }
+        Rect::new(x, y, bounds.width(), bounds.height())
+            .map_err(|_| SceneError::WorldBoundsOverflow(node))
+    }
+
+    pub fn hit_test(&self, point: Point) -> Result<Option<NodeId>, SceneError> {
+        for node in self.paint_order().into_iter().rev() {
+            if self.world_bounds(node)?.contains(point) {
+                return Ok(Some(node));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn hit_test_rect(&self, bounds: Rect) -> Result<Vec<NodeId>, SceneError> {
+        let mut nodes = Vec::new();
+        for node in self.paint_order().into_iter().rev() {
+            if self.world_bounds(node)?.intersects(bounds) {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
+    }
+
     pub fn reparent(&mut self, node: NodeId, parent: Option<NodeId>) -> Result<(), SceneError> {
         let current_parent = self.require_node(node)?.parent;
         if current_parent == parent {
@@ -283,6 +448,7 @@ impl Scene {
             parent,
             children: Vec::new(),
             properties,
+            content: NodeContent::Empty,
         };
         if let Some(index) = self.free_slots.pop() {
             let slot = &mut self.slots[index];
@@ -376,6 +542,27 @@ mod tests {
             Rect::new(0.0, 0.0, -1.0, 1.0),
             Err(GeometryError::NegativeExtent)
         );
+        assert_eq!(
+            Point::new(f64::INFINITY, 0.0),
+            Err(GeometryError::NonFiniteCoordinate)
+        );
+        assert_eq!(
+            Rect::new(f64::MAX, 0.0, 1.0, 1.0),
+            Err(GeometryError::ExtentOverflow)
+        );
+    }
+
+    #[test]
+    fn uses_half_open_rectangles_for_containment_and_intersection() {
+        let bounds = Rect::new(10.0, 20.0, 30.0, 40.0).unwrap();
+
+        assert!(bounds.contains(Point::new(10.0, 20.0).unwrap()));
+        assert!(bounds.contains(Point::new(39.999, 59.999).unwrap()));
+        assert!(!bounds.contains(Point::new(40.0, 20.0).unwrap()));
+        assert!(!bounds.contains(Point::new(10.0, 60.0).unwrap()));
+        assert!(!bounds.intersects(Rect::new(40.0, 20.0, 1.0, 1.0).unwrap()));
+        assert!(!bounds.intersects(Rect::new(10.0, 60.0, 1.0, 1.0).unwrap()));
+        assert!(!bounds.intersects(Rect::new(10.0, 20.0, 0.0, 1.0).unwrap()));
     }
 
     #[test]
@@ -419,6 +606,162 @@ mod tests {
 
         assert_eq!(scene.node(node).unwrap().properties(), properties);
         assert!(scene.paint_order().is_empty());
+    }
+
+    #[test]
+    fn attaches_an_image_without_coupling_the_scene_to_the_texture_store() {
+        let mut scene = Scene::new();
+        let node = scene.create_root(NodeProperties::default());
+        let mut textures = crate::resources::TextureStore::new();
+        let texture =
+            textures.insert(crate::resources::Texture::from_rgba8(1, 1, vec![0, 0, 0, 0]).unwrap());
+        let image = ImageNode::new(texture, 0.5).unwrap();
+
+        scene.set_content(node, NodeContent::Image(image)).unwrap();
+
+        assert_eq!(
+            scene.node(node).unwrap().content(),
+            NodeContent::Image(image)
+        );
+        assert_eq!(
+            ImageNode::new(texture, 1.1),
+            Err(ImageNodeError::InvalidOpacity)
+        );
+    }
+
+    #[test]
+    fn computes_bounds_from_all_ancestor_transforms() {
+        let mut scene = Scene::new();
+        let root = scene.create_root(NodeProperties {
+            transform: Transform::new(40.0, 20.0).unwrap(),
+            ..NodeProperties::default()
+        });
+        let child = scene
+            .create_child(
+                root,
+                NodeProperties {
+                    transform: Transform::new(8.0, 6.0).unwrap(),
+                    bounds: Rect::new(1.0, 2.0, 128.0, 64.0).unwrap(),
+                    ..NodeProperties::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            scene.world_bounds(child).unwrap(),
+            Rect::new(49.0, 28.0, 128.0, 64.0).unwrap()
+        );
+    }
+
+    #[test]
+    fn hits_the_topmost_visible_node_at_a_point() {
+        let mut scene = Scene::new();
+        let bounds = Rect::new(0.0, 0.0, 100.0, 100.0).unwrap();
+        let back = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(0)
+        });
+        let same_depth = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(0)
+        });
+        let front = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(1)
+        });
+        let hidden = scene.create_root(NodeProperties {
+            bounds,
+            visible: false,
+            ..properties(2)
+        });
+
+        assert_eq!(
+            scene.hit_test(Point::new(50.0, 50.0).unwrap()).unwrap(),
+            Some(front)
+        );
+        assert_ne!(back, same_depth);
+        assert_ne!(front, hidden);
+        assert_eq!(
+            scene.hit_test(Point::new(100.0, 100.0).unwrap()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn hit_testing_preserves_hierarchical_stacking_contexts() {
+        let mut scene = Scene::new();
+        let bounds = Rect::new(0.0, 0.0, 100.0, 100.0).unwrap();
+        let back = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(0)
+        });
+        scene
+            .create_child(
+                back,
+                NodeProperties {
+                    bounds,
+                    ..properties(100)
+                },
+            )
+            .unwrap();
+        let front = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(1)
+        });
+
+        assert_eq!(
+            scene.hit_test(Point::new(50.0, 50.0).unwrap()).unwrap(),
+            Some(front)
+        );
+    }
+
+    #[test]
+    fn hits_children_outside_their_parent_before_clipping_exists() {
+        let mut scene = Scene::new();
+        let parent = scene.create_root(NodeProperties {
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0).unwrap(),
+            ..NodeProperties::default()
+        });
+        let child = scene
+            .create_child(
+                parent,
+                NodeProperties {
+                    transform: Transform::new(8.0, 0.0).unwrap(),
+                    bounds: Rect::new(0.0, 0.0, 10.0, 10.0).unwrap(),
+                    ..NodeProperties::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            scene.hit_test(Point::new(15.0, 5.0).unwrap()).unwrap(),
+            Some(child)
+        );
+    }
+
+    #[test]
+    fn returns_overlapping_nodes_front_to_back_for_rect_queries() {
+        let mut scene = Scene::new();
+        let bounds = Rect::new(0.0, 0.0, 20.0, 20.0).unwrap();
+        let back = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(0)
+        });
+        let middle = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(0)
+        });
+        let front = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(1)
+        });
+
+        assert_eq!(
+            scene
+                .hit_test_rect(Rect::new(10.0, 10.0, 5.0, 5.0).unwrap())
+                .unwrap(),
+            vec![front, middle, back]
+        );
     }
 
     #[test]

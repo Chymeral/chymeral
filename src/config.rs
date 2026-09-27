@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -95,6 +96,13 @@ pub enum Background {
     },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct StartupSplash {
+    pub path: PathBuf,
+    pub duration: Duration,
+    pub opacity: f32,
+}
+
 impl Background {
     pub fn opacity(&self) -> f32 {
         match self {
@@ -118,6 +126,7 @@ pub enum ImageFit {
 
 pub struct LoadedConfig {
     pub appearance: Appearance,
+    pub startup_splash: Option<StartupSplash>,
     pub diagnostics: DiagnosticsShortcuts,
     pub path: Option<PathBuf>,
 }
@@ -126,6 +135,7 @@ pub fn load() -> Result<LoadedConfig> {
     let Some(path) = config_path() else {
         return Ok(LoadedConfig {
             appearance: Appearance::default(),
+            startup_splash: None,
             diagnostics: DiagnosticsShortcuts::default(),
             path: None,
         });
@@ -134,6 +144,7 @@ pub fn load() -> Result<LoadedConfig> {
     if !path.exists() {
         return Ok(LoadedConfig {
             appearance: Appearance::default(),
+            startup_splash: None,
             diagnostics: DiagnosticsShortcuts::default(),
             path: None,
         });
@@ -147,6 +158,7 @@ pub fn load() -> Result<LoadedConfig> {
 
     Ok(LoadedConfig {
         appearance: parsed.appearance,
+        startup_splash: parsed.startup_splash,
         diagnostics: parsed.diagnostics,
         path: Some(path),
     })
@@ -187,14 +199,21 @@ fn parse(contents: &str, base_directory: &Path) -> Result<Appearance> {
 
 struct ParsedConfig {
     appearance: Appearance,
+    startup_splash: Option<StartupSplash>,
     diagnostics: DiagnosticsShortcuts,
 }
 
 fn parse_config(contents: &str, base_directory: &Path) -> Result<ParsedConfig> {
     let raw: RawConfig = toml::from_str(contents).context("could not parse TOML")?;
+    let RawConfig {
+        terminal,
+        appearance,
+        input,
+    } = raw;
     Ok(ParsedConfig {
-        appearance: raw.terminal.into_appearance(base_directory)?,
-        diagnostics: raw.input.shortcuts.into_shortcuts()?,
+        appearance: terminal.into_appearance(base_directory)?,
+        startup_splash: appearance.into_startup_splash(base_directory)?,
+        diagnostics: input.shortcuts.into_shortcuts()?,
     })
 }
 
@@ -204,7 +223,71 @@ struct RawConfig {
     #[serde(default)]
     terminal: RawTerminal,
     #[serde(default)]
+    appearance: RawAppearance,
+    #[serde(default)]
     input: RawInput,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAppearance {
+    #[serde(default)]
+    startup_splash: RawStartupSplash,
+}
+
+impl RawAppearance {
+    fn into_startup_splash(self, base_directory: &Path) -> Result<Option<StartupSplash>> {
+        self.startup_splash.into_splash(base_directory)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStartupSplash {
+    #[serde(default)]
+    enabled: bool,
+    image: Option<PathBuf>,
+    #[serde(default = "default_splash_duration_ms")]
+    duration_ms: u64,
+    #[serde(default = "default_opacity")]
+    opacity: f32,
+}
+
+impl Default for RawStartupSplash {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            image: None,
+            duration_ms: default_splash_duration_ms(),
+            opacity: default_opacity(),
+        }
+    }
+}
+
+impl RawStartupSplash {
+    fn into_splash(self, base_directory: &Path) -> Result<Option<StartupSplash>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let path = self
+            .image
+            .context("appearance.startup_splash.image is required when enabled = true")?;
+        if self.duration_ms == 0 {
+            bail!("appearance.startup_splash.duration_ms must be greater than zero");
+        }
+        if !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
+            bail!("appearance.startup_splash.opacity must be between 0.0 and 1.0");
+        }
+        Ok(Some(StartupSplash {
+            path: resolve_path(base_directory, path),
+            duration: Duration::from_millis(self.duration_ms),
+            opacity: self.opacity,
+        }))
+    }
+}
+
+fn default_splash_duration_ms() -> u64 {
+    1_500
 }
 
 #[derive(Default, Deserialize)]
@@ -521,11 +604,11 @@ fn validate_positive(name: &str, value: f32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, time::Duration};
 
     use super::{
-        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, parse, parse_config,
-        parse_hex_color,
+        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, StartupSplash, parse,
+        parse_config, parse_hex_color,
     };
     use crate::diagnostics::Shortcut;
 
@@ -696,5 +779,53 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn loads_an_enabled_relative_startup_splash() {
+        let config = parse_config(
+            r#"
+                [appearance.startup_splash]
+                enabled = true
+                image = "images/splash.png"
+                duration_ms = 1250
+                opacity = 0.65
+            "#,
+            Path::new("/tmp/moditty-config"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.startup_splash,
+            Some(StartupSplash {
+                path: "/tmp/moditty-config/images/splash.png".into(),
+                duration: Duration::from_millis(1250),
+                opacity: 0.65,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_an_incomplete_or_invalid_startup_splash() {
+        for contents in [
+            r#"
+                [appearance.startup_splash]
+                enabled = true
+            "#,
+            r#"
+                [appearance.startup_splash]
+                enabled = true
+                image = "splash.png"
+                duration_ms = 0
+            "#,
+            r#"
+                [appearance.startup_splash]
+                enabled = true
+                image = "splash.png"
+                opacity = 1.1
+            "#,
+        ] {
+            assert!(parse_config(contents, Path::new("/tmp/moditty-config")).is_err());
+        }
     }
 }

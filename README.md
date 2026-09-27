@@ -443,10 +443,10 @@ el runtime y los programas no reciben tipos de `winit`.
 
 No usar ECS inicialmente.
 
-M3 introduce un scene graph interno, sin renderer ni editor visual. Es una
+M3 introduce un scene graph interno, sin editor visual. Su núcleo es una
 estructura backend-agnóstica que organiza pertenencia, visibilidad y orden de
 superposición para los recursos y la interacción que llegarán en milestones
-posteriores.
+posteriores. M5 añade su primer consumidor visual: nodos de imagen rasterizada.
 
 Cada `Node` tiene un `NodeId` estable, un padre opcional, hijos ordenados,
 una traslación local, bounds locales, visibilidad y `z_index`. Los nodos raíz
@@ -461,6 +461,7 @@ struct Node {
     bounds: Rect,
     visible: bool,
     z_index: i32,
+    content: NodeContent,
 }
 ```
 
@@ -483,8 +484,8 @@ al siguiente hermano. La misma regla se aplica entre raíces. Así, una raíz de
 `z_index` alto puede actuar como overlay global, mientras que los contenidos de
 un panel o popup permanecen agrupados frente a sus hermanos.
 
-M3 no añade imágenes, texto de escena, texturas, hit testing, colisiones,
-layouts, widgets ni APIs de plugins. Esos sistemas consumirán esta estructura
+El núcleo de M3 no impone renderer, texto de escena, hit testing, colisiones,
+layouts, widgets ni APIs de plugins. Esos sistemas consumen esta estructura
 sin alterar sus invariantes.
 
 ## Recursos gráficos
@@ -501,14 +502,41 @@ registro no conoce el scene graph y no expone tipos de `wgpu`.
 
 M4 valida dimensiones no nulas y la correspondencia exacta entre dimensiones y
 bytes RGBA8, pero no define cuotas globales de memoria, actualizaciones de
-píxeles, render targets, animación ni carga de archivos. M5 asociará un
-`TextureId` con un nodo de imagen y será el primer milestone que lo dibuje.
+píxeles, render targets, animación ni carga de archivos.
+
+## Imagen de escena
+
+M5 incorpora `NodeContent::Image(ImageNode)`: un nodo contiene cero o una
+imagen y las composiciones se forman con hijos. `ImageNode` referencia un
+`TextureId` y define una opacidad propia entre `0.0` y `1.0`. El renderer
+recorre el orden de pintura del scene graph, convierte los bounds lógicos a la
+superficie de la ventana y compone las imágenes sobre el texto de la terminal.
+Por tanto, escena y terminal comparten ventana y coordenadas lógicas, pero el
+grid de terminal mantiene su representación interna independiente.
+
+Una textura eliminada se omite al dibujar aunque un nodo aún conserve su
+handle. M5 no añade texto de escena, carga general de recursos, animación de
+nodos, recorte, repetición, sprites ni una API pública para mods.
 
 ## Interacción y colisiones
 
 Las necesidades iniciales son de UI, no de física.
 
-Implementar primero:
+M6 introduce hit testing geométrico y backend-agnóstico. `Point` y `Rect` usan
+píxeles lógicos; los rectángulos son semiabiertos, por lo que incluyen su borde
+izquierdo y superior, pero excluyen el derecho e inferior. `Scene::hit_test`
+devuelve el nodo visible más alto bajo un punto. `Scene::hit_test_rect` devuelve
+todos los nodos visibles que se superponen con un rectángulo, de frente a fondo.
+Ambas consultas usan los bounds mundiales y el mismo orden determinista de
+pintura del scene graph.
+
+Un nodo no requiere contenido ni una marca de interactividad para participar:
+M6 sólo resuelve geometría. Un hijo puede detectarse fuera de los bounds de su
+padre porque todavía no hay clipping; M9 introducirá límites de dibujo y estas
+consultas aplicarán los mismos límites. M6 no convierte eventos de plataforma
+ni los despacha: eso pertenece a M7.
+
+La siguiente infraestructura permite:
 
 ```text
 point vs rect
@@ -861,6 +889,15 @@ El color predeterminado de texto se define con `terminal.foreground.color` en fo
 El fondo admite un color hexadecimal `#RRGGBB` o una imagen PNG, JPEG o GIF. Los GIF se animan según sus frames; `opacity` se aplica solo al fondo, multiplicándose con el alfa propio de la imagen. Las opciones `cover`, `contain` y `stretch` controlan su ajuste. Para evitar agotar recursos, cada imagen queda limitada a 8192×8192 píxeles y 64 MiB decodificados; un GIF admite hasta 300 frames y 128 MiB en total.
 
 Cuando el fondo tiene alfa, Moditty solicita una ventana transparente al compositor. Si el compositor no expone una superficie compatible, la aplicación continúa con una superficie opaca.
+
+`appearance.startup_splash` habilita una pantalla de inicio estética opcional.
+Al activarla, `image` es obligatoria, se resuelve relativa al archivo
+`moditty.toml` y debe referirse a una imagen PNG, JPG o JPEG estática. La imagen
+se conserva a su tamaño natural en píxeles lógicos, se centra sobre la terminal
+y desaparece después de `duration_ms`; `opacity` es independiente del fondo y
+del texto. Los GIF y cualquier otro formato animado se rechazan expresamente
+en esta pantalla hasta que exista un recurso de animación. La plantilla incluye
+la sección completa y el comportamiento predeterminado es no mostrar splash.
 
 ### Diagnóstico del runtime
 

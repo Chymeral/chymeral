@@ -5,6 +5,7 @@ mod background;
 mod config;
 mod diagnostics;
 mod pty;
+mod scene_renderer;
 mod terminal;
 
 use std::{
@@ -21,6 +22,10 @@ use moditty::runtime::{
     EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent, KeyState,
     Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton, PointerEvent, Program,
     Runtime, RuntimeCommand, RuntimeResult, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
+};
+use moditty::{
+    resources::{Texture as ResourceTexture, TextureId, TextureStore},
+    scene::{ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, Transform},
 };
 use portable_pty::PtySize;
 use wgpu::{
@@ -40,9 +45,10 @@ use winit::{
 
 use crate::{
     background::BackgroundRenderer,
-    config::{Appearance, FontAppearance, FontSource, Rgb},
+    config::{Appearance, FontAppearance, FontSource, Rgb, StartupSplash},
     diagnostics::{Diagnostics, DiagnosticsShortcuts},
     pty::Pty,
+    scene_renderer::{ImageRenderer, ImageViewport},
     terminal::{Terminal, TextColor},
 };
 
@@ -101,6 +107,12 @@ impl Program for TerminalProgram {
     }
 }
 
+struct ActiveSplash {
+    node: NodeId,
+    texture: TextureId,
+    deadline: Instant,
+}
+
 struct WindowState {
     instance: wgpu::Instance,
     device: wgpu::Device,
@@ -116,6 +128,10 @@ struct WindowState {
     pty: Pty,
     runtime: Runtime<TerminalProgram>,
     diagnostics: Diagnostics,
+    scene: Scene,
+    textures: TextureStore,
+    image_renderer: ImageRenderer,
+    active_splash: Option<ActiveSplash>,
     pending_resize: Option<PhysicalSize<u32>>,
     next_resize_update: Option<Instant>,
     font_system: FontSystem,
@@ -133,6 +149,7 @@ impl WindowState {
         event_loop: &ActiveEventLoop,
         event_proxy: EventLoopProxy<UserEvent>,
         appearance: Appearance,
+        startup_splash: Option<StartupSplash>,
         diagnostics_shortcuts: DiagnosticsShortcuts,
     ) -> Result<Self> {
         let physical_size = window.inner_size();
@@ -211,6 +228,37 @@ impl WindowState {
         text_buffer.set_wrap(Wrap::None);
         let background =
             BackgroundRenderer::new(&device, &queue, &surface_config, &appearance.background)?;
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let active_splash = if let Some(splash) = startup_splash {
+            let max_dimension = device.limits().max_texture_dimension_2d;
+            let texture = background::load_static_texture(&splash.path, max_dimension)?;
+            let texture_id = textures.insert(texture);
+            let texture = textures
+                .texture(texture_id)
+                .context("could not retrieve the newly registered splash texture")?;
+            let node = scene.create_root(splash_properties(
+                texture,
+                surface_config.width,
+                surface_config.height,
+                scale_factor,
+            )?);
+            scene.set_content(
+                node,
+                NodeContent::Image(ImageNode::new(texture_id, splash.opacity)?),
+            )?;
+            let deadline = Instant::now()
+                .checked_add(splash.duration)
+                .context("appearance.startup_splash.duration_ms exceeds the supported duration")?;
+            Some(ActiveSplash {
+                node,
+                texture: texture_id,
+                deadline,
+            })
+        } else {
+            None
+        };
+        let image_renderer = ImageRenderer::new(&device, &surface_config);
 
         let mut state = Self {
             instance,
@@ -227,6 +275,10 @@ impl WindowState {
             pty,
             runtime,
             diagnostics,
+            scene,
+            textures,
+            image_renderer,
+            active_splash,
             pending_resize: None,
             next_resize_update: None,
             font_system,
@@ -379,12 +431,50 @@ impl WindowState {
             eprintln!("Moditty: {error:#}");
         }
         self.background.resize(&self.queue, &self.surface_config);
+        self.center_splash();
         self.sync_terminal_text(false);
         self.window.request_redraw();
     }
 
     fn next_resize_deadline(&self) -> Option<Instant> {
         self.pending_resize.as_ref().and(self.next_resize_update)
+    }
+
+    fn next_splash_deadline(&self) -> Option<Instant> {
+        self.active_splash.as_ref().map(|splash| splash.deadline)
+    }
+
+    fn advance_splash(&mut self, now: Instant) -> bool {
+        let Some(splash) = self.active_splash.as_ref() else {
+            return false;
+        };
+        if now < splash.deadline {
+            return false;
+        }
+        let Some(splash) = self.active_splash.take() else {
+            return false;
+        };
+        let _ = self.scene.remove_subtree(splash.node);
+        let _ = self.textures.remove(splash.texture);
+        true
+    }
+
+    fn center_splash(&mut self) {
+        let Some(splash) = self.active_splash.as_ref() else {
+            return;
+        };
+        let Some(texture) = self.textures.texture(splash.texture) else {
+            return;
+        };
+        let Ok(properties) = splash_properties(
+            texture,
+            self.surface_config.width,
+            self.surface_config.height,
+            self.scale_factor,
+        ) else {
+            return;
+        };
+        let _ = self.scene.set_properties(splash.node, properties);
     }
 
     fn scale_factor_changed(&mut self, scale_factor: f64) {
@@ -498,6 +588,17 @@ impl WindowState {
             }],
             &mut self.swash_cache,
         )?;
+        self.image_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &self.scene,
+            &self.textures,
+            ImageViewport::new(
+                self.surface_config.width,
+                self.surface_config.height,
+                self.scale_factor,
+            ),
+        )?;
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -550,6 +651,7 @@ impl WindowState {
             self.background.render(&mut pass);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)?;
+            self.image_renderer.render(&mut pass);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -565,6 +667,7 @@ struct ModittyApp {
     pointer_position: Vec2,
     event_proxy: EventLoopProxy<UserEvent>,
     appearance: Appearance,
+    startup_splash: Option<StartupSplash>,
     diagnostics_shortcuts: DiagnosticsShortcuts,
 }
 
@@ -572,6 +675,7 @@ impl ModittyApp {
     fn new(
         event_proxy: EventLoopProxy<UserEvent>,
         appearance: Appearance,
+        startup_splash: Option<StartupSplash>,
         diagnostics_shortcuts: DiagnosticsShortcuts,
     ) -> Self {
         Self {
@@ -580,6 +684,7 @@ impl ModittyApp {
             pointer_position: Vec2::default(),
             event_proxy,
             appearance,
+            startup_splash,
             diagnostics_shortcuts,
         }
     }
@@ -616,6 +721,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
             event_loop,
             event_proxy,
             self.appearance.clone(),
+            self.startup_splash.clone(),
             self.diagnostics_shortcuts.clone(),
         )) {
             Ok(state) => {
@@ -737,6 +843,9 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
             {
                 state.window.request_redraw();
             }
+            if state.advance_splash(now) && state.pending_resize.is_none() {
+                state.window.request_redraw();
+            }
             if state.diagnostics.needs_continuous_redraw() && state.pending_resize.is_none() {
                 state.window.request_redraw();
             }
@@ -744,6 +853,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
                 state.background.next_animation_frame(),
                 state.next_resize_deadline(),
                 state.runtime.next_tick_deadline(),
+                state.next_splash_deadline(),
             ]
             .into_iter()
             .flatten()
@@ -785,6 +895,30 @@ fn physical_padding(scale_factor: f64) -> u32 {
     (PADDING * scale_factor)
         .round()
         .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+fn splash_properties(
+    texture: &ResourceTexture,
+    surface_width: u32,
+    surface_height: u32,
+    scale_factor: f64,
+) -> Result<NodeProperties> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        anyhow::bail!("window scale factor must be a positive finite number");
+    }
+
+    let logical_width = f64::from(surface_width) / scale_factor;
+    let logical_height = f64::from(surface_height) / scale_factor;
+    let width = f64::from(texture.width());
+    let height = f64::from(texture.height());
+    Ok(NodeProperties {
+        transform: Transform::new(
+            (logical_width - width) / 2.0,
+            (logical_height - height) / 2.0,
+        )?,
+        bounds: Rect::new(0.0, 0.0, width, height)?,
+        ..NodeProperties::default()
+    })
 }
 
 fn select_surface_format(capabilities: &SurfaceCapabilities) -> Result<TextureFormat> {
@@ -1067,6 +1201,7 @@ fn main() -> Result<()> {
     let mut app = ModittyApp::new(
         event_loop.create_proxy(),
         loaded_config.appearance,
+        loaded_config.startup_splash,
         loaded_config.diagnostics,
     );
     event_loop
@@ -1088,12 +1223,16 @@ mod tests {
     use crate::{
         TerminalProgram, config::Appearance, engine_focus, engine_key, engine_modifiers,
         engine_pointer_button, engine_scroll_delta, grid_size, named_key_input, pty_size,
-        select_present_mode, select_surface_format, terminal_input, terminal_input_with_text,
+        select_present_mode, select_surface_format, splash_properties, terminal_input,
+        terminal_input_with_text,
     };
-    use moditty::runtime::{
-        EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent,
-        KeyState, Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton, Runtime,
-        ScrollUnit, Vec2,
+    use moditty::{
+        resources::Texture,
+        runtime::{
+            EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent,
+            KeyState, Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton,
+            Runtime, ScrollUnit, Vec2,
+        },
     };
 
     #[test]
@@ -1281,5 +1420,19 @@ mod tests {
         assert_eq!(size.rows, 24);
         assert_eq!(size.pixel_width, 960);
         assert_eq!(size.pixel_height, 640);
+    }
+
+    #[test]
+    fn centers_a_splash_at_its_natural_logical_size() {
+        let texture = Texture::from_rgba8(20, 10, vec![0; 20 * 10 * 4]).unwrap();
+
+        let properties = splash_properties(&texture, 200, 120, 2.0).unwrap();
+
+        assert_eq!(properties.transform.x(), 40.0);
+        assert_eq!(properties.transform.y(), 25.0);
+        assert_eq!(
+            properties.bounds,
+            moditty::scene::Rect::new(0.0, 0.0, 20.0, 10.0).unwrap()
+        );
     }
 }
