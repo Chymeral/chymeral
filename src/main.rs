@@ -18,6 +18,7 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
 };
+use moditty::interaction::SceneInteraction;
 use moditty::runtime::{
     EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent, KeyState,
     Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton, PointerEvent, Program,
@@ -36,7 +37,7 @@ use wgpu::{
 };
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalSize},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::{ElementState, KeyEvent as WinitKeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key as WinitKey, ModifiersState, NamedKey as WinitNamedKey},
@@ -129,6 +130,8 @@ struct WindowState {
     runtime: Runtime<TerminalProgram>,
     diagnostics: Diagnostics,
     scene: Scene,
+    interaction: SceneInteraction,
+    pointer_position: Vec2,
     textures: TextureStore,
     image_renderer: ImageRenderer,
     active_splash: Option<ActiveSplash>,
@@ -276,6 +279,8 @@ impl WindowState {
             runtime,
             diagnostics,
             scene,
+            interaction: SceneInteraction::new(),
+            pointer_position: Vec2::default(),
             textures,
             image_renderer,
             active_splash,
@@ -456,6 +461,7 @@ impl WindowState {
         };
         let _ = self.scene.remove_subtree(splash.node);
         let _ = self.textures.remove(splash.texture);
+        self.reconcile_scene_interaction();
         true
     }
 
@@ -474,7 +480,9 @@ impl WindowState {
         ) else {
             return;
         };
-        let _ = self.scene.set_properties(splash.node, properties);
+        if self.scene.set_properties(splash.node, properties).is_ok() {
+            self.reconcile_scene_interaction();
+        }
     }
 
     fn scale_factor_changed(&mut self, scale_factor: f64) {
@@ -494,6 +502,35 @@ impl WindowState {
         self.diagnostics.record_event(&event, Instant::now());
         if self.runtime.enqueue_event(event) {
             self.window.request_redraw();
+        }
+    }
+
+    fn handle_pointer_event(&mut self, event: PointerEvent) {
+        self.enqueue_event(EngineEvent::Pointer(event.clone()));
+        match self.interaction.route_pointer(&self.scene, &event) {
+            Ok(events) => {
+                for event in events {
+                    self.enqueue_event(EngineEvent::Scene(event));
+                }
+            }
+            Err(error) => eprintln!("Moditty: could not route pointer event: {error}"),
+        }
+    }
+
+    fn reconcile_scene_interaction(&mut self) {
+        match self.interaction.reconcile(&self.scene) {
+            Ok(events) => {
+                for event in events {
+                    self.enqueue_event(EngineEvent::Scene(event));
+                }
+            }
+            Err(error) => eprintln!("Moditty: could not reconcile scene interaction: {error}"),
+        }
+    }
+
+    fn handle_pointer_left(&mut self) {
+        for event in self.interaction.pointer_left() {
+            self.enqueue_event(EngineEvent::Scene(event));
         }
     }
 
@@ -664,7 +701,6 @@ impl WindowState {
 struct ModittyApp {
     state: Option<WindowState>,
     modifiers: ModifiersState,
-    pointer_position: Vec2,
     event_proxy: EventLoopProxy<UserEvent>,
     appearance: Appearance,
     startup_splash: Option<StartupSplash>,
@@ -681,7 +717,6 @@ impl ModittyApp {
         Self {
             state: None,
             modifiers: ModifiersState::default(),
-            pointer_position: Vec2::default(),
             event_proxy,
             appearance,
             startup_splash,
@@ -765,40 +800,53 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
                 self.with_state(|state| state.handle_key_event(event));
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer_position = Vec2 {
-                    x: position.x,
-                    y: position.y,
-                };
-                let event = EngineEvent::Pointer(PointerEvent::Move {
-                    position: self.pointer_position,
-                    modifiers: engine_modifiers(self.modifiers),
+                let modifiers = engine_modifiers(self.modifiers);
+                self.with_state(|state| {
+                    let Some(position) = logical_pointer_position(position, state.scale_factor)
+                    else {
+                        return;
+                    };
+                    state.pointer_position = position;
+                    state.handle_pointer_event(PointerEvent::Move {
+                        position,
+                        modifiers,
+                    });
                 });
-                self.with_state(|state| state.enqueue_event(event));
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.with_state(WindowState::handle_pointer_left);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let event = match state {
-                    ElementState::Pressed => PointerEvent::Press {
-                        button: engine_pointer_button(button),
-                        position: self.pointer_position,
-                        modifiers: engine_modifiers(self.modifiers),
-                    },
-                    ElementState::Released => PointerEvent::Release {
-                        button: engine_pointer_button(button),
-                        position: self.pointer_position,
-                        modifiers: engine_modifiers(self.modifiers),
-                    },
-                };
-                self.with_state(|state| state.enqueue_event(EngineEvent::Pointer(event)));
+                let modifiers = engine_modifiers(self.modifiers);
+                self.with_state(|window| {
+                    let event = match state {
+                        ElementState::Pressed => PointerEvent::Press {
+                            button: engine_pointer_button(button),
+                            position: window.pointer_position,
+                            modifiers,
+                        },
+                        ElementState::Released => PointerEvent::Release {
+                            button: engine_pointer_button(button),
+                            position: window.pointer_position,
+                            modifiers,
+                        },
+                    };
+                    window.handle_pointer_event(event);
+                });
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (delta, unit) = engine_scroll_delta(delta);
-                let event = EngineEvent::Scroll(ScrollEvent {
-                    position: self.pointer_position,
-                    delta,
-                    unit,
-                    modifiers: engine_modifiers(self.modifiers),
+                let modifiers = engine_modifiers(self.modifiers);
+                self.with_state(|state| {
+                    let Some((delta, unit)) = engine_scroll_delta(delta, state.scale_factor) else {
+                        return;
+                    };
+                    state.enqueue_event(EngineEvent::Scroll(ScrollEvent {
+                        position: state.pointer_position,
+                        delta,
+                        unit,
+                        modifiers,
+                    }));
                 });
-                self.with_state(|state| state.enqueue_event(event));
             }
             WindowEvent::Focused(focused) => {
                 let event = EngineEvent::Focus(engine_focus(focused));
@@ -950,6 +998,21 @@ fn pty_size(columns: u16, rows: u16, size: PhysicalSize<u32>) -> PtySize {
     }
 }
 
+fn logical_pointer_position(position: PhysicalPosition<f64>, scale_factor: f64) -> Option<Vec2> {
+    if !position.x.is_finite()
+        || !position.y.is_finite()
+        || !scale_factor.is_finite()
+        || scale_factor <= 0.0
+    {
+        return None;
+    }
+    let position = Vec2 {
+        x: position.x / scale_factor,
+        y: position.y / scale_factor,
+    };
+    (position.x.is_finite() && position.y.is_finite()).then_some(position)
+}
+
 fn engine_key_event(event: &WinitKeyEvent, modifiers: ModifiersState) -> EngineKeyEvent {
     EngineKeyEvent {
         key: engine_key(&event.logical_key),
@@ -1014,8 +1077,11 @@ fn engine_pointer_button(button: MouseButton) -> PointerButton {
     }
 }
 
-fn engine_scroll_delta(delta: MouseScrollDelta) -> (Vec2, ScrollUnit) {
-    match delta {
+fn engine_scroll_delta(delta: MouseScrollDelta, scale_factor: f64) -> Option<(Vec2, ScrollUnit)> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    let (delta, unit) = match delta {
         MouseScrollDelta::LineDelta(x, y) => (
             Vec2 {
                 x: f64::from(x),
@@ -1025,12 +1091,13 @@ fn engine_scroll_delta(delta: MouseScrollDelta) -> (Vec2, ScrollUnit) {
         ),
         MouseScrollDelta::PixelDelta(delta) => (
             Vec2 {
-                x: delta.x,
-                y: delta.y,
+                x: delta.x / scale_factor,
+                y: delta.y / scale_factor,
             },
             ScrollUnit::Pixel,
         ),
-    }
+    };
+    (delta.x.is_finite() && delta.y.is_finite()).then_some((delta, unit))
 }
 
 fn engine_focus(focused: bool) -> FocusEvent {
@@ -1215,16 +1282,16 @@ mod tests {
 
     use wgpu::{PresentMode, SurfaceCapabilities, TextureFormat};
     use winit::{
-        dpi::PhysicalSize,
+        dpi::{PhysicalPosition, PhysicalSize},
         event::{MouseButton, MouseScrollDelta},
         keyboard::{Key as WinitKey, ModifiersState, NamedKey as WinitNamedKey},
     };
 
     use crate::{
         TerminalProgram, config::Appearance, engine_focus, engine_key, engine_modifiers,
-        engine_pointer_button, engine_scroll_delta, grid_size, named_key_input, pty_size,
-        select_present_mode, select_surface_format, splash_properties, terminal_input,
-        terminal_input_with_text,
+        engine_pointer_button, engine_scroll_delta, grid_size, logical_pointer_position,
+        named_key_input, pty_size, select_present_mode, select_surface_format, splash_properties,
+        terminal_input, terminal_input_with_text,
     };
     use moditty::{
         resources::Texture,
@@ -1379,11 +1446,30 @@ mod tests {
             PointerButton::Other(7)
         );
         assert_eq!(
-            engine_scroll_delta(MouseScrollDelta::LineDelta(1.5, -2.0)),
-            (Vec2 { x: 1.5, y: -2.0 }, ScrollUnit::Line)
+            engine_scroll_delta(MouseScrollDelta::LineDelta(1.5, -2.0), 2.0),
+            Some((Vec2 { x: 1.5, y: -2.0 }, ScrollUnit::Line))
         );
         assert_eq!(engine_focus(true), FocusEvent::Gained);
         assert_eq!(engine_focus(false), FocusEvent::Lost);
+    }
+
+    #[test]
+    fn normalizes_pointer_and_pixel_scroll_coordinates_to_logical_space() {
+        assert_eq!(
+            logical_pointer_position(PhysicalPosition::new(200.0, 100.0), 2.0),
+            Some(Vec2 { x: 100.0, y: 50.0 })
+        );
+        assert_eq!(
+            engine_scroll_delta(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(80.0, -40.0)),
+                2.0,
+            ),
+            Some((Vec2 { x: 40.0, y: -20.0 }, ScrollUnit::Pixel))
+        );
+        assert_eq!(
+            logical_pointer_position(PhysicalPosition::new(f64::NAN, 0.0), 1.0),
+            None
+        );
     }
 
     #[test]

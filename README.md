@@ -331,9 +331,8 @@ Ejemplo conceptual:
 enum EngineEvent {
     Key(KeyEvent),
 
-    PointerMove(PointerMoveEvent),
-    PointerDown(PointerButtonEvent),
-    PointerUp(PointerButtonEvent),
+    Pointer(PointerEvent),
+    Scene(SceneEvent),
 
     DragStart(DragEvent),
     Drag(DragEvent),
@@ -366,9 +365,9 @@ normalización
     ↓
 EngineEvent
     ↓
-hit testing / focus / dispatch
+hit testing / focus
     ↓
-scene
+EngineEvent::Scene
     ↓
 mods
 ```
@@ -533,8 +532,24 @@ pintura del scene graph.
 Un nodo no requiere contenido ni una marca de interactividad para participar:
 M6 sólo resuelve geometría. Un hijo puede detectarse fuera de los bounds de su
 padre porque todavía no hay clipping; M9 introducirá límites de dibujo y estas
-consultas aplicarán los mismos límites. M6 no convierte eventos de plataforma
-ni los despacha: eso pertenece a M7.
+consultas aplicarán los mismos límites.
+
+M7 mantiene `hovered_node` y `focused_node` y convierte las posiciones de
+puntero y scroll en píxeles lógicos antes de crear eventos. Conserva los
+`EngineEvent::Pointer`, `Scroll` y `Focus` crudos; después del puntero crudo
+emite el canal separado `EngineEvent::Scene` con `PointerEnter`, `PointerLeave`,
+`PointerMove`, `PointerPress`, `PointerRelease`, `FocusGained` y `FocusLost`.
+La salida del cursor de la ventana también emite `PointerLeave`.
+Un clic primario actualiza el foco, un clic primario en espacio vacío lo limpia
+y los otros botones no lo alteran. La pérdida de foco de la ventana no cambia
+el foco de escena.
+
+La liberación se dirige al nodo bajo el cursor en ese momento. M7 no añade
+captura de puntero, click/doble click, touch, foco por teclado, navegación por
+Tab ni entrega de teclado al nodo enfocado; esos comportamientos se incorporan
+en milestones posteriores. Si un nodo hovered o focused se elimina, se oculta o
+deja de estar en el orden de pintura, la interacción se reconcilia y emite la
+salida correspondiente.
 
 La siguiente infraestructura permite:
 

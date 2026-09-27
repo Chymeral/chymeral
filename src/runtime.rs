@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::scene::NodeId;
+
 const MAX_TICKS_PER_FRAME: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +200,43 @@ pub enum FocusEvent {
     Lost,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum SceneEvent {
+    PointerEnter {
+        target: NodeId,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    PointerLeave {
+        target: NodeId,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    PointerMove {
+        target: NodeId,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    PointerPress {
+        target: NodeId,
+        button: PointerButton,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    PointerRelease {
+        target: NodeId,
+        button: PointerButton,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    FocusGained {
+        target: NodeId,
+    },
+    FocusLost {
+        target: NodeId,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
     OutputAvailable,
@@ -214,6 +253,7 @@ pub struct CustomEvent {
 pub enum EngineEvent {
     Key(KeyEvent),
     Pointer(PointerEvent),
+    Scene(SceneEvent),
     Scroll(ScrollEvent),
     Focus(FocusEvent),
     Terminal(TerminalEvent),
@@ -516,6 +556,7 @@ mod tests {
             let name = match event {
                 EngineEvent::Key(_) => "key",
                 EngineEvent::Pointer(_) => "pointer",
+                EngineEvent::Scene(_) => "scene",
                 EngineEvent::Scroll(_) => "scroll",
                 EngineEvent::Focus(_) => "focus",
                 EngineEvent::Terminal(_) => "terminal",
@@ -604,6 +645,7 @@ mod tests {
         let now = Instant::now();
         let mut runtime = runtime(Recorder::default());
         runtime.initialize(InitContext::default(), now).unwrap();
+        let node = crate::scene::Scene::new().create_root(crate::scene::NodeProperties::default());
         for event in [
             EngineEvent::Key(KeyEvent {
                 key: Key::Character("a".into()),
@@ -616,6 +658,7 @@ mod tests {
                 position: Vec2 { x: 12.0, y: 24.0 },
                 modifiers: Modifiers::default(),
             }),
+            EngineEvent::Scene(SceneEvent::FocusGained { target: node }),
             EngineEvent::Scroll(ScrollEvent {
                 position: Vec2 { x: 12.0, y: 24.0 },
                 delta: Vec2 { x: 0.0, y: -1.0 },
@@ -636,6 +679,7 @@ mod tests {
                 "start",
                 "event:key",
                 "event:pointer",
+                "event:scene",
                 "event:scroll",
                 "event:focus",
             ]

@@ -305,6 +305,7 @@ fn describe_event(event: &EngineEvent) -> String {
             format!("key {action} {key}{}", modifier_text(event.modifiers))
         }
         EngineEvent::Pointer(event) => format!("pointer {event:?}"),
+        EngineEvent::Scene(event) => format!("scene {event:?}"),
         EngineEvent::Scroll(event) => format!(
             "scroll unit={:?} delta=({:.1}, {:.1}) position=({:.1}, {:.1}){}",
             event.unit,
@@ -343,6 +344,11 @@ fn modifier_text(modifiers: Modifiers) -> String {
 
 #[cfg(test)]
 mod tests {
+    use moditty::{
+        runtime::SceneEvent,
+        scene::{NodeProperties, Scene},
+    };
+
     use super::*;
 
     fn key_event(key: char, modifiers: Modifiers) -> EngineKeyEvent {
@@ -395,6 +401,24 @@ mod tests {
             .unwrap();
         assert!(text.contains("<redacted>"));
         assert!(!text.contains("top-secret"));
+    }
+
+    #[test]
+    fn records_targeted_scene_events() {
+        let now = Instant::now();
+        let mut diagnostics = Diagnostics::new(
+            DiagnosticsShortcuts::default(),
+            now,
+            RuntimeMetrics::default(),
+        );
+        diagnostics.active = Some(DiagnosticView::Events);
+        let target = Scene::new().create_root(NodeProperties::default());
+        diagnostics.record_event(&EngineEvent::Scene(SceneEvent::FocusGained { target }), now);
+
+        let text = diagnostics
+            .render_text(RuntimeMetrics::default(), 10)
+            .unwrap();
+        assert!(text.contains("scene FocusGained"));
     }
 
     #[test]
