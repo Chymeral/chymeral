@@ -487,6 +487,23 @@ M3 no añade imágenes, texto de escena, texturas, hit testing, colisiones,
 layouts, widgets ni APIs de plugins. Esos sistemas consumirán esta estructura
 sin alterar sus invariantes.
 
+## Recursos gráficos
+
+M4 introduce un registro interno de texturas inmutables. Una textura almacena
+píxeles rasterizados RGBA8 sRGB con alfa no premultiplicado; no representa una
+posición ni un elemento visible de la escena. Las imágenes en formatos como
+PNG, JPEG o GIF deben decodificarse primero a estos píxeles.
+
+Cada recurso recibe un `TextureId { index, generation }` generacional. El
+registro permite insertar, consultar y eliminar texturas; eliminar una textura
+invalida su handle anterior incluso si se reutiliza el slot interno. El
+registro no conoce el scene graph y no expone tipos de `wgpu`.
+
+M4 valida dimensiones no nulas y la correspondencia exacta entre dimensiones y
+bytes RGBA8, pero no define cuotas globales de memoria, actualizaciones de
+píxeles, render targets, animación ni carga de archivos. M5 asociará un
+`TextureId` con un nodo de imagen y será el primer milestone que lo dibuje.
+
 ## Interacción y colisiones
 
 Las necesidades iniciales son de UI, no de física.
