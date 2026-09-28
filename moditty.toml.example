@@ -43,3 +43,29 @@ enabled = false
 diagnostics_events = "Ctrl+Shift+E"
 diagnostics_ticks = "Ctrl+Shift+T"
 diagnostics_frames = "Ctrl+Shift+F"
+
+# Herramientas internas de prueba. No forman parte de la API de mods y se
+# desactivan por defecto. Los nodos se dibujan sobre la terminal en píxeles
+# lógicos y participan en hit testing, foco y drag and drop.
+[testing_tools.scene]
+enabled = false
+
+# [[testing_tools.scene.nodes]]
+# id = "source"
+# x = 48.0
+# y = 72.0
+# width = 160.0
+# height = 96.0
+# color = "#F97316"
+# opacity = 0.85
+# z_index = 0
+
+# [[testing_tools.scene.nodes]]
+# id = "target"
+# x = 288.0
+# y = 72.0
+# width = 160.0
+# height = 96.0
+# color = "#2563EB"
+# opacity = 0.85
+# z_index = 0

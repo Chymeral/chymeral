@@ -370,6 +370,23 @@ impl Scene {
         Ok(None)
     }
 
+    pub fn hit_test_excluding_subtree(
+        &self,
+        point: Point,
+        excluded: NodeId,
+    ) -> Result<Option<NodeId>, SceneError> {
+        self.require_node(excluded)?;
+        for node in self.paint_order().into_iter().rev() {
+            if self.is_descendant_of(node, excluded) {
+                continue;
+            }
+            if self.world_bounds(node)?.contains(point) {
+                return Ok(Some(node));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn hit_test_rect(&self, bounds: Rect) -> Result<Vec<NodeId>, SceneError> {
         let mut nodes = Vec::new();
         for node in self.paint_order().into_iter().rev() {
@@ -736,6 +753,52 @@ mod tests {
         assert_eq!(
             scene.hit_test(Point::new(15.0, 5.0).unwrap()).unwrap(),
             Some(child)
+        );
+    }
+
+    #[test]
+    fn hit_testing_can_exclude_a_node_and_its_descendants() {
+        let mut scene = Scene::new();
+        let bounds = Rect::new(0.0, 0.0, 100.0, 100.0).unwrap();
+        let parent = scene.create_root(NodeProperties {
+            bounds,
+            ..properties(0)
+        });
+        let source = scene
+            .create_child(
+                parent,
+                NodeProperties {
+                    bounds,
+                    ..properties(1)
+                },
+            )
+            .unwrap();
+        let child = scene
+            .create_child(
+                source,
+                NodeProperties {
+                    bounds,
+                    ..properties(2)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            scene
+                .hit_test_excluding_subtree(Point::new(50.0, 50.0).unwrap(), source)
+                .unwrap(),
+            Some(parent)
+        );
+        assert!(
+            scene
+                .hit_test_excluding_subtree(Point::new(50.0, 50.0).unwrap(), child)
+                .is_ok()
+        );
+        scene.remove_subtree(source).unwrap();
+        assert!(
+            scene
+                .hit_test_excluding_subtree(Point::new(50.0, 50.0).unwrap(), source)
+                .is_err()
         );
     }
 

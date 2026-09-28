@@ -46,7 +46,7 @@ use winit::{
 
 use crate::{
     background::BackgroundRenderer,
-    config::{Appearance, FontAppearance, FontSource, Rgb, StartupSplash},
+    config::{Appearance, FontAppearance, FontSource, Rgb, StartupSplash, TestingScene},
     diagnostics::{Diagnostics, DiagnosticsShortcuts},
     pty::Pty,
     scene_renderer::{ImageRenderer, ImageViewport},
@@ -153,6 +153,7 @@ impl WindowState {
         event_proxy: EventLoopProxy<UserEvent>,
         appearance: Appearance,
         startup_splash: Option<StartupSplash>,
+        testing_scene: Option<TestingScene>,
         diagnostics_shortcuts: DiagnosticsShortcuts,
     ) -> Result<Self> {
         let physical_size = window.inner_size();
@@ -233,6 +234,9 @@ impl WindowState {
             BackgroundRenderer::new(&device, &queue, &surface_config, &appearance.background)?;
         let mut scene = Scene::new();
         let mut textures = TextureStore::new();
+        if let Some(testing_scene) = testing_scene.as_ref() {
+            install_testing_scene(&mut scene, &mut textures, testing_scene)?;
+        }
         let active_splash = if let Some(splash) = startup_splash {
             let max_dimension = device.limits().max_texture_dimension_2d;
             let texture = background::load_static_texture(&splash.path, max_dimension)?;
@@ -534,6 +538,12 @@ impl WindowState {
         }
     }
 
+    fn cancel_scene_drag(&mut self) {
+        for event in self.interaction.window_focus_lost() {
+            self.enqueue_event(EngineEvent::Scene(event));
+        }
+    }
+
     fn handle_key_event(&mut self, event: EngineKeyEvent) {
         let was_active = self.diagnostics.is_active();
         if self
@@ -704,6 +714,7 @@ struct ModittyApp {
     event_proxy: EventLoopProxy<UserEvent>,
     appearance: Appearance,
     startup_splash: Option<StartupSplash>,
+    testing_scene: Option<TestingScene>,
     diagnostics_shortcuts: DiagnosticsShortcuts,
 }
 
@@ -712,6 +723,7 @@ impl ModittyApp {
         event_proxy: EventLoopProxy<UserEvent>,
         appearance: Appearance,
         startup_splash: Option<StartupSplash>,
+        testing_scene: Option<TestingScene>,
         diagnostics_shortcuts: DiagnosticsShortcuts,
     ) -> Self {
         Self {
@@ -720,6 +732,7 @@ impl ModittyApp {
             event_proxy,
             appearance,
             startup_splash,
+            testing_scene,
             diagnostics_shortcuts,
         }
     }
@@ -757,6 +770,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
             event_proxy,
             self.appearance.clone(),
             self.startup_splash.clone(),
+            self.testing_scene.clone(),
             self.diagnostics_shortcuts.clone(),
         )) {
             Ok(state) => {
@@ -850,7 +864,12 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
             }
             WindowEvent::Focused(focused) => {
                 let event = EngineEvent::Focus(engine_focus(focused));
-                self.with_state(|state| state.enqueue_event(event));
+                self.with_state(|state| {
+                    state.enqueue_event(event);
+                    if !focused {
+                        state.cancel_scene_drag();
+                    }
+                });
             }
             WindowEvent::RedrawRequested => {
                 let mut runtime_error = None;
@@ -943,6 +962,45 @@ fn physical_padding(scale_factor: f64) -> u32 {
     (PADDING * scale_factor)
         .round()
         .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+fn install_testing_scene(
+    scene: &mut Scene,
+    textures: &mut TextureStore,
+    testing_scene: &TestingScene,
+) -> Result<()> {
+    for testing_node in &testing_scene.nodes {
+        let texture = ResourceTexture::from_rgba8(
+            1,
+            1,
+            vec![
+                testing_node.color.red,
+                testing_node.color.green,
+                testing_node.color.blue,
+                255,
+            ],
+        )?;
+        let texture = textures.insert(texture);
+        let node = scene.create_root(testing_node_properties(testing_node)?);
+        scene.set_content(
+            node,
+            NodeContent::Image(ImageNode::new(texture, testing_node.opacity)?),
+        )?;
+        eprintln!(
+            "Moditty: testing scene node {:?} uses {node:?}",
+            testing_node.id
+        );
+    }
+    Ok(())
+}
+
+fn testing_node_properties(testing_node: &config::TestingNode) -> Result<NodeProperties> {
+    Ok(NodeProperties {
+        transform: Transform::new(testing_node.x, testing_node.y)?,
+        bounds: Rect::new(0.0, 0.0, testing_node.width, testing_node.height)?,
+        z_index: testing_node.z_index,
+        ..NodeProperties::default()
+    })
 }
 
 fn splash_properties(
@@ -1269,6 +1327,7 @@ fn main() -> Result<()> {
         event_loop.create_proxy(),
         loaded_config.appearance,
         loaded_config.startup_splash,
+        loaded_config.testing_scene,
         loaded_config.diagnostics,
     );
     event_loop
@@ -1288,10 +1347,12 @@ mod tests {
     };
 
     use crate::{
-        TerminalProgram, config::Appearance, engine_focus, engine_key, engine_modifiers,
-        engine_pointer_button, engine_scroll_delta, grid_size, logical_pointer_position,
-        named_key_input, pty_size, select_present_mode, select_surface_format, splash_properties,
-        terminal_input, terminal_input_with_text,
+        TerminalProgram,
+        config::{Appearance, Rgb, TestingNode},
+        engine_focus, engine_key, engine_modifiers, engine_pointer_button, engine_scroll_delta,
+        grid_size, logical_pointer_position, named_key_input, pty_size, select_present_mode,
+        select_surface_format, splash_properties, terminal_input, terminal_input_with_text,
+        testing_node_properties,
     };
     use moditty::{
         resources::Texture,
@@ -1520,5 +1581,28 @@ mod tests {
             properties.bounds,
             moditty::scene::Rect::new(0.0, 0.0, 20.0, 10.0).unwrap()
         );
+    }
+
+    #[test]
+    fn builds_testing_nodes_in_logical_scene_coordinates() {
+        let properties = testing_node_properties(&TestingNode {
+            id: "source".to_owned(),
+            x: 24.0,
+            y: 48.0,
+            width: 120.0,
+            height: 80.0,
+            color: Rgb::new(255, 102, 0),
+            opacity: 0.75,
+            z_index: 3,
+        })
+        .unwrap();
+
+        assert_eq!(properties.transform.x(), 24.0);
+        assert_eq!(properties.transform.y(), 48.0);
+        assert_eq!(
+            properties.bounds,
+            moditty::scene::Rect::new(0.0, 0.0, 120.0, 80.0).unwrap()
+        );
+        assert_eq!(properties.z_index, 3);
     }
 }

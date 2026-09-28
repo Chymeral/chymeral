@@ -235,6 +235,47 @@ pub enum SceneEvent {
     FocusLost {
         target: NodeId,
     },
+    DragStart {
+        source: NodeId,
+        origin: Vec2,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    DragEnter {
+        source: NodeId,
+        target: NodeId,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    DragLeave {
+        source: NodeId,
+        target: NodeId,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    DragMove {
+        source: NodeId,
+        target: Option<NodeId>,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    Drop {
+        source: NodeId,
+        target: NodeId,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    DragEnd {
+        source: NodeId,
+        target: Option<NodeId>,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
+    DragCancel {
+        source: NodeId,
+        position: Vec2,
+        modifiers: Modifiers,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

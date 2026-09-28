@@ -334,10 +334,6 @@ enum EngineEvent {
     Pointer(PointerEvent),
     Scene(SceneEvent),
 
-    DragStart(DragEvent),
-    Drag(DragEvent),
-    DragEnd(DragEvent),
-
     FileHover(FileEvent),
     FileDrop(FileEvent),
 
@@ -545,11 +541,32 @@ y los otros botones no lo alteran. La pérdida de foco de la ventana no cambia
 el foco de escena.
 
 La liberación se dirige al nodo bajo el cursor en ese momento. M7 no añade
-captura de puntero, click/doble click, touch, foco por teclado, navegación por
-Tab ni entrega de teclado al nodo enfocado; esos comportamientos se incorporan
-en milestones posteriores. Si un nodo hovered o focused se elimina, se oculta o
-deja de estar en el orden de pintura, la interacción se reconcilia y emite la
-salida correspondiente.
+click/doble click, touch, foco por teclado, navegación por Tab ni entrega de
+teclado al nodo enfocado; esos comportamientos se incorporan en milestones
+posteriores. Si un nodo hovered o focused se elimina, se oculta o deja de estar
+en el orden de pintura, la interacción se reconcilia y emite la salida
+correspondiente.
+
+M8 añade drag and drop al canal derivado `EngineEvent::Scene`, sin alterar los
+eventos de puntero crudos. Un `PointerPress` primario sobre un nodo visible crea
+un candidato; el drag comienza al recorrer una distancia euclídea de al menos
+4 píxeles lógicos. Desde ese momento se emiten `DragStart`, `DragEnter`,
+`DragLeave` y `DragMove`. Este último contiene un destino opcional y se emite
+en cada movimiento del puntero mientras el drag esté activo.
+
+El destino se obtiene con hit testing de los bounds visibles. El origen y todos
+sus descendientes se excluyen para impedir soltarse sobre sí mismo, pero un
+ancestro del origen sigue siendo un destino válido. En la liberación primaria,
+un destino produce `Drop` seguido de `DragEnd`; fuera de un destino sólo se
+emite `DragEnd`. Moditty no mueve nodos ni cambia su contenido automáticamente:
+el consumidor de los eventos decide cualquier efecto visual o lógico.
+
+La captura de M8 es lógica, no un grab del cursor del sistema. Por ello, salir
+de la ventana conserva el drag activo, emite las salidas de hover y de destino,
+y permite continuarlo cuando el cursor vuelve. Perder el foco de la ventana
+cancela un drag activo mediante `DragCancel`. Si su origen se elimina u oculta,
+la reconciliación también lo cancela. M8 sigue limitado al botón primario y no
+añade gestos táctiles ni comportamiento de click.
 
 La siguiente infraestructura permite:
 
@@ -920,7 +937,53 @@ Las vistas internas de diagnóstico permiten comprobar visualmente la integraci�
 
 La vista es modal y permanece abierta hasta pulsar `Escape`. Limpia sólo la representación visual de Moditty: el PTY continúa procesando la salida del shell, pero los caracteres escritos mientras el diagnóstico está activo no se envían a éste. Al volver, se muestra la terminal en su estado actual.
 
-`events` muestra los sucesos canónicos de teclado, puntero, scroll, foco y terminal. El texto imprimible y los eventos personalizados se redactan. `ticks` y `frames` muestran contadores, `dt`, ticks asociados al frame y ticks descartados por recuperación. Cada vista conserva un buffer circular de las últimas 128 entradas relevantes.
+`events` muestra los sucesos canónicos de teclado, puntero, scroll, foco,
+terminal y escena, incluidos los de drag. El texto imprimible y los eventos
+personalizados se redactan. `ticks` y `frames` muestran contadores, `dt`,
+ticks asociados al frame y ticks descartados por recuperación. Cada vista
+conserva un buffer circular de las últimas 128 entradas relevantes.
+
+### Herramientas de prueba
+
+`testing_tools.scene` permite preparar una escena manual mínima para verificar
+el comportamiento nativo del motor antes de que exista la API de mods. Está
+desactivada por defecto y no crea un programa, un plugin ni una interfaz pública.
+Al habilitarla, cada entrada de `[[testing_tools.scene.nodes]]` crea un rectángulo
+de color sobre la terminal. Sus coordenadas, dimensiones y `z_index` usan
+píxeles lógicos; `opacity` afecta sólo ese rectángulo.
+
+~~~toml
+[testing_tools.scene]
+enabled = true
+
+[[testing_tools.scene.nodes]]
+id = "source"
+x = 48.0
+y = 72.0
+width = 160.0
+height = 96.0
+color = "#F97316"
+opacity = 0.85
+z_index = 0
+
+[[testing_tools.scene.nodes]]
+id = "target"
+x = 288.0
+y = 72.0
+width = 160.0
+height = 96.0
+color = "#2563EB"
+opacity = 0.85
+z_index = 0
+~~~
+
+Los identificadores deben ser únicos. Al iniciar, Moditty escribe la relación
+entre cada `id` y su `NodeId` en stderr; `Ctrl+Shift+E` muestra después los
+`SceneEvent` asociados a esos handles. Así se pueden probar hover, foco, orden
+de superposición y drag and drop con dos rectángulos sin recursos externos.
+Los nodos de prueba siguen las mismas reglas de escena que los de producción y
+se dibujan después de la superficie de texto, incluso durante diagnóstico. Una
+splash activa queda sobre ellos hasta expirar.
 
 ## Orden aproximado de desarrollo
 
@@ -934,7 +997,7 @@ M4  recursos gráficos y TextureId
 M5  ImageNode
 M6  hit testing
 M7  mouse/focus
-M8  drag and drop
+M8  drag and drop + herramientas de prueba
 M9  clipping/layers
 M10 API interna estable
 M11 STAPI

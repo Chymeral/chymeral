@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -103,6 +104,23 @@ pub struct StartupSplash {
     pub opacity: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TestingScene {
+    pub nodes: Vec<TestingNode>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TestingNode {
+    pub id: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub color: Rgb,
+    pub opacity: f32,
+    pub z_index: i32,
+}
+
 impl Background {
     pub fn opacity(&self) -> f32 {
         match self {
@@ -128,6 +146,7 @@ pub struct LoadedConfig {
     pub appearance: Appearance,
     pub startup_splash: Option<StartupSplash>,
     pub diagnostics: DiagnosticsShortcuts,
+    pub testing_scene: Option<TestingScene>,
     pub path: Option<PathBuf>,
 }
 
@@ -137,6 +156,7 @@ pub fn load() -> Result<LoadedConfig> {
             appearance: Appearance::default(),
             startup_splash: None,
             diagnostics: DiagnosticsShortcuts::default(),
+            testing_scene: None,
             path: None,
         });
     };
@@ -146,6 +166,7 @@ pub fn load() -> Result<LoadedConfig> {
             appearance: Appearance::default(),
             startup_splash: None,
             diagnostics: DiagnosticsShortcuts::default(),
+            testing_scene: None,
             path: None,
         });
     }
@@ -160,6 +181,7 @@ pub fn load() -> Result<LoadedConfig> {
         appearance: parsed.appearance,
         startup_splash: parsed.startup_splash,
         diagnostics: parsed.diagnostics,
+        testing_scene: parsed.testing_scene,
         path: Some(path),
     })
 }
@@ -201,6 +223,7 @@ struct ParsedConfig {
     appearance: Appearance,
     startup_splash: Option<StartupSplash>,
     diagnostics: DiagnosticsShortcuts,
+    testing_scene: Option<TestingScene>,
 }
 
 fn parse_config(contents: &str, base_directory: &Path) -> Result<ParsedConfig> {
@@ -209,11 +232,13 @@ fn parse_config(contents: &str, base_directory: &Path) -> Result<ParsedConfig> {
         terminal,
         appearance,
         input,
+        testing_tools,
     } = raw;
     Ok(ParsedConfig {
         appearance: terminal.into_appearance(base_directory)?,
         startup_splash: appearance.into_startup_splash(base_directory)?,
         diagnostics: input.shortcuts.into_shortcuts()?,
+        testing_scene: testing_tools.into_scene()?,
     })
 }
 
@@ -226,6 +251,96 @@ struct RawConfig {
     appearance: RawAppearance,
     #[serde(default)]
     input: RawInput,
+    #[serde(default)]
+    testing_tools: RawTestingTools,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTestingTools {
+    #[serde(default)]
+    scene: RawTestingScene,
+}
+
+impl RawTestingTools {
+    fn into_scene(self) -> Result<Option<TestingScene>> {
+        self.scene.into_scene()
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTestingScene {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    nodes: Vec<RawTestingNode>,
+}
+
+impl RawTestingScene {
+    fn into_scene(self) -> Result<Option<TestingScene>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        if self.nodes.is_empty() {
+            bail!("testing_tools.scene.nodes must contain at least one node when enabled = true");
+        }
+
+        let mut ids = HashSet::new();
+        let nodes = self
+            .nodes
+            .into_iter()
+            .map(|node| node.into_node(&mut ids))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(TestingScene { nodes }))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTestingNode {
+    id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    color: String,
+    #[serde(default = "default_opacity")]
+    opacity: f32,
+    #[serde(default)]
+    z_index: i32,
+}
+
+impl RawTestingNode {
+    fn into_node(self, ids: &mut HashSet<String>) -> Result<TestingNode> {
+        let id = self.id.trim().to_owned();
+        if id.is_empty() {
+            bail!("testing_tools.scene.nodes[].id must not be empty");
+        }
+        if !ids.insert(id.clone()) {
+            bail!("testing_tools.scene.nodes[].id {id:?} is duplicated");
+        }
+        validate_finite("testing_tools.scene.nodes[].x", self.x)?;
+        validate_finite("testing_tools.scene.nodes[].y", self.y)?;
+        validate_positive_f64("testing_tools.scene.nodes[].width", self.width)?;
+        validate_positive_f64("testing_tools.scene.nodes[].height", self.height)?;
+        if !(self.x + self.width).is_finite() || !(self.y + self.height).is_finite() {
+            bail!("testing_tools.scene.nodes[] bounds must remain finite");
+        }
+        if !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
+            bail!("testing_tools.scene.nodes[].opacity must be between 0.0 and 1.0");
+        }
+        Ok(TestingNode {
+            id,
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            color: parse_hex_color("testing_tools.scene.nodes[].color", &self.color)?,
+            opacity: self.opacity,
+            z_index: self.z_index,
+        })
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -602,13 +717,27 @@ fn validate_positive(name: &str, value: f32) -> Result<()> {
     Ok(())
 }
 
+fn validate_finite(name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() {
+        bail!("{name} must be finite");
+    }
+    Ok(())
+}
+
+fn validate_positive_f64(name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() || value <= 0.0 {
+        bail!("{name} must be a positive finite number");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, time::Duration};
 
     use super::{
-        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, StartupSplash, parse,
-        parse_config, parse_hex_color,
+        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, StartupSplash, TestingNode,
+        TestingScene, parse, parse_config, parse_hex_color,
     };
     use crate::diagnostics::Shortcut;
 
@@ -824,6 +953,108 @@ mod tests {
                 image = "splash.png"
                 opacity = 1.1
             "#,
+        ] {
+            assert!(parse_config(contents, Path::new("/tmp/moditty-config")).is_err());
+        }
+    }
+
+    #[test]
+    fn loads_a_testing_scene_with_distinct_named_nodes() {
+        let config = parse_config(
+            r##"
+                [testing_tools.scene]
+                enabled = true
+
+                [[testing_tools.scene.nodes]]
+                id = "source"
+                x = 24.0
+                y = 48.0
+                width = 120.0
+                height = 80.0
+                color = "#FF6600"
+                opacity = 0.75
+                z_index = 1
+
+                [[testing_tools.scene.nodes]]
+                id = "target"
+                x = 200.0
+                y = 48.0
+                width = 120.0
+                height = 80.0
+                color = "#0066FF"
+            "##,
+            Path::new("/tmp/moditty-config"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.testing_scene,
+            Some(TestingScene {
+                nodes: vec![
+                    TestingNode {
+                        id: "source".to_owned(),
+                        x: 24.0,
+                        y: 48.0,
+                        width: 120.0,
+                        height: 80.0,
+                        color: Rgb::new(255, 102, 0),
+                        opacity: 0.75,
+                        z_index: 1,
+                    },
+                    TestingNode {
+                        id: "target".to_owned(),
+                        x: 200.0,
+                        y: 48.0,
+                        width: 120.0,
+                        height: 80.0,
+                        color: Rgb::new(0, 102, 255),
+                        opacity: 1.0,
+                        z_index: 0,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_enabled_testing_scene() {
+        for contents in [
+            r#"
+                [testing_tools.scene]
+                enabled = true
+            "#,
+            r##"
+                [testing_tools.scene]
+                enabled = true
+
+                [[testing_tools.scene.nodes]]
+                id = "same"
+                x = 0.0
+                y = 0.0
+                width = 10.0
+                height = 10.0
+                color = "#FFFFFF"
+
+                [[testing_tools.scene.nodes]]
+                id = "same"
+                x = 20.0
+                y = 0.0
+                width = 10.0
+                height = 10.0
+                color = "#FFFFFF"
+            "##,
+            r##"
+                [testing_tools.scene]
+                enabled = true
+
+                [[testing_tools.scene.nodes]]
+                id = "broken"
+                x = 0.0
+                y = 0.0
+                width = 0.0
+                height = 10.0
+                color = "#FFFFFF"
+            "##,
         ] {
             assert!(parse_config(contents, Path::new("/tmp/moditty-config")).is_err());
         }
