@@ -1,11 +1,12 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use moditty::scene::SceneLayer;
 use serde::Deserialize;
 
 use crate::diagnostics::{DiagnosticsShortcuts, Shortcut};
@@ -112,13 +113,16 @@ pub struct TestingScene {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TestingNode {
     pub id: String,
+    pub parent: Option<String>,
     pub x: f64,
     pub y: f64,
     pub width: f64,
     pub height: f64,
     pub color: Rgb,
     pub opacity: f32,
+    pub clip_children: bool,
     pub z_index: i32,
+    pub layer: Option<SceneLayer>,
 }
 
 impl Background {
@@ -292,6 +296,7 @@ impl RawTestingScene {
             .into_iter()
             .map(|node| node.into_node(&mut ids))
             .collect::<Result<Vec<_>>>()?;
+        validate_testing_hierarchy(&nodes)?;
         Ok(Some(TestingScene { nodes }))
     }
 }
@@ -300,6 +305,7 @@ impl RawTestingScene {
 #[serde(deny_unknown_fields)]
 struct RawTestingNode {
     id: String,
+    parent: Option<String>,
     x: f64,
     y: f64,
     width: f64,
@@ -308,7 +314,10 @@ struct RawTestingNode {
     #[serde(default = "default_opacity")]
     opacity: f32,
     #[serde(default)]
+    clip_children: bool,
+    #[serde(default)]
     z_index: i32,
+    layer: Option<RawSceneLayer>,
 }
 
 impl RawTestingNode {
@@ -319,6 +328,13 @@ impl RawTestingNode {
         }
         if !ids.insert(id.clone()) {
             bail!("testing_tools.scene.nodes[].id {id:?} is duplicated");
+        }
+        let parent = self.parent.map(|parent| parent.trim().to_owned());
+        if parent.as_ref().is_some_and(String::is_empty) {
+            bail!("testing_tools.scene.nodes[].parent must not be empty");
+        }
+        if parent.is_some() && self.layer.is_some() {
+            bail!("testing_tools.scene.nodes[].layer is only valid on root nodes");
         }
         validate_finite("testing_tools.scene.nodes[].x", self.x)?;
         validate_finite("testing_tools.scene.nodes[].y", self.y)?;
@@ -332,15 +348,57 @@ impl RawTestingNode {
         }
         Ok(TestingNode {
             id,
+            parent,
             x: self.x,
             y: self.y,
             width: self.width,
             height: self.height,
             color: parse_hex_color("testing_tools.scene.nodes[].color", &self.color)?,
             opacity: self.opacity,
+            clip_children: self.clip_children,
             z_index: self.z_index,
+            layer: self.layer.map(RawSceneLayer::into_layer),
         })
     }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawSceneLayer {
+    Underlay,
+    Overlay,
+}
+
+impl RawSceneLayer {
+    const fn into_layer(self) -> SceneLayer {
+        match self {
+            Self::Underlay => SceneLayer::Underlay,
+            Self::Overlay => SceneLayer::Overlay,
+        }
+    }
+}
+
+fn validate_testing_hierarchy(nodes: &[TestingNode]) -> Result<()> {
+    let parents = nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.parent.as_deref()))
+        .collect::<HashMap<_, _>>();
+    for node in nodes {
+        let mut visited = HashSet::new();
+        let mut current = Some(node.id.as_str());
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                bail!("testing_tools.scene.nodes contain a parent cycle at {id:?}");
+            }
+            current = parents
+                .get(id)
+                .with_context(|| {
+                    format!("testing_tools.scene.nodes[].parent references unknown node {id:?}")
+                })?
+                .to_owned();
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default, Deserialize)]
@@ -736,8 +794,8 @@ mod tests {
     use std::{path::Path, time::Duration};
 
     use super::{
-        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, StartupSplash, TestingNode,
-        TestingScene, parse, parse_config, parse_hex_color,
+        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, SceneLayer, StartupSplash,
+        TestingNode, TestingScene, parse, parse_config, parse_hex_color,
     };
     use crate::diagnostics::Shortcut;
 
@@ -993,27 +1051,70 @@ mod tests {
                 nodes: vec![
                     TestingNode {
                         id: "source".to_owned(),
+                        parent: None,
                         x: 24.0,
                         y: 48.0,
                         width: 120.0,
                         height: 80.0,
                         color: Rgb::new(255, 102, 0),
                         opacity: 0.75,
+                        clip_children: false,
                         z_index: 1,
+                        layer: None,
                     },
                     TestingNode {
                         id: "target".to_owned(),
+                        parent: None,
                         x: 200.0,
                         y: 48.0,
                         width: 120.0,
                         height: 80.0,
                         color: Rgb::new(0, 102, 255),
                         opacity: 1.0,
+                        clip_children: false,
                         z_index: 0,
+                        layer: None,
                     },
                 ],
             })
         );
+    }
+
+    #[test]
+    fn loads_testing_scene_hierarchy_and_root_layer() {
+        let config = parse_config(
+            r##"
+                [testing_tools.scene]
+                enabled = true
+
+                [[testing_tools.scene.nodes]]
+                id = "panel"
+                x = 24.0
+                y = 48.0
+                width = 120.0
+                height = 80.0
+                color = "#112233"
+                clip_children = true
+                layer = "underlay"
+
+                [[testing_tools.scene.nodes]]
+                id = "child"
+                parent = "panel"
+                x = 100.0
+                y = 12.0
+                width = 40.0
+                height = 40.0
+                color = "#445566"
+            "##,
+            Path::new("/tmp/moditty-config"),
+        )
+        .unwrap();
+        let scene = config.testing_scene.unwrap();
+
+        assert_eq!(scene.nodes[0].layer, Some(SceneLayer::Underlay));
+        assert!(scene.nodes[0].clip_children);
+        assert_eq!(scene.nodes[1].parent.as_deref(), Some("panel"));
+        assert_eq!(scene.nodes[1].layer, None);
     }
 
     #[test]
@@ -1052,6 +1153,63 @@ mod tests {
                 x = 0.0
                 y = 0.0
                 width = 0.0
+                height = 10.0
+                color = "#FFFFFF"
+            "##,
+            r##"
+                [testing_tools.scene]
+                enabled = true
+
+                [[testing_tools.scene.nodes]]
+                id = "child"
+                parent = "missing"
+                x = 0.0
+                y = 0.0
+                width = 10.0
+                height = 10.0
+                color = "#FFFFFF"
+            "##,
+            r##"
+                [testing_tools.scene]
+                enabled = true
+
+                [[testing_tools.scene.nodes]]
+                id = "first"
+                parent = "second"
+                x = 0.0
+                y = 0.0
+                width = 10.0
+                height = 10.0
+                color = "#FFFFFF"
+
+                [[testing_tools.scene.nodes]]
+                id = "second"
+                parent = "first"
+                x = 20.0
+                y = 0.0
+                width = 10.0
+                height = 10.0
+                color = "#FFFFFF"
+            "##,
+            r##"
+                [testing_tools.scene]
+                enabled = true
+
+                [[testing_tools.scene.nodes]]
+                id = "root"
+                x = 0.0
+                y = 0.0
+                width = 10.0
+                height = 10.0
+                color = "#FFFFFF"
+
+                [[testing_tools.scene.nodes]]
+                id = "child"
+                parent = "root"
+                layer = "underlay"
+                x = 0.0
+                y = 0.0
+                width = 10.0
                 height = 10.0
                 color = "#FFFFFF"
             "##,

@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::HashMap};
 use anyhow::{Context, Result};
 use moditty::{
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
-    scene::{NodeContent, Rect, Scene},
+    scene::{NodeContent, Rect, Scene, SceneLayer},
 };
 use wgpu::{
     AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
@@ -84,6 +84,16 @@ struct GpuImage {
 struct Draw {
     texture: TextureId,
     first_vertex: u32,
+    layer: SceneLayer,
+    scissor: ScissorRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScissorRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -167,8 +177,13 @@ impl ImageRenderer {
             let Some(texture) = textures.texture(image.texture()) else {
                 continue;
             };
-            self.ensure_gpu_image(device, queue, image.texture(), texture)?;
             let bounds = scene.world_bounds(node_id)?;
+            let Some(visible_bounds) = scene.visible_bounds(node_id)? else {
+                continue;
+            };
+            let Some(scissor) = scissor_rect(visible_bounds, viewport) else {
+                continue;
+            };
             let Some(quad) = image_vertices(
                 bounds,
                 image.opacity(),
@@ -178,6 +193,7 @@ impl ImageRenderer {
             ) else {
                 continue;
             };
+            self.ensure_gpu_image(device, queue, image.texture(), texture)?;
             let first_vertex = u32::try_from(self.draws.len())
                 .ok()
                 .and_then(|count| count.checked_mul(VERTICES_PER_IMAGE))
@@ -188,6 +204,8 @@ impl ImageRenderer {
             self.draws.push(Draw {
                 texture: image.texture(),
                 first_vertex,
+                layer: node.layer(),
+                scissor,
             });
         }
 
@@ -198,17 +216,23 @@ impl ImageRenderer {
         Ok(())
     }
 
-    pub fn render<'a>(&'a self, pass: &mut RenderPass<'a>) {
-        if self.draws.is_empty() {
+    pub fn render_layer<'a>(&'a self, pass: &mut RenderPass<'a>, layer: SceneLayer) {
+        if !self.draws.iter().any(|draw| draw.layer == layer) {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        for draw in &self.draws {
+        for draw in self.draws.iter().filter(|draw| draw.layer == layer) {
             let Some(image) = self.gpu_images.get(&draw.texture) else {
                 continue;
             };
             pass.set_bind_group(0, &image.bind_group, &[]);
+            pass.set_scissor_rect(
+                draw.scissor.x,
+                draw.scissor.y,
+                draw.scissor.width,
+                draw.scissor.height,
+            );
             pass.draw(
                 draw.first_vertex..draw.first_vertex + VERTICES_PER_IMAGE,
                 0..1,
@@ -411,6 +435,36 @@ fn image_vertices(
     ])
 }
 
+fn scissor_rect(bounds: Rect, viewport: ImageViewport) -> Option<ScissorRect> {
+    if viewport.width == 0
+        || viewport.height == 0
+        || !viewport.scale_factor.is_finite()
+        || viewport.scale_factor <= 0.0
+    {
+        return None;
+    }
+    let left = (bounds.x() * viewport.scale_factor).floor();
+    let top = (bounds.y() * viewport.scale_factor).floor();
+    let right = ((bounds.x() + bounds.width()) * viewport.scale_factor).ceil();
+    let bottom = ((bounds.y() + bounds.height()) * viewport.scale_factor).ceil();
+    if !left.is_finite() || !top.is_finite() || !right.is_finite() || !bottom.is_finite() {
+        return None;
+    }
+    let left = left.clamp(0.0, f64::from(viewport.width));
+    let top = top.clamp(0.0, f64::from(viewport.height));
+    let right = right.clamp(0.0, f64::from(viewport.width));
+    let bottom = bottom.clamp(0.0, f64::from(viewport.height));
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(ScissorRect {
+        x: left as u32,
+        y: top as u32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    })
+}
+
 fn clip_coordinate(value: f64, length: u32, inverted: bool) -> Option<f32> {
     let ratio = value / f64::from(length) * 2.0;
     let coordinate = if inverted { 1.0 - ratio } else { ratio - 1.0 };
@@ -427,7 +481,7 @@ fn append_vertex(bytes: &mut Vec<u8>, vertex: [f32; 5]) {
 mod tests {
     use moditty::scene::Rect;
 
-    use super::image_vertices;
+    use super::{ImageViewport, ScissorRect, image_vertices, scissor_rect};
 
     #[test]
     fn maps_logical_bounds_to_clip_space() {
@@ -448,6 +502,29 @@ mod tests {
     fn skips_bounds_that_cannot_be_represented_by_gpu_vertices() {
         assert!(
             image_vertices(Rect::new(1e42, 0.0, 1e41, 1.0).unwrap(), 1.0, 100, 100, 1.0,).is_none()
+        );
+    }
+
+    #[test]
+    fn converts_visible_logical_bounds_to_a_clamped_physical_scissor() {
+        assert_eq!(
+            scissor_rect(
+                Rect::new(-1.1, 2.25, 4.4, 3.5).unwrap(),
+                ImageViewport::new(20, 20, 2.0),
+            ),
+            Some(ScissorRect {
+                x: 0,
+                y: 4,
+                width: 7,
+                height: 8,
+            })
+        );
+        assert_eq!(
+            scissor_rect(
+                Rect::new(20.0, 0.0, 1.0, 1.0).unwrap(),
+                ImageViewport::new(20, 20, 1.0),
+            ),
+            None
         );
     }
 }

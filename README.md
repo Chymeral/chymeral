@@ -444,17 +444,20 @@ superposición para los recursos y la interacción que llegarán en milestones
 posteriores. M5 añade su primer consumidor visual: nodos de imagen rasterizada.
 
 Cada `Node` tiene un `NodeId` estable, un padre opcional, hijos ordenados,
-una traslación local, bounds locales, visibilidad y `z_index`. Los nodos raíz
-pertenecen directamente a la escena. Las posiciones usan píxeles lógicos y la
-traslación de un hijo es relativa a su padre.
+una traslación local, bounds locales, visibilidad, `clip_children` y
+`z_index`. Los nodos raíz pertenecen directamente a la escena y seleccionan
+una `SceneLayer`; las posiciones usan píxeles lógicos y la traslación de un
+hijo es relativa a su padre.
 
 ```rust
 struct Node {
     parent: Option<NodeId>,
     children: Vec<NodeId>,
+    layer: SceneLayer,
     transform: Transform,
     bounds: Rect,
     visible: bool,
+    clip_children: bool,
     z_index: i32,
     content: NodeContent,
 }
@@ -475,9 +478,10 @@ permiten ciclos. Un nodo invisible oculta su subárbol del orden de pintura.
 El scene graph usa contextos de apilamiento jerárquicos. Cada padre se pinta
 antes que su subárbol; los hijos se ordenan por `z_index` ascendente y, ante
 empate, por su orden de inserción. Un subárbol completo se pinta antes de pasar
-al siguiente hermano. La misma regla se aplica entre raíces. Así, una raíz de
-`z_index` alto puede actuar como overlay global, mientras que los contenidos de
-un panel o popup permanecen agrupados frente a sus hermanos.
+al siguiente hermano. La misma regla se aplica entre raíces de la misma capa.
+M9 agrega un orden fijo entre `Underlay` y `Overlay`; por tanto, un
+`z_index` alto organiza hermanos dentro de su capa, pero no puede atravesar
+ese límite global.
 
 El núcleo de M3 no impone renderer, texto de escena, hit testing, colisiones,
 layouts, widgets ni APIs de plugins. Esos sistemas consumen esta estructura
@@ -505,13 +509,14 @@ M5 incorpora `NodeContent::Image(ImageNode)`: un nodo contiene cero o una
 imagen y las composiciones se forman con hijos. `ImageNode` referencia un
 `TextureId` y define una opacidad propia entre `0.0` y `1.0`. El renderer
 recorre el orden de pintura del scene graph, convierte los bounds lógicos a la
-superficie de la ventana y compone las imágenes sobre el texto de la terminal.
-Por tanto, escena y terminal comparten ventana y coordenadas lógicas, pero el
-grid de terminal mantiene su representación interna independiente.
+superficie de la ventana y compone las imágenes en la capa de su raíz. M9
+define si esa capa queda antes o después del texto de la terminal. Por tanto,
+escena y terminal comparten ventana y coordenadas lógicas, pero el grid de
+terminal mantiene su representación interna independiente.
 
 Una textura eliminada se omite al dibujar aunque un nodo aún conserve su
 handle. M5 no añade texto de escena, carga general de recursos, animación de
-nodos, recorte, repetición, sprites ni una API pública para mods.
+nodos, repetición, sprites ni una API pública para mods.
 
 ## Interacción y colisiones
 
@@ -526,9 +531,8 @@ Ambas consultas usan los bounds mundiales y el mismo orden determinista de
 pintura del scene graph.
 
 Un nodo no requiere contenido ni una marca de interactividad para participar:
-M6 sólo resuelve geometría. Un hijo puede detectarse fuera de los bounds de su
-padre porque todavía no hay clipping; M9 introducirá límites de dibujo y estas
-consultas aplicarán los mismos límites.
+M6 sólo resuelve geometría. Por defecto, un hijo puede detectarse fuera de los
+bounds de su padre. M9 permite limitar explícitamente esa herencia visual.
 
 M7 mantiene `hovered_node` y `focused_node` y convierte las posiciones de
 puntero y scroll en píxeles lógicos antes de crear eventos. Conserva los
@@ -567,6 +571,28 @@ y permite continuarlo cuando el cursor vuelve. Perder el foco de la ventana
 cancela un drag activo mediante `DragCancel`. Si su origen se elimina u oculta,
 la reconciliación también lo cancela. M8 sigue limitado al botón primario y no
 añade gestos táctiles ni comportamiento de click.
+
+M9 añade clipping rectangular heredado y capas globales de escena. Cada nodo
+incluye `clip_children`, desactivado por defecto. Cuando está activo, los
+bounds mundiales del nodo recortan solamente a sus descendientes; no cambian
+el área propia del nodo. Los clips de ancestros se intersectan y una región
+vacía deja al descendiente fuera de render y de interacción. Las consultas
+`hit_test` y `hit_test_rect` usan esos mismos bounds visibles, por lo que no
+existen áreas clicables que no puedan dibujarse.
+
+M9 define dos `SceneLayer`: `Underlay` se dibuja sobre el fondo y antes del
+texto de terminal; `Overlay`, predeterminado, se dibuja después del texto.
+Una raíz selecciona su capa y todos sus descendientes la heredan. Las capas
+ordenan árboles completos: ningún `z_index` puede llevar un nodo de
+`Underlay` sobre uno de `Overlay`. Dentro de cada capa se conserva el orden
+determinista de M3. El hit testing respeta el mismo orden, de modo que
+`Overlay` tiene prioridad y `Underlay` recibe interacción cuando no existe
+un destino superior de escena.
+
+El renderer aplica los clips mediante scissor rects físicos derivados de los
+bounds lógicos, incluida la conversión DPI. M9 no incorpora máscaras,
+rectángulos de clip arbitrarios, esquinas redondeadas, filtros, render targets,
+capas modales ni protocolos de mouse para la terminal.
 
 La siguiente infraestructura permite:
 
@@ -949,15 +975,26 @@ conserva un buffer circular de las últimas 128 entradas relevantes.
 el comportamiento nativo del motor antes de que exista la API de mods. Está
 desactivada por defecto y no crea un programa, un plugin ni una interfaz pública.
 Al habilitarla, cada entrada de `[[testing_tools.scene.nodes]]` crea un rectángulo
-de color sobre la terminal. Sus coordenadas, dimensiones y `z_index` usan
-píxeles lógicos; `opacity` afecta sólo ese rectángulo.
+de color. Sus coordenadas, dimensiones y `z_index` usan píxeles lógicos;
+`opacity` afecta sólo ese rectángulo. Una entrada con `parent` usa
+coordenadas locales respecto de ese padre; el orden de declaración no importa.
 
 ~~~toml
 [testing_tools.scene]
 enabled = true
 
 [[testing_tools.scene.nodes]]
-id = "source"
+id = "underlay"
+x = 24.0
+y = 48.0
+width = 280.0
+height = 150.0
+color = "#0EA5E9"
+opacity = 0.55
+layer = "underlay"
+
+[[testing_tools.scene.nodes]]
+id = "panel"
 x = 48.0
 y = 72.0
 width = 160.0
@@ -965,25 +1002,33 @@ height = 96.0
 color = "#F97316"
 opacity = 0.85
 z_index = 0
+layer = "overlay"
+clip_children = true
 
 [[testing_tools.scene.nodes]]
-id = "target"
-x = 288.0
-y = 72.0
-width = 160.0
-height = 96.0
-color = "#2563EB"
-opacity = 0.85
-z_index = 0
+id = "clipped-child"
+parent = "panel"
+x = 120.0
+y = 24.0
+width = 96.0
+height = 48.0
+color = "#A855F7"
+opacity = 0.9
 ~~~
 
-Los identificadores deben ser únicos. Al iniciar, Moditty escribe la relación
-entre cada `id` y su `NodeId` en stderr; `Ctrl+Shift+E` muestra después los
-`SceneEvent` asociados a esos handles. Así se pueden probar hover, foco, orden
-de superposición y drag and drop con dos rectángulos sin recursos externos.
-Los nodos de prueba siguen las mismas reglas de escena que los de producción y
-se dibujan después de la superficie de texto, incluso durante diagnóstico. Una
-splash activa queda sobre ellos hasta expirar.
+Los identificadores deben ser únicos y los padres deben existir; ciclos,
+referencias faltantes y una `layer` asignada a un hijo se rechazan. Una raíz
+puede elegir `layer = "underlay"` o `"overlay"`; los hijos siempre heredan
+la de su raíz. `clip_children = true` permite confirmar que la parte del hijo
+fuera del padre desaparece y no recibe hover ni drag.
+
+Al iniciar, Moditty escribe la relación entre cada `id` y su `NodeId` en
+stderr; `Ctrl+Shift+E` muestra después los `SceneEvent` asociados a esos
+handles. Así se pueden probar hover, foco, orden de superposición, clipping y
+drag and drop sin recursos externos. Los nodos de prueba siguen las mismas
+reglas de escena que los de producción; `Underlay` se dibuja detrás del texto
+y `Overlay` delante, incluso durante diagnóstico. Una splash activa queda
+sobre ellos hasta expirar.
 
 ## Orden aproximado de desarrollo
 
@@ -998,7 +1043,7 @@ M5  ImageNode
 M6  hit testing
 M7  mouse/focus
 M8  drag and drop + herramientas de prueba
-M9  clipping/layers
+M9  clipping/layers + jerarquía de pruebas
 M10 API interna estable
 M11 STAPI
 M12 protocolo de plugins

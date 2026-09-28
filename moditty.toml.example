@@ -50,6 +50,17 @@ diagnostics_frames = "Ctrl+Shift+F"
 [testing_tools.scene]
 enabled = false
 
+# Un underlay se dibuja detrás del texto de terminal y de todos los overlays.
+# [[testing_tools.scene.nodes]]
+# id = "underlay"
+# x = 24.0
+# y = 48.0
+# width = 280.0
+# height = 150.0
+# color = "#0EA5E9"
+# opacity = 0.55
+# layer = "underlay"
+
 # [[testing_tools.scene.nodes]]
 # id = "source"
 # x = 48.0
@@ -59,6 +70,8 @@ enabled = false
 # color = "#F97316"
 # opacity = 0.85
 # z_index = 0
+# layer = "overlay" # Sólo raíces: "underlay" o "overlay".
+# clip_children = true
 
 # [[testing_tools.scene.nodes]]
 # id = "target"
@@ -69,3 +82,14 @@ enabled = false
 # color = "#2563EB"
 # opacity = 0.85
 # z_index = 0
+
+# Para probar clipping, un hijo usa coordenadas locales respecto de su padre.
+# [[testing_tools.scene.nodes]]
+# id = "clipped-child"
+# parent = "source"
+# x = 120.0
+# y = 24.0
+# width = 96.0
+# height = 48.0
+# color = "#A855F7"
+# opacity = 0.9

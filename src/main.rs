@@ -9,6 +9,7 @@ mod scene_renderer;
 mod terminal;
 
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -26,7 +27,7 @@ use moditty::runtime::{
 };
 use moditty::{
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
-    scene::{ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, Transform},
+    scene::{ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer, Transform},
 };
 use portable_pty::PtySize;
 use wgpu::{
@@ -696,9 +697,12 @@ impl WindowState {
                 multiview_mask: None,
             });
             self.background.render(&mut pass);
+            self.image_renderer
+                .render_layer(&mut pass, SceneLayer::Underlay);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)?;
-            self.image_renderer.render(&mut pass);
+            self.image_renderer
+                .render_layer(&mut pass, SceneLayer::Overlay);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -969,27 +973,52 @@ fn install_testing_scene(
     textures: &mut TextureStore,
     testing_scene: &TestingScene,
 ) -> Result<()> {
-    for testing_node in &testing_scene.nodes {
-        let texture = ResourceTexture::from_rgba8(
-            1,
-            1,
-            vec![
-                testing_node.color.red,
-                testing_node.color.green,
-                testing_node.color.blue,
-                255,
-            ],
-        )?;
-        let texture = textures.insert(texture);
-        let node = scene.create_root(testing_node_properties(testing_node)?);
-        scene.set_content(
-            node,
-            NodeContent::Image(ImageNode::new(texture, testing_node.opacity)?),
-        )?;
-        eprintln!(
-            "Moditty: testing scene node {:?} uses {node:?}",
-            testing_node.id
-        );
+    let mut ids = HashMap::new();
+    let mut remaining = testing_scene.nodes.iter().collect::<Vec<_>>();
+    while !remaining.is_empty() {
+        let mut next = Vec::new();
+        let mut created = 0;
+        for testing_node in remaining {
+            let properties = testing_node_properties(testing_node)?;
+            let node = match testing_node.parent.as_deref() {
+                Some(parent) => match ids.get(parent) {
+                    Some(parent) => scene.create_child(*parent, properties)?,
+                    None => {
+                        next.push(testing_node);
+                        continue;
+                    }
+                },
+                None => scene.create_root_in_layer(
+                    properties,
+                    testing_node.layer.unwrap_or(SceneLayer::Overlay),
+                ),
+            };
+            let texture = ResourceTexture::from_rgba8(
+                1,
+                1,
+                vec![
+                    testing_node.color.red,
+                    testing_node.color.green,
+                    testing_node.color.blue,
+                    255,
+                ],
+            )?;
+            let texture = textures.insert(texture);
+            scene.set_content(
+                node,
+                NodeContent::Image(ImageNode::new(texture, testing_node.opacity)?),
+            )?;
+            ids.insert(testing_node.id.as_str(), node);
+            eprintln!(
+                "Moditty: testing scene node {:?} uses {node:?}",
+                testing_node.id
+            );
+            created += 1;
+        }
+        if created == 0 {
+            anyhow::bail!("testing_tools.scene nodes could not resolve their parent hierarchy");
+        }
+        remaining = next;
     }
     Ok(())
 }
@@ -998,6 +1027,7 @@ fn testing_node_properties(testing_node: &config::TestingNode) -> Result<NodePro
     Ok(NodeProperties {
         transform: Transform::new(testing_node.x, testing_node.y)?,
         bounds: Rect::new(0.0, 0.0, testing_node.width, testing_node.height)?,
+        clip_children: testing_node.clip_children,
         z_index: testing_node.z_index,
         ..NodeProperties::default()
     })
@@ -1348,19 +1378,20 @@ mod tests {
 
     use crate::{
         TerminalProgram,
-        config::{Appearance, Rgb, TestingNode},
+        config::{Appearance, Rgb, TestingNode, TestingScene},
         engine_focus, engine_key, engine_modifiers, engine_pointer_button, engine_scroll_delta,
-        grid_size, logical_pointer_position, named_key_input, pty_size, select_present_mode,
-        select_surface_format, splash_properties, terminal_input, terminal_input_with_text,
-        testing_node_properties,
+        grid_size, install_testing_scene, logical_pointer_position, named_key_input, pty_size,
+        select_present_mode, select_surface_format, splash_properties, terminal_input,
+        terminal_input_with_text, testing_node_properties,
     };
     use moditty::{
-        resources::Texture,
+        resources::{Texture, TextureStore},
         runtime::{
             EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent,
             KeyState, Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton,
             Runtime, ScrollUnit, Vec2,
         },
+        scene::{Scene, SceneLayer},
     };
 
     #[test]
@@ -1587,13 +1618,16 @@ mod tests {
     fn builds_testing_nodes_in_logical_scene_coordinates() {
         let properties = testing_node_properties(&TestingNode {
             id: "source".to_owned(),
+            parent: None,
             x: 24.0,
             y: 48.0,
             width: 120.0,
             height: 80.0,
             color: Rgb::new(255, 102, 0),
             opacity: 0.75,
+            clip_children: false,
             z_index: 3,
+            layer: None,
         })
         .unwrap();
 
@@ -1604,5 +1638,50 @@ mod tests {
             moditty::scene::Rect::new(0.0, 0.0, 120.0, 80.0).unwrap()
         );
         assert_eq!(properties.z_index, 3);
+    }
+
+    #[test]
+    fn installs_testing_nodes_after_their_parent_even_when_declared_first() {
+        let testing_scene = TestingScene {
+            nodes: vec![
+                TestingNode {
+                    id: "child".to_owned(),
+                    parent: Some("root".to_owned()),
+                    x: 80.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 80.0,
+                    color: Rgb::new(0, 102, 255),
+                    opacity: 1.0,
+                    clip_children: false,
+                    z_index: 1,
+                    layer: None,
+                },
+                TestingNode {
+                    id: "root".to_owned(),
+                    parent: None,
+                    x: 20.0,
+                    y: 40.0,
+                    width: 100.0,
+                    height: 100.0,
+                    color: Rgb::new(255, 102, 0),
+                    opacity: 0.5,
+                    clip_children: true,
+                    z_index: 0,
+                    layer: Some(SceneLayer::Underlay),
+                },
+            ],
+        };
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+
+        install_testing_scene(&mut scene, &mut textures, &testing_scene).unwrap();
+
+        let root = scene.roots()[0];
+        let child = scene.node(root).unwrap().children()[0];
+        assert_eq!(scene.node(root).unwrap().layer(), SceneLayer::Underlay);
+        assert!(scene.node(root).unwrap().properties().clip_children);
+        assert_eq!(scene.node(child).unwrap().layer(), SceneLayer::Underlay);
+        assert_eq!(textures.len(), 2);
     }
 }

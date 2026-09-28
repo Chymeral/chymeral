@@ -11,6 +11,17 @@ pub struct NodeId {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SceneLayer {
+    Underlay,
+    #[default]
+    Overlay,
+}
+
+impl SceneLayer {
+    pub const PAINT_ORDER: [Self; 2] = [Self::Underlay, Self::Overlay];
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GeometryError {
     NonFiniteCoordinate,
@@ -144,6 +155,15 @@ impl Rect {
             && self.bottom() > other.y
     }
 
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        (right > x && bottom > y)
+            .then(|| Self::new(x, y, right - x, bottom - y).expect("finite rectangle intersection"))
+    }
+
     fn right(self) -> f64 {
         self.x + self.width
     }
@@ -158,6 +178,7 @@ pub struct NodeProperties {
     pub transform: Transform,
     pub bounds: Rect,
     pub visible: bool,
+    pub clip_children: bool,
     pub z_index: i32,
 }
 
@@ -167,6 +188,7 @@ impl Default for NodeProperties {
             transform: Transform::default(),
             bounds: Rect::default(),
             visible: true,
+            clip_children: false,
             z_index: 0,
         }
     }
@@ -223,6 +245,7 @@ pub enum NodeContent {
 pub struct Node {
     parent: Option<NodeId>,
     children: Vec<NodeId>,
+    layer: SceneLayer,
     properties: NodeProperties,
     content: NodeContent,
 }
@@ -234,6 +257,10 @@ impl Node {
 
     pub fn children(&self) -> &[NodeId] {
         &self.children
+    }
+
+    pub const fn layer(&self) -> SceneLayer {
+        self.layer
     }
 
     pub const fn properties(&self) -> NodeProperties {
@@ -249,6 +276,7 @@ impl Node {
 pub enum SceneError {
     InvalidNode(NodeId),
     WouldCreateCycle { node: NodeId, parent: NodeId },
+    LayerRequiresRoot(NodeId),
     WorldBoundsOverflow(NodeId),
 }
 
@@ -258,6 +286,9 @@ impl Display for SceneError {
             Self::InvalidNode(_) => formatter.write_str("node handle is no longer valid"),
             Self::WouldCreateCycle { .. } => {
                 formatter.write_str("a scene node cannot parent one of its descendants")
+            }
+            Self::LayerRequiresRoot(_) => {
+                formatter.write_str("only a scene root can change its layer")
             }
             Self::WorldBoundsOverflow(_) => {
                 formatter.write_str("node transforms produce non-finite world bounds")
@@ -296,7 +327,15 @@ impl Scene {
     }
 
     pub fn create_root(&mut self, properties: NodeProperties) -> NodeId {
-        let node = self.insert_node(None, properties);
+        self.create_root_in_layer(properties, SceneLayer::Overlay)
+    }
+
+    pub fn create_root_in_layer(
+        &mut self,
+        properties: NodeProperties,
+        layer: SceneLayer,
+    ) -> NodeId {
+        let node = self.insert_node(None, properties, layer);
         self.roots.push(node);
         self.node_count += 1;
         node
@@ -307,8 +346,8 @@ impl Scene {
         parent: NodeId,
         properties: NodeProperties,
     ) -> Result<NodeId, SceneError> {
-        self.require_node(parent)?;
-        let child = self.insert_node(Some(parent), properties);
+        let layer = self.require_node(parent)?.layer;
+        let child = self.insert_node(Some(parent), properties, layer);
         self.require_node_mut(parent)?.children.push(child);
         self.node_count += 1;
         Ok(child)
@@ -343,6 +382,13 @@ impl Scene {
         self.set_content(node, NodeContent::Empty)
     }
 
+    pub fn set_root_layer(&mut self, node: NodeId, layer: SceneLayer) -> Result<(), SceneError> {
+        if self.require_node(node)?.parent.is_some() {
+            return Err(SceneError::LayerRequiresRoot(node));
+        }
+        self.set_subtree_layer(node, layer)
+    }
+
     pub fn world_bounds(&self, node: NodeId) -> Result<Rect, SceneError> {
         let bounds = self.require_node(node)?.properties.bounds;
         let mut x = bounds.x();
@@ -361,9 +407,37 @@ impl Scene {
             .map_err(|_| SceneError::WorldBoundsOverflow(node))
     }
 
+    pub fn visible_bounds(&self, node: NodeId) -> Result<Option<Rect>, SceneError> {
+        let node_ref = self.require_node(node)?;
+        if !node_ref.properties.visible {
+            return Ok(None);
+        }
+
+        let mut visible = self.world_bounds(node)?;
+        let mut current = node_ref.parent;
+        while let Some(current_node) = current {
+            let current_ref = self.require_node(current_node)?;
+            if !current_ref.properties.visible {
+                return Ok(None);
+            }
+            if current_ref.properties.clip_children {
+                let clip = self.world_bounds(current_node)?;
+                let Some(intersection) = visible.intersection(clip) else {
+                    return Ok(None);
+                };
+                visible = intersection;
+            }
+            current = current_ref.parent;
+        }
+        Ok(Some(visible))
+    }
+
     pub fn hit_test(&self, point: Point) -> Result<Option<NodeId>, SceneError> {
         for node in self.paint_order().into_iter().rev() {
-            if self.world_bounds(node)?.contains(point) {
+            if self
+                .visible_bounds(node)?
+                .is_some_and(|bounds| bounds.contains(point))
+            {
                 return Ok(Some(node));
             }
         }
@@ -380,7 +454,10 @@ impl Scene {
             if self.is_descendant_of(node, excluded) {
                 continue;
             }
-            if self.world_bounds(node)?.contains(point) {
+            if self
+                .visible_bounds(node)?
+                .is_some_and(|bounds| bounds.contains(point))
+            {
                 return Ok(Some(node));
             }
         }
@@ -390,7 +467,10 @@ impl Scene {
     pub fn hit_test_rect(&self, bounds: Rect) -> Result<Vec<NodeId>, SceneError> {
         let mut nodes = Vec::new();
         for node in self.paint_order().into_iter().rev() {
-            if self.world_bounds(node)?.intersects(bounds) {
+            if self
+                .visible_bounds(node)?
+                .is_some_and(|visible| visible.intersects(bounds))
+            {
                 nodes.push(node);
             }
         }
@@ -398,16 +478,20 @@ impl Scene {
     }
 
     pub fn reparent(&mut self, node: NodeId, parent: Option<NodeId>) -> Result<(), SceneError> {
-        let current_parent = self.require_node(node)?.parent;
+        let current_node = self.require_node(node)?;
+        let current_parent = current_node.parent;
         if current_parent == parent {
             return Ok(());
         }
-        if let Some(parent) = parent {
-            self.require_node(parent)?;
+        let layer = if let Some(parent) = parent {
+            let parent_node = self.require_node(parent)?;
             if self.is_descendant_of(parent, node) {
                 return Err(SceneError::WouldCreateCycle { node, parent });
             }
-        }
+            parent_node.layer
+        } else {
+            current_node.layer
+        };
 
         self.detach(node, current_parent);
         self.require_node_mut(node)?.parent = parent;
@@ -415,6 +499,7 @@ impl Scene {
             Some(parent) => self.require_node_mut(parent)?.children.push(node),
             None => self.roots.push(node),
         }
+        self.set_subtree_layer(node, layer)?;
         Ok(())
     }
 
@@ -443,7 +528,21 @@ impl Scene {
 
     pub fn paint_order(&self) -> Vec<NodeId> {
         let mut nodes = Vec::with_capacity(self.len());
-        let mut pending = self.ordered_siblings(&self.roots);
+        for layer in SceneLayer::PAINT_ORDER {
+            nodes.extend(self.paint_order_in_layer(layer));
+        }
+        nodes
+    }
+
+    pub fn paint_order_in_layer(&self, layer: SceneLayer) -> Vec<NodeId> {
+        let mut nodes = Vec::new();
+        let roots = self
+            .roots
+            .iter()
+            .copied()
+            .filter(|root| self.node(*root).is_some_and(|node| node.layer == layer))
+            .collect::<Vec<_>>();
+        let mut pending = self.ordered_siblings(&roots);
         pending.reverse();
         while let Some(node_id) = pending.pop() {
             let Some(node) = self.node(node_id) else {
@@ -460,10 +559,16 @@ impl Scene {
         nodes
     }
 
-    fn insert_node(&mut self, parent: Option<NodeId>, properties: NodeProperties) -> NodeId {
+    fn insert_node(
+        &mut self,
+        parent: Option<NodeId>,
+        properties: NodeProperties,
+        layer: SceneLayer,
+    ) -> NodeId {
         let node = Node {
             parent,
             children: Vec::new(),
+            layer,
             properties,
             content: NodeContent::Empty,
         };
@@ -511,6 +616,16 @@ impl Scene {
             current = self.node(node).and_then(Node::parent);
         }
         false
+    }
+
+    fn set_subtree_layer(&mut self, node: NodeId, layer: SceneLayer) -> Result<(), SceneError> {
+        let mut pending = vec![node];
+        while let Some(current) = pending.pop() {
+            let children = self.require_node(current)?.children.clone();
+            self.require_node_mut(current)?.layer = layer;
+            pending.extend(children);
+        }
+        Ok(())
     }
 
     fn detach(&mut self, node: NodeId, parent: Option<NodeId>) {
@@ -616,6 +731,7 @@ mod tests {
             transform: Transform::new(12.0, 34.0).unwrap(),
             bounds: Rect::new(1.0, 2.0, 320.0, 180.0).unwrap(),
             visible: false,
+            clip_children: false,
             z_index: 7,
         };
 
@@ -733,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn hits_children_outside_their_parent_before_clipping_exists() {
+    fn allows_children_outside_a_parent_without_clipping() {
         let mut scene = Scene::new();
         let parent = scene.create_root(NodeProperties {
             bounds: Rect::new(0.0, 0.0, 10.0, 10.0).unwrap(),
@@ -754,6 +870,107 @@ mod tests {
             scene.hit_test(Point::new(15.0, 5.0).unwrap()).unwrap(),
             Some(child)
         );
+        assert_eq!(
+            scene.visible_bounds(child).unwrap(),
+            Some(Rect::new(8.0, 0.0, 10.0, 10.0).unwrap())
+        );
+    }
+
+    #[test]
+    fn clips_descendants_for_render_bounds_and_hit_testing() {
+        let mut scene = Scene::new();
+        let parent = scene.create_root(NodeProperties {
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0).unwrap(),
+            clip_children: true,
+            ..NodeProperties::default()
+        });
+        let child = scene
+            .create_child(
+                parent,
+                NodeProperties {
+                    transform: Transform::new(8.0, 0.0).unwrap(),
+                    bounds: Rect::new(0.0, 0.0, 10.0, 10.0).unwrap(),
+                    ..NodeProperties::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            scene.visible_bounds(child).unwrap(),
+            Some(Rect::new(8.0, 0.0, 2.0, 10.0).unwrap())
+        );
+        assert_eq!(
+            scene.hit_test(Point::new(9.0, 5.0).unwrap()).unwrap(),
+            Some(child)
+        );
+        assert_eq!(
+            scene.hit_test(Point::new(15.0, 5.0).unwrap()).unwrap(),
+            None
+        );
+        assert_eq!(
+            scene
+                .hit_test_rect(Rect::new(10.0, 0.0, 8.0, 10.0).unwrap())
+                .unwrap(),
+            Vec::<NodeId>::new()
+        );
+    }
+
+    #[test]
+    fn layers_paint_and_hit_test_underlay_before_overlay() {
+        let mut scene = Scene::new();
+        let bounds = Rect::new(0.0, 0.0, 10.0, 10.0).unwrap();
+        let overlay = scene.create_root_in_layer(
+            NodeProperties {
+                bounds,
+                ..properties(-10)
+            },
+            SceneLayer::Overlay,
+        );
+        let underlay = scene.create_root_in_layer(
+            NodeProperties {
+                bounds,
+                ..properties(10)
+            },
+            SceneLayer::Underlay,
+        );
+
+        assert_eq!(scene.paint_order(), vec![underlay, overlay]);
+        assert_eq!(
+            scene.paint_order_in_layer(SceneLayer::Underlay),
+            vec![underlay]
+        );
+        assert_eq!(
+            scene.paint_order_in_layer(SceneLayer::Overlay),
+            vec![overlay]
+        );
+        assert_eq!(
+            scene.hit_test(Point::new(5.0, 5.0).unwrap()).unwrap(),
+            Some(overlay)
+        );
+    }
+
+    #[test]
+    fn roots_propagate_their_layer_to_descendants_and_reparented_subtrees() {
+        let mut scene = Scene::new();
+        let underlay = scene.create_root_in_layer(NodeProperties::default(), SceneLayer::Underlay);
+        let child = scene
+            .create_child(underlay, NodeProperties::default())
+            .unwrap();
+        let overlay = scene.create_root(NodeProperties::default());
+
+        assert_eq!(scene.node(underlay).unwrap().layer(), SceneLayer::Underlay);
+        assert_eq!(scene.node(child).unwrap().layer(), SceneLayer::Underlay);
+        scene.reparent(underlay, Some(overlay)).unwrap();
+        assert_eq!(scene.node(underlay).unwrap().layer(), SceneLayer::Overlay);
+        assert_eq!(scene.node(child).unwrap().layer(), SceneLayer::Overlay);
+        assert_eq!(
+            scene.set_root_layer(child, SceneLayer::Underlay),
+            Err(SceneError::LayerRequiresRoot(child))
+        );
+        scene.set_root_layer(overlay, SceneLayer::Underlay).unwrap();
+        assert_eq!(scene.node(overlay).unwrap().layer(), SceneLayer::Underlay);
+        assert_eq!(scene.node(underlay).unwrap().layer(), SceneLayer::Underlay);
+        assert_eq!(scene.node(child).unwrap().layer(), SceneLayer::Underlay);
     }
 
     #[test]
