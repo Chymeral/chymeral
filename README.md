@@ -2,7 +2,7 @@
 
 Moditty es un motor de terminal extensible escrito en Rust.
 
-Su objetivo inicial es comportarse como una terminal extremadamente mínima y funcional, pero su propósito real es servir como plataforma para desarrollar TUIs avanzadas, plugins y mods con capacidades de interacción que normalmente son difíciles o imposibles de implementar limpiamente sobre una terminal tradicional.
+Su objetivo inicial es comportarse como una terminal extremadamente mínima y funcional, pero su propósito real es servir como runtime para programas que construyen TUIs avanzadas con capacidades de interacción que normalmente son difíciles o imposibles de implementar limpiamente sobre una terminal tradicional.
 
 Moditty debe pensarse más como un pequeño motor gráfico/event-driven cuyo objeto principal por defecto es una terminal, y no simplemente como un emulador de terminal al que posteriormente se le añaden funciones.
 
@@ -63,9 +63,9 @@ Moditty Engine
      │
      ├── Terminal tradicional
      │
-     ├── STAPI / API del motor
+     ├── API y protocolo del motor
      │
-     ├── Mods
+     ├── Programas Moditty
      │
      └── Frameworks TUI de terceros
 ```
@@ -76,7 +76,7 @@ Una aplicación diseñada específicamente para Moditty podrá usar las capacida
 
 ## Filosofía de plataforma
 
-Moditty debe tratar las TUIs avanzadas como mods o aplicaciones ejecutadas sobre una plataforma.
+Moditty debe tratar las TUIs avanzadas como programas ejecutados sobre una plataforma. No existe una categoría conceptual de "mod": un programa Moditty es software distribuible con Moditty como dependencia de instalación y con acceso opcional a sus capacidades de runtime.
 
 La terminal no debe imponer cómo debe verse o funcionar una interfaz.
 
@@ -96,7 +96,7 @@ Timer
 TerminalSurface
 ```
 
-Los widgets, layouts complejos, editores, navegadores de archivos, interfaces visuales y demás abstracciones deben poder ser creados como librerías o mods externos.
+Los widgets, layouts complejos, editores, navegadores de archivos, interfaces visuales y demás abstracciones deben poder ser creados como librerías de programas externos.
 
 El objetivo es que el ecosistema pueda construir cosas encima de Moditty sin necesitar modificar el core.
 
@@ -109,7 +109,7 @@ primitives
   ↓
 API
   ↓
-mods/frameworks
+programas/frameworks
   ↓
 experiences
 ```
@@ -240,7 +240,7 @@ slotmap
 
 o una solución equivalente basada en IDs generacionales.
 
-No se deben exponer referencias o punteros internos a plugins.
+No se deben exponer referencias o punteros internos a programas externos.
 
 Ejemplo conceptual:
 
@@ -365,12 +365,12 @@ hit testing / focus
     ↓
 EngineEvent::Scene
     ↓
-mods
+programas
 ```
 
 ## Ciclo de vida del runtime
 
-El runtime de un Mod o programa tiene tres rutas internas. Son contratos de
+El runtime de un programa tiene tres rutas internas. Son contratos de
 ejecución, no una exigencia de usar tres hilos del sistema.
 
 ```text
@@ -379,12 +379,12 @@ Event    press(), release(), scroll(), …
 Runtime  tick(dt), frame(dt)
 ```
 
-`init()` se invoca una vez antes de iniciar el Mod o programa. Permite cargar
+`init()` se invoca una vez antes de iniciar el programa. Permite cargar
 argumentos, configuración, comandos y recursos iniciales, pero todavía no debe
 recibir órdenes ni eventos de usuario.
 
 `start()` se invoca una única vez después de que `init()` haya terminado con
-éxito y el Mod o programa esté preparado para recibir órdenes. Ningún evento ni
+éxito y el programa esté preparado para recibir órdenes. Ningún evento ni
 llamada de runtime se entrega antes de `start()`.
 
 La ruta `Event` entrega las entradas discretas mediante la API canónica del
@@ -396,7 +396,7 @@ lógica y `frame(dt)` prepara o renderiza un cuadro. Un frame puede no contener
 ningún tick o contener varios; ambos deben operar únicamente después de
 `start()`.
 
-M2 concreta ese contrato con un `Program` interno:
+M2 concreta este contrato en el core mediante un `Program` interno:
 
 ```rust
 trait Program {
@@ -418,8 +418,9 @@ Un error de `on_event()`, `on_command()`, `tick()` o `frame()` es terminal para
 el runtime activo: pasa a `RuntimeState::Faulted(RuntimeFault)`, conserva la
 fase y el error, descarta los mensajes pendientes y cancela sus ticks. Desde
 ese momento no acepta ni entrega más eventos o comandos. M2 sólo tiene un
-programa activo, por lo que el host registra el fallo y cierra limpiamente la
-aplicación; el aislamiento de extensiones llegará junto al sistema de plugins.
+programa interno activo, por lo que el host registra el fallo y cierra
+limpiamente la aplicación. Este comportamiento sólo describe M2 y no impone la
+política de aislamiento de los futuros programas externos.
 
 `RuntimeCommand` es un canal separado de `EngineEvent`: una orden controla al
 programa, mientras que un evento describe una entrada o suceso. Internamente
@@ -429,6 +430,11 @@ ejecuta cero o más `tick(dt)` de intervalo fijo. Cuando ocurre un redibujado,
 después de esos pasos se invoca un único `frame(dt)`. El scheduler limita la
 recuperación a ocho ticks por iteración y descarta retraso sobrante para no
 bloquear la interfaz tras una pausa larga.
+
+Este `Program` interno no es todavía una API ni un ABI público. Establece las
+semánticas que M10 en adelante expondrán a programas externos mediante un
+contrato de proceso. Un fallo de un futuro programa externo deberá cerrar su
+sesión y liberar sus recursos sin cerrar la terminal anfitriona.
 
 Los tipos canónicos actuales incluyen teclado, puntero, scroll, foco, terminal
 y eventos personalizados. Los adaptadores de plataforma viven en el backend;
@@ -484,7 +490,7 @@ M9 agrega un orden fijo entre `Underlay` y `Overlay`; por tanto, un
 ese límite global.
 
 El núcleo de M3 no impone renderer, texto de escena, hit testing, colisiones,
-layouts, widgets ni APIs de plugins. Esos sistemas consumen esta estructura
+layouts, widgets ni APIs públicas de programas. Esos sistemas consumen esta estructura
 sin alterar sus invariantes.
 
 ## Recursos gráficos
@@ -516,7 +522,7 @@ terminal mantiene su representación interna independiente.
 
 Una textura eliminada se omite al dibujar aunque un nodo aún conserve su
 handle. M5 no añade texto de escena, carga general de recursos, animación de
-nodos, repetición, sprites ni una API pública para mods.
+nodos, repetición, sprites ni una API pública para programas.
 
 ## Interacción y colisiones
 
@@ -616,226 +622,129 @@ collision leave
 
 La API debe diferenciar conceptualmente hit-testing de colisiones, aunque internamente puedan compartir infraestructura.
 
-## Sistema de plugins
+## Modelo de programas
 
-El sistema de plugins debe ser independiente del lenguaje.
+Los consumidores de las capacidades avanzadas de Moditty son programas, no
+mods ni plugins cargados por el host. Un programa Moditty se distribuye e
+instala como cualquier otro programa de terminal; su paquete o instalador
+declara una versión mínima de Moditty como dependencia.
 
-Rust NO debe ser un requisito para crear mods.
+Un programa puede ser un binario nativo para Windows o Linux, o un lanzador
+empaquetado que inicia un runtime como Python, Lua, JavaScript, .NET o Java.
+El host no conoce ni selecciona el lenguaje: sólo inicia y se comunica con el
+ejecutable indicado por el paquete. Por ello Rust, C, C++, Zig, Go y cualquier
+otro lenguaje capaz de implementar el contrato tienen el mismo estatus.
 
-La arquitectura final debe permitir plugins escritos en cualquier lenguaje siempre que exista un adaptador de lenguaje capaz de comunicarse con la API de Moditty.
-
-Ejemplos potenciales:
-
-```text
-Python
-Lua
-JavaScript
-C
-C++
-Rust
-Zig
-C#
-Java
-Go
-otros
-```
-
-El motor debe exponer una API canónica independiente del lenguaje.
-
-Nombre provisional:
+Al ejecutarlo desde el shell contenido en Moditty, debe sentirse normal:
 
 ```text
-STAPI
+PS> mi-programa.exe
+$ mi-programa
 ```
 
-El nombre puede cambiar posteriormente.
+Sus argumentos, `stdin`, `stdout`, `stderr` y código de salida conservan la
+semántica de un programa convencional. El shell y las aplicaciones que no
+conocen Moditty siguen funcionando sin cambios.
 
-Conceptualmente:
+Un programa que use Moditty hereda información privada de la sesión actual y
+abre un canal con el host mediante su SDK. Por ese canal solicita recursos de
+escena y recibe el ciclo de vida, eventos y tiempo del runtime; sus flujos
+estándar continúan unidos al PTY.
 
 ```text
-Plugin
-   ↓
-Language Bridge
-   ↓
-STAPI
-   ↓
-Moditty Engine
+shell dentro de Moditty
+  └── programa
+       ├── stdin / stdout / stderr ──> PTY y terminal convencional
+       └── SDK de Moditty ───────────> canal privado ──> host
 ```
 
-## Plugins fuera del proceso
+Si el programa se inicia fuera de una sesión Moditty, el SDK no tendrá un
+endpoint al que conectarse. La política final —modo CLI alternativo o error
+explícito de requisito— corresponde al programa; Moditty no requiere un
+servicio global para que sus programas se ejecuten.
 
-El mecanismo universal preferido debe considerar plugins ejecutados como procesos separados.
+## Contrato entre programa y runtime
 
-Ejemplo:
+La frontera pública será un protocolo local, versionado y neutral al lenguaje.
+Su nombre provisional es **MLP** (*Moditty Link Protocol*). No es una syscall:
+es un contrato de mensajes entre procesos que evita exponer memoria, tipos de
+Rust o dependencias gráficas del host.
+
+M10 implementa dentro del core el primer contrato de MLP: versión `1.0`,
+sesiones concurrentes, negociación de capacidades, handshake `Init`/`Start`,
+fallos y handles opacos aislados por sesión. Esta capa no abre conexiones ni
+ejecuta procesos; M11 añadirá el transporte que intercambiará estos mensajes.
+
+MLP tendrá dos direcciones lógicas en una sesión bidireccional:
 
 ```text
-Moditty
-   │
-   ├── Python plugin
-   ├── Lua plugin
-   ├── Node.js plugin
-   └── executable arbitrario
+Moditty → programa: Init, Start, Event, Tick, Frame, Resize, errores
+programa → Moditty: comandos, lotes de escena, recursos, suscripciones
 ```
 
-Todos se comunicarían mediante un protocolo común.
+`Init`, `Start`, `Event`, `Tick` y `Frame` preservarán las semánticas ya
+validadas por M2. Los comandos permanecen separados de los eventos, aunque el
+protocolo determinará de forma explícita el orden, los límites de lote y las
+respuestas a fallos. Todos los identificadores de nodos y recursos serán
+handles opacos propiedad de la sesión del programa.
 
-Transportes potenciales:
+El host valida cada comando antes de aplicarlo, asocia los recursos a la
+conexión que los creó y los libera al cerrar, fallar o desconectar el programa.
+Un programa no obtiene referencias ni acceso directo a la memoria del host.
+
+La primera implementación utilizará un transporte local privado: socket de
+dominio Unix en Linux y named pipe en Windows. El endpoint y un secreto de
+sesión se heredarán sólo por los procesos iniciados desde la terminal Moditty.
+MLP seguirá separado de ese transporte para permitir adaptadores futuros sin
+alterar la API, pero `stdio`, red, memoria compartida, WASM y carga de código
+nativo quedan fuera de este alcance inicial.
+
+## SDKs de cliente e independencia de lenguaje
+
+Un SDK es una biblioteca de cliente enlazada, incluida o implementada por el
+programa. Traduce las convenciones de un lenguaje a MLP; no es un plugin que
+Moditty cargue ni un requisito de instalación dentro del host.
 
 ```text
-stdio
-Unix socket
-named pipe
-shared memory
+Python / Lua / JavaScript / C# / Go / Rust / C / C++ / Zig
+                         ↓
+                SDK o implementación propia de MLP
+                         ↓
+                      Moditty
 ```
 
-No fijar aún el transporte definitivo.
+Un programa nativo puede enlazar un SDK estático y distribuir un único binario.
+Un runtime interpretado puede incluir su launcher y dependencias en su paquete.
+Los SDKs oficiales son conveniencia y conformance, no una lista cerrada de
+lenguajes permitidos: cualquier implementación correcta de MLP es válida.
 
-El protocolo debe estar desacoplado del transporte.
+El nombre **MLExtension** queda descartado como pieza arquitectónica central.
+Podrá reutilizarse más adelante para un adaptador opcional de un lenguaje, pero
+no habrá un directorio de extensiones por lenguaje ni DLL/SO cargadas por el
+host para ejecutar programas ordinarios.
 
-En el futuro pueden coexistir:
+## Paquetes y manifiestos de programa
 
-```text
-process transport
-WASM transport
-native transport
-```
+Los instaladores de programas resuelven la dependencia de Moditty y registran
+su comando en el entorno del usuario como harían con cualquier aplicación. Un
+manifiesto de programa, cuando sea necesario, describirá sólo metadatos de
+ejecución y compatibilidad, nunca el lenguaje como parte del contrato.
 
-sin cambiar la API lógica.
+Los campos iniciales previstos son identificador, versión mínima de MLP,
+ejecutable o launcher por plataforma y capacidades solicitadas. La forma del
+paquete, el gestor de instalación y un registro central de programas no forman
+parte del core inicial.
 
-## Valores canónicos
+## Esquema de protocolo e IDL futura
 
-Debe existir una representación neutral de valores para cruzar la frontera entre lenguajes.
+MLP comenzará con mensajes tipados para el ciclo de vida, eventos y comandos
+que realmente existan. No se añadirá una llamada genérica de valores dinámicos
+ni una IDL antes de que el conjunto inicial de comandos se estabilice.
 
-Ejemplo conceptual:
-
-```rust
-enum STValue {
-    Null,
-    Bool(bool),
-
-    I64(i64),
-    U64(u64),
-    F64(f64),
-
-    String(String),
-    Bytes(Vec<u8>),
-
-    Handle(HandleId),
-
-    Array(Vec<STValue>),
-    Object(Vec<(String, STValue)>),
-}
-```
-
-La API podría conceptualizarse como:
-
-```rust
-call(
-    function: ApiFunction,
-    arguments: &[STValue],
-) -> Result<STValue, ApiError>
-```
-
-Esto es conceptual. No implementar todavía sin diseñar adecuadamente el protocolo.
-
-## Extensiones de lenguaje
-
-Cada lenguaje podrá tener una extensión encargada de traducir entre dicho lenguaje y STAPI.
-
-Nombre provisional del manifiesto:
-
-```text
-STExtention.toml
-```
-
-El nombre contiene deliberadamente "Extention" por ahora y puede revisarse posteriormente.
-
-Ejemplo:
-
-```text
-extensions/
-└── python/
-    ├── STExtention.toml
-    ├── bridge.py
-    └── ...
-```
-
-El manifiesto debe describir metadata y configuración.
-
-La lógica compleja debe residir en el bridge, no en TOML.
-
-Ejemplo conceptual:
-
-```toml
-[extension]
-id = "org.moditty.python"
-language = "python"
-api = "1"
-
-[execution]
-command = "python3"
-arguments = ["{bridge}", "{entry}"]
-
-[bridge]
-entry = "bridge.py"
-transport = "stdio"
-
-[files]
-extensions = [".py"]
-default_entry = "main.py"
-```
-
-Una sola extensión de lenguaje debe poder permitir la ejecución de muchos plugins escritos en ese lenguaje.
-
-## IDL futura
-
-Debe considerarse una Interface Definition Language neutral para definir STAPI.
-
-Nombre provisional:
-
-```text
-STIDL
-```
-
-Ejemplo conceptual:
-
-```text
-resource Node
-resource Texture
-
-fn create_node() -> Node
-
-fn set_position(
-    node: Node,
-    x: f32,
-    y: f32
-)
-
-fn load_texture(
-    path: string
-) -> Texture
-
-event PointerMove {
-    x: f32
-    y: f32
-}
-```
-
-STIDL debe convertirse eventualmente en la fuente de verdad de la API.
-
-A partir de ella podrán generarse bindings para diferentes lenguajes:
-
-```text
-STIDL
-  │
-  ├── Rust bindings
-  ├── Python bindings
-  ├── C bindings
-  ├── Lua bindings
-  └── otros
-```
-
-No implementar STIDL durante el primer milestone.
+Cuando haya más de un SDK, una IDL neutral podrá convertirse en la fuente de
+verdad de MLP y generar bindings, documentación y pruebas de conformidad. Esa
+IDL debe describir handles, mensajes, errores, versiones y capacidades; no debe
+filtrar tipos de `winit`, `wgpu`, Rust ni ningún backend de Moditty.
 
 ## Estructura conceptual del proyecto
 
@@ -853,26 +762,20 @@ moditty/
 │   ├── moditty-text/
 │   ├── moditty-terminal/
 │   ├── moditty-pty/
-│   ├── moditty-api/
-│   ├── moditty-plugin/
-│   └── moditty-app/
+│   ├── moditty-protocol/
+│   └── moditty-session/
 │
-├── api/
-│
-└── extensions/
+├── protocol/
+└── examples/
 ```
 
 No crear crates vacíos solo para satisfacer esta estructura.
 
 Crear únicamente los crates necesarios para cada milestone y separar componentes cuando exista una frontera arquitectónica real.
 
-## Primer milestone
+## Alcance original de M1
 
-No implementar plugins todavía.
-
-No implementar STAPI todavía.
-
-No implementar STIDL todavía.
+M1 no implementa programas externos, MLP, SDKs ni una API pública.
 
 No implementar un toolkit de UI.
 
@@ -972,8 +875,8 @@ conserva un buffer circular de las últimas 128 entradas relevantes.
 ### Herramientas de prueba
 
 `testing_tools.scene` permite preparar una escena manual mínima para verificar
-el comportamiento nativo del motor antes de que exista la API de mods. Está
-desactivada por defecto y no crea un programa, un plugin ni una interfaz pública.
+el comportamiento nativo del motor antes de que exista la API de programas.
+Está desactivada por defecto y no crea un programa ni una interfaz pública.
 Al habilitarla, cada entrada de `[[testing_tools.scene.nodes]]` crea un rectángulo
 de color. Sus coordenadas, dimensiones y `z_index` usan píxeles lógicos;
 `opacity` afecta sólo ese rectángulo. Una entrada con `parent` usa
@@ -1032,7 +935,9 @@ sobre ellos hasta expirar.
 
 ## Orden aproximado de desarrollo
 
-Después del terminal mínimo:
+M1–M10 están completados. `testing_tools.scene` y el `Program` de M2 son
+infraestructura interna de prueba; no son un mecanismo de ejecución de
+aplicaciones ni una API pública.
 
 ```text
 M1  terminal mínima funcional
@@ -1044,14 +949,32 @@ M6  hit testing
 M7  mouse/focus
 M8  drag and drop + herramientas de prueba
 M9  clipping/layers + jerarquía de pruebas
-M10 API interna estable
-M11 STAPI
-M12 protocolo de plugins
-M13 STIDL
-M14 primera extensión de lenguaje
+M10 contrato de programa y tipos internos de MLP ✓
+M11 sesión local MLP: transporte, handshake, Init/Start y limpieza
+M12 comandos de escena y recursos con ownership por programa
+M13 entrega de Event/Tick/Frame y ciclo de cierre de programa
+M14 SDK de referencia, pruebas de conformidad y primer programa de prueba
+M15 manifiesto mínimo de programa, capacidades y compatibilidad de paquete
+M16 IDL sólo si más de un SDK justifica generación de bindings
 ```
 
-La primera extensión de lenguaje probablemente será Python, pero esto no debe condicionar el diseño del protocolo.
+El lenguaje del primer SDK o programa de prueba no condicionará MLP. Python,
+Lua, JavaScript, C#, Go, Rust, C, C++ y Zig son candidatos equivalentes;
+también será válida una implementación independiente del protocolo.
+
+### Estado de M10
+
+M10 define y prueba dentro del core el contrato que un programa externo usará:
+versión de MLP, identidad y capacidades de sesión, mensajes de handshake,
+transiciones `Init`/`Start`, mensajes de fallo y handles aislados por sesión.
+Las sesiones son concurrentes; un fallo o cierre libera sólo los handles de su
+programa. Después de entregar `Closed`, el host puede descartar el registro
+terminado sin afectar las sesiones activas. El contrato mantiene la semántica
+canónica de M2 sin filtrar tipos del backend.
+
+M10 no abre sockets ni named pipes, no inicia procesos, no expone comandos de
+escena a aplicaciones y no crea SDKs. Esas responsabilidades comienzan,
+respectivamente, en M11, M12–M13 y M14.
 
 ## Principios que deben preservarse
 
@@ -1063,15 +986,15 @@ La primera extensión de lenguaje probablemente será Python, pero esto no debe 
 
 4. No convertir Moditty en un toolkit de widgets.
 
-5. El terminal convencional debe seguir funcionando sin ninguna extensión.
+5. El terminal convencional debe seguir funcionando sin ningún programa cliente.
 
-6. Los mods deben poder alterar profundamente la experiencia sin modificar el core.
+6. Los programas Moditty deben poder alterar profundamente la experiencia sin modificar el core.
 
-7. El sistema de plugins debe ser independiente de Rust.
+7. El protocolo y los SDKs deben ser independientes de Rust.
 
 8. Usar handles en vez de referencias internas.
 
-9. Separar protocolo de plugins, transporte y bindings de lenguaje.
+9. Separar protocolo de programas, transporte y SDKs de lenguaje.
 
 10. Priorizar una arquitectura que permita reemplazar backends sin romper la API.
 
