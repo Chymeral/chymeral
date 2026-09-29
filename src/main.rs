@@ -699,6 +699,7 @@ impl WindowState {
             self.background.render(&mut pass);
             self.image_renderer
                 .render_layer(&mut pass, SceneLayer::Underlay);
+            pass.set_scissor_rect(0, 0, self.surface_config.width, self.surface_config.height);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)?;
             self.image_renderer
