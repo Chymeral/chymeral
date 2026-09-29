@@ -162,7 +162,7 @@ impl TextureStore {
     }
 }
 
-fn rgba8_byte_len(width: u32, height: u32) -> Result<usize, TextureError> {
+pub fn rgba8_byte_len(width: u32, height: u32) -> Result<usize, TextureError> {
     if width == 0 || height == 0 {
         return Err(TextureError::EmptyDimensions);
     }

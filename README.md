@@ -670,10 +670,10 @@ Su nombre provisional es **MLP** (*Moditty Link Protocol*). No es una syscall:
 es un contrato de mensajes entre procesos que evita exponer memoria, tipos de
 Rust o dependencias gráficas del host.
 
-M10 implementa dentro del core el primer contrato de MLP: versión `1.0`,
-sesiones concurrentes, negociación de capacidades, handshake `Init`/`Start`,
-fallos y handles opacos aislados por sesión. M11 lo conecta a un transporte
-local real, pero todavía no acepta comandos de escena, recursos ni eventos.
+M10 implementa dentro del core el primer contrato de MLP y M11 lo conecta a un
+transporte local real. M12 eleva el protocolo a la versión `1.1` y añade el
+primer conjunto de comandos: escena, rectángulos sólidos, imágenes RGBA8 y
+recursos opacos aislados por sesión. Todavía no entrega eventos ni tiempo.
 
 MLP tendrá dos direcciones lógicas en una sesión bidireccional:
 
@@ -705,16 +705,17 @@ MLP sigue separado de ese transporte para permitir adaptadores futuros sin
 alterar la API, pero `stdio`, red, memoria compartida, WASM y carga de código
 nativo quedan fuera de este alcance inicial.
 
-### Transporte MLP v1 (M11)
+### Transporte MLP v1.1 (M11–M12)
 
-El flujo de bytes de M11 está compuesto por frames con una longitud `u32`
-big-endian seguida de un objeto JSON UTF-8. Cada frame, incluyendo el JSON,
-tiene un límite de 1 MiB. Los identificadores se serializan como strings para
-no perder precisión en lenguajes cuyo tipo numérico no representa todos los
-enteros de 64 bits.
+El flujo de bytes está compuesto por frames con una longitud `u32` big-endian,
+un discriminante de un byte y su payload. `J` identifica un objeto JSON UTF-8;
+`B`, un fragmento binario. Cada frame, incluido el discriminante, tiene un
+límite de 1 MiB. Los identificadores se serializan como strings para no perder
+precisión en lenguajes cuyo tipo numérico no representa todos los enteros de
+64 bits.
 
 La primera frame debe ser `hello` y debe llegar dentro de cinco segundos. Lleva
-la versión `{ "major": 1, "minor": 0 }`, el token heredado y la lista de
+la versión `{ "major": 1, "minor": 1 }`, el token heredado y la lista de
 capacidades solicitadas (`scene`, `resources`, `input`, `timing`). Tras validar
 el token y negociar capacidades, la sesión sigue exactamente este orden:
 
@@ -743,10 +744,60 @@ cerrar Moditty, el host deja de aceptar conexiones, entrega `closed` con razón
 `host_shutdown` a cada cliente que siga conectado y espera la limpieza de sus
 handlers antes de liberar el endpoint.
 
-M11 no inicia programas, no interpreta sus argumentos, no expone el token como
-API de alto nivel y no entrega aún `Event`, `Tick`, `Frame`, comandos de escena
-ni recursos. Un SDK de M14 encapsulará estos detalles; hasta entonces son un
-contrato de transporte probado, no una interfaz de usuario final.
+M11–M12 no inician programas, no interpretan sus argumentos, no exponen el
+token como API de alto nivel y no entregan aún `Event`, `Tick` ni `Frame`. Un
+SDK de M14 encapsulará estos detalles; hasta entonces MLP es un contrato crudo
+probado, no una interfaz de usuario final.
+
+### Comandos de escena M12
+
+Una vez que el programa ha enviado `started`, puede emitir una operación JSON
+ordenada. Cada comando lleva un `request_id` no vacío elegido por el cliente y
+recibe exactamente una respuesta `result` o `command_error` con el mismo id.
+No hay lotes todavía: el siguiente comando se interpreta sólo después de que
+el anterior haya respondido.
+
+```text
+programa → { type: "command", request_id, command: { op: ... } }
+Moditty  → { type: "result", request_id, result: ... }
+Moditty  → { type: "command_error", request_id, code, message }
+```
+
+Las operaciones de escena son `create_root`, `create_child`, `update_node`,
+`set_content`, `reparent` y `remove_node`. Una creación recibe propiedades
+lógicas `{ x, y, width, height, visible, clip_children, z_index }`; las
+actualizaciones son parciales. Los hijos expresan coordenadas locales como el
+scene graph existente. Un root puede declarar `layer: "underlay"` u
+`"overlay"`; si se omite, usa `overlay`.
+
+El contenido de un nodo es `empty`, `solid` con `color: [r, g, b, a]`, o
+`image` con un handle de textura y opacidad independiente. Los rectángulos
+sólidos e imágenes comparten el mismo espacio lógico, clipping, orden de
+pintura y composición de M3–M9. `underlay` queda detrás del texto de terminal;
+`overlay`, delante.
+
+`upload_texture` declara `width` y `height`; debe seguirle inmediatamente una
+secuencia de frames `B` que contenga exactamente `width * height * 4` bytes
+RGBA8. La respuesta entrega `texture-N`. No existe Base64, rutas del host ni
+lectura de archivos por parte de Moditty. `destroy_texture` sólo tiene éxito
+cuando ningún nodo la referencia: el programa debe primero cambiar o eliminar
+esos nodos.
+
+Los handles `node-N` y `texture-N` son opacos y exclusivos de la sesión que
+los creó. Cada operación valida propiedad, capacidades, geometría y ciclo de
+vida antes de tocar el scene graph. Al cerrar, fallar o desconectar una sesión,
+el host elimina sus nodos y luego sus texturas, sin afectar a las demás. Una
+textura individual puede medir hasta 64 MiB RGBA8 y una sesión puede retener
+hasta 128 MiB; además, ancho y alto no pueden superar el límite de la GPU
+seleccionada por la ventana. Sobrepasar esos límites devuelve `command_error`
+recuperable.
+
+El handler MLP nunca muta `wgpu`, `Scene` ni `TextureStore` directamente.
+Encola los comandos en una cola acotada para el hilo de ventana, espera la
+respuesta y éste reconcilia interacción y solicita el redraw. Las notificaciones
+de limpieza viajan por un canal separado para que cerrar muchas sesiones nunca
+bloquee el apagado. Esa frontera mantiene el protocolo independiente del backend
+gráfico y preserva el acceso de un solo hilo a la UI.
 
 ## SDKs de cliente e independencia de lenguaje
 
@@ -984,7 +1035,7 @@ sobre ellos hasta expirar.
 
 ## Orden aproximado de desarrollo
 
-M1–M11 están completados. `testing_tools.scene` y el `Program` de M2 son
+M1–M12 están completados. `testing_tools.scene` y el `Program` de M2 son
 infraestructura interna de prueba; no son un mecanismo de ejecución de
 aplicaciones ni una API pública.
 
@@ -1000,7 +1051,7 @@ M8  drag and drop + herramientas de prueba
 M9  clipping/layers + jerarquía de pruebas
 M10 contrato de programa y tipos internos de MLP ✓
 M11 sesión local MLP: transporte, handshake, Init/Start y limpieza ✓
-M12 comandos de escena y recursos con ownership por programa
+M12 comandos de escena y recursos con ownership por programa ✓
 M13 entrega de Event/Tick/Frame y ciclo de cierre de programa
 M14 SDK de referencia, pruebas de conformidad y primer programa de prueba
 M15 manifiesto mínimo de programa, capacidades y compatibilidad de paquete
@@ -1011,7 +1062,7 @@ El lenguaje del primer SDK o programa de prueba no condicionará MLP. Python,
 Lua, JavaScript, C#, Go, Rust, C, C++ y Zig son candidatos equivalentes;
 también será válida una implementación independiente del protocolo.
 
-### Estado de M10 y M11
+### Estado de M10, M11 y M12
 
 M10 define y prueba dentro del core el contrato que un programa externo usará:
 versión de MLP, identidad y capacidades de sesión, mensajes de handshake,
@@ -1028,8 +1079,12 @@ el cierre, `HostShutdown`, el límite de handshakes y la limpieza al desconectar
 Una prueba de integración inicia además un proceso hijo independiente que sólo
 recibe las variables heredadas e implementa el framing MLP crudo. M11 no inicia
 programas por sí mismo, no expone comandos de escena a aplicaciones y no crea
-SDKs. Esas responsabilidades corresponden, respectivamente, a los paquetes,
-M12–M13 y M14.
+SDKs. M12 añade comandos seriales de escena, rectángulos sólidos, imágenes de
+texturas RGBA8 transferidas en fragmentos binarios, validación de capacidad y
+propiedad, límites de memoria y limpieza de recursos al terminar una sesión.
+Sus pruebas cubren ownership, limpieza, intento de destrucción de una textura
+en uso y el recorrido real de un upload binario hacia el hilo de host. Los
+eventos y tiempo corresponden a M13; los paquetes y SDKs, a M14–M15.
 
 ## Principios que deben preservarse
 

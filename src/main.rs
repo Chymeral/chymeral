@@ -26,10 +26,11 @@ use moditty::runtime::{
     Runtime, RuntimeCommand, RuntimeResult, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
 };
 use moditty::{
+    program_scene::{ProgramSceneError, ProgramSceneResources},
     protocol::CapabilitySet,
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
     scene::{ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer, Transform},
-    transport::MlpServer,
+    transport::{HostAction, HostCommandResponse, MlpServer},
 };
 use portable_pty::PtySize;
 use wgpu::{
@@ -67,6 +68,7 @@ const RUNTIME_TICK_INTERVAL: Duration = Duration::from_millis(16);
 pub enum UserEvent {
     PtyOutput,
     PtyClosed,
+    MlpAction,
 }
 
 #[derive(Default)]
@@ -130,13 +132,14 @@ struct WindowState {
     background: BackgroundRenderer,
     terminal: Terminal,
     pty: Pty,
-    _mlp_server: MlpServer,
+    mlp_server: MlpServer,
     runtime: Runtime<TerminalProgram>,
     diagnostics: Diagnostics,
     scene: Scene,
     interaction: SceneInteraction,
     pointer_position: Vec2,
     textures: TextureStore,
+    program_scene_resources: ProgramSceneResources,
     image_renderer: ImageRenderer,
     active_splash: Option<ActiveSplash>,
     pending_resize: Option<PhysicalSize<u32>>,
@@ -172,7 +175,10 @@ impl WindowState {
                 blue: appearance.foreground.color.blue,
             },
         );
-        let mlp_server = MlpServer::start(CapabilitySet::ALL)?;
+        let mlp_event_proxy = event_proxy.clone();
+        let mlp_server = MlpServer::start_with_wake(CapabilitySet::ALL, move || {
+            let _ = mlp_event_proxy.send_event(UserEvent::MlpAction);
+        })?;
         let pty = Pty::spawn(
             pty_size(columns, rows, physical_size),
             event_proxy,
@@ -275,6 +281,7 @@ impl WindowState {
             None
         };
         let image_renderer = ImageRenderer::new(&device, &surface_config);
+        let max_program_texture_dimension = device.limits().max_texture_dimension_2d;
 
         let mut state = Self {
             instance,
@@ -289,13 +296,14 @@ impl WindowState {
             background,
             terminal,
             pty,
-            _mlp_server: mlp_server,
+            mlp_server,
             runtime,
             diagnostics,
             scene,
             interaction: SceneInteraction::new(),
             pointer_position: Vec2::default(),
             textures,
+            program_scene_resources: ProgramSceneResources::new(max_program_texture_dimension),
             image_renderer,
             active_splash,
             pending_resize: None,
@@ -509,6 +517,49 @@ impl WindowState {
     fn write_input(&self, bytes: &[u8]) {
         if let Err(error) = self.pty.write(bytes) {
             eprintln!("Moditty: {error:#}");
+        }
+    }
+
+    fn apply_mlp_actions(&mut self) {
+        let actions = self.mlp_server.drain_host_actions();
+        if actions.is_empty() {
+            return;
+        }
+        let mut scene_changed = false;
+        for action in actions {
+            match action {
+                HostAction::Command(request) => {
+                    let (session_id, _, command, response_sender) = request.into_parts();
+                    let response = match self.program_scene_resources.execute(
+                        session_id,
+                        command,
+                        &mut self.scene,
+                        &mut self.textures,
+                    ) {
+                        Ok(result) => {
+                            scene_changed = true;
+                            HostCommandResponse::Success(result)
+                        }
+                        Err(error) => HostCommandResponse::Error {
+                            code: program_scene_error_code(&error),
+                            message: error.to_string(),
+                        },
+                    };
+                    let _ = response_sender.send(response);
+                }
+                HostAction::Cleanup { session_id } => {
+                    self.program_scene_resources.cleanup_session(
+                        session_id,
+                        &mut self.scene,
+                        &mut self.textures,
+                    );
+                    scene_changed = true;
+                }
+            }
+        }
+        if scene_changed {
+            self.reconcile_scene_interaction();
+            self.window.request_redraw();
         }
     }
 
@@ -812,6 +863,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
                 });
                 event_loop.exit();
             }
+            UserEvent::MlpAction => self.with_state(WindowState::apply_mlp_actions),
         }
     }
 
@@ -909,6 +961,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
         let mut runtime_error = None;
         self.with_state(|state| {
             let now = Instant::now();
+            state.apply_mlp_actions();
             state.apply_pending_resize(now);
             if state
                 .runtime
@@ -965,6 +1018,24 @@ fn grid_size(size: PhysicalSize<u32>, font: &FontAppearance, scale_factor: f64) 
         u16::try_from(columns).unwrap_or(u16::MAX),
         u16::try_from(rows).unwrap_or(u16::MAX),
     )
+}
+
+fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
+    match error {
+        ProgramSceneError::InvalidNodeHandle(_) | ProgramSceneError::InvalidTextureHandle(_) => {
+            "invalid_handle"
+        }
+        ProgramSceneError::HandleNotOwned => "not_owner",
+        ProgramSceneError::TextureInUse(_) => "texture_in_use",
+        ProgramSceneError::TextureLimitExceeded { .. }
+        | ProgramSceneError::SessionTextureLimitExceeded { .. }
+        | ProgramSceneError::TextureDimensionLimitExceeded { .. } => "resource_limit",
+        ProgramSceneError::Geometry(_)
+        | ProgramSceneError::Image(_)
+        | ProgramSceneError::Texture(_) => "invalid_argument",
+        ProgramSceneError::Scene(_) => "invalid_scene_operation",
+        ProgramSceneError::HandleExhausted => "host_capacity",
+    }
 }
 
 fn physical_font_metrics(font: &FontAppearance, scale_factor: f64) -> Metrics {

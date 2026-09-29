@@ -200,6 +200,21 @@ pub struct ImageNode {
     opacity: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SolidNode {
+    color: [u8; 4],
+}
+
+impl SolidNode {
+    pub const fn new(color: [u8; 4]) -> Self {
+        Self { color }
+    }
+
+    pub const fn color(self) -> [u8; 4] {
+        self.color
+    }
+}
+
 impl ImageNode {
     pub fn new(texture: TextureId, opacity: f32) -> Result<Self, ImageNodeError> {
         if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
@@ -238,6 +253,7 @@ impl Error for ImageNodeError {}
 pub enum NodeContent {
     #[default]
     Empty,
+    Solid(SolidNode),
     Image(ImageNode),
 }
 
@@ -380,6 +396,15 @@ impl Scene {
 
     pub fn clear_content(&mut self, node: NodeId) -> Result<(), SceneError> {
         self.set_content(node, NodeContent::Empty)
+    }
+
+    pub fn references_texture(&self, texture: TextureId) -> bool {
+        self.slots.iter().any(|slot| {
+            matches!(
+                slot.node.as_ref().map(Node::content),
+                Some(NodeContent::Image(image)) if image.texture() == texture
+            )
+        })
     }
 
     pub fn set_root_layer(&mut self, node: NodeId, layer: SceneLayer) -> Result<(), SceneError> {

@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
     time::{Duration, Instant},
@@ -22,11 +23,20 @@ use crate::protocol::{
     ProgramInitContext, ProgramPhase, ProtocolError, ProtocolVersion, SessionCloseReason,
     SessionId, SessionManager,
 };
+use crate::{
+    program_scene::{
+        ContentInput, MAX_TEXTURE_BYTES, NodeHandle, NodePropertiesInput, NodePropertiesPatch,
+        SceneCommand, SceneCommandResult, TextureHandle,
+    },
+    resources::rgba8_byte_len,
+    scene::SceneLayer,
+};
 
 pub const MLP_ENDPOINT_ENV: &str = "MODITTY_MLP_ENDPOINT";
 pub const MLP_TOKEN_ENV: &str = "MODITTY_MLP_TOKEN";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_PENDING_HANDSHAKES: usize = 16;
+pub const MAX_PENDING_HOST_ACTIONS: usize = 64;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -60,16 +70,80 @@ pub struct MlpServer {
     listener_thread: Option<thread::JoinHandle<()>>,
     manager: Arc<Mutex<SessionManager>>,
     control: Arc<ServerControl>,
+    host_actions: Mutex<Receiver<HostAction>>,
+    cleanup_actions: Mutex<Receiver<SessionId>>,
+}
+
+pub enum HostAction {
+    Command(HostCommandRequest),
+    Cleanup { session_id: SessionId },
+}
+
+pub struct HostCommandRequest {
+    pub session_id: SessionId,
+    pub request_id: String,
+    pub command: SceneCommand,
+    response: SyncSender<HostCommandResponse>,
+}
+
+impl HostCommandRequest {
+    pub fn respond(self, response: HostCommandResponse) {
+        let _ = self.response.send(response);
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        SessionId,
+        String,
+        SceneCommand,
+        SyncSender<HostCommandResponse>,
+    ) {
+        (
+            self.session_id,
+            self.request_id,
+            self.command,
+            self.response,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostCommandResponse {
+    Success(SceneCommandResult),
+    Error { code: &'static str, message: String },
+}
+
+#[derive(Clone)]
+struct HostActionBroker {
+    sender: SyncSender<HostAction>,
+    cleanup_sender: mpsc::Sender<SessionId>,
+    wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl MlpServer {
     pub fn start(available_capabilities: CapabilitySet) -> Result<Self> {
+        Self::start_with_wake(available_capabilities, || {})
+    }
+
+    pub fn start_with_wake(
+        available_capabilities: CapabilitySet,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
         let (environment, listener) = bind_listener()?;
         let control = Arc::new(ServerControl::default());
         let manager = Arc::new(Mutex::new(SessionManager::new(available_capabilities)));
+        let (host_action_sender, host_actions) = mpsc::sync_channel(MAX_PENDING_HOST_ACTIONS);
+        let (cleanup_sender, cleanup_actions) = mpsc::channel();
+        let broker = HostActionBroker {
+            sender: host_action_sender,
+            cleanup_sender,
+            wake: Arc::new(wake),
+        };
         let listener_control = Arc::clone(&control);
         let listener_manager = Arc::clone(&manager);
         let listener_environment = environment.clone();
+        let listener_broker = broker.clone();
         let listener_thread = thread::Builder::new()
             .name("moditty-mlp-listener".to_owned())
             .spawn(move || {
@@ -78,6 +152,7 @@ impl MlpServer {
                     listener_environment,
                     listener_manager,
                     listener_control,
+                    listener_broker,
                 );
             })
             .context("could not start the MLP listener")?;
@@ -87,6 +162,8 @@ impl MlpServer {
             listener_thread: Some(listener_thread),
             manager,
             control,
+            host_actions: Mutex::new(host_actions),
+            cleanup_actions: Mutex::new(cleanup_actions),
         })
     }
 
@@ -109,9 +186,45 @@ impl MlpServer {
         self.control.wait_for_handlers();
     }
 
+    pub fn drain_host_actions(&self) -> Vec<HostAction> {
+        let mut actions: Vec<HostAction> = self
+            .host_actions
+            .lock()
+            .map(|receiver| std::iter::from_fn(|| receiver.try_recv().ok()).collect())
+            .unwrap_or_default();
+        if let Ok(receiver) = self.cleanup_actions.lock() {
+            actions.extend(
+                std::iter::from_fn(|| receiver.try_recv().ok())
+                    .map(|session_id| HostAction::Cleanup { session_id }),
+            );
+        }
+        actions
+    }
+
     #[cfg(test)]
     fn pending_handshake_count(&self) -> usize {
         self.control.pending_handshake_count()
+    }
+}
+
+impl HostActionBroker {
+    fn submit(&self, request: HostCommandRequest) -> Result<()> {
+        match self.sender.try_send(HostAction::Command(request)) {
+            Ok(()) => {
+                (self.wake)();
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => Err(anyhow!("the host command queue is full")),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(anyhow!("the host command queue is unavailable"))
+            }
+        }
+    }
+
+    fn cleanup(&self, session_id: SessionId) {
+        if self.cleanup_sender.send(session_id).is_ok() {
+            (self.wake)();
+        }
     }
 }
 
@@ -261,6 +374,7 @@ fn serve_connections(
     environment: SessionEnvironment,
     manager: Arc<Mutex<SessionManager>>,
     control: Arc<ServerControl>,
+    broker: HostActionBroker,
 ) {
     while !control.is_shutting_down() {
         match listener.accept() {
@@ -272,6 +386,7 @@ fn serve_connections(
                 let connection_environment = environment.clone();
                 let connection_manager = Arc::clone(&manager);
                 let connection_control = Arc::clone(&control);
+                let connection_broker = broker.clone();
                 if let Err(error) = thread::Builder::new()
                     .name("moditty-mlp-client".to_owned())
                     .spawn(move || {
@@ -280,6 +395,7 @@ fn serve_connections(
                             connection_environment,
                             connection_manager,
                             connection_control,
+                            connection_broker,
                             connection_guard,
                         );
                     })
@@ -306,6 +422,7 @@ fn handle_connection(
     environment: SessionEnvironment,
     manager: Arc<Mutex<SessionManager>>,
     control: Arc<ServerControl>,
+    broker: HostActionBroker,
     mut connection_guard: ConnectionGuard,
 ) {
     if let Err(error) = stream.set_nonblocking(true) {
@@ -377,6 +494,14 @@ fn handle_connection(
             return;
         }
     };
+    let granted_capabilities = match &init_message {
+        HostMessage::Init(init) => init.granted_capabilities,
+        _ => unreachable!("a newly accepted MLP session always receives init"),
+    };
+    let _cleanup = SessionCleanup {
+        session_id,
+        broker: broker.clone(),
+    };
 
     if let Err(error) = write_host_message(&mut stream, init_message) {
         close_disconnected_session(&manager, session_id);
@@ -387,9 +512,8 @@ fn handle_connection(
     let mut handshake_complete = false;
     loop {
         let deadline = (!handshake_complete).then_some(handshake_deadline);
-        let message = match read_client_message(&mut stream, &mut frame_reader, deadline, &control)
-        {
-            Ok(FrameRead::Message(message)) => message,
+        let frame = match read_client_frame(&mut stream, &mut frame_reader, deadline, &control) {
+            Ok(FrameRead::Message(frame)) => frame,
             Ok(FrameRead::Disconnected) => {
                 close_disconnected_session(&manager, session_id);
                 return;
@@ -408,7 +532,104 @@ fn handle_connection(
                 return;
             }
         };
-        let client_message = match client_message_from_wire(message) {
+        if let WireFrame::Json(payload) = &frame
+            && let Ok(WireClientMessage::Command {
+                request_id,
+                command,
+            }) = serde_json::from_slice(payload)
+        {
+            if !handshake_complete {
+                close_protocol_violation(
+                    &mut stream,
+                    &manager,
+                    session_id,
+                    "commands require a running session",
+                );
+                return;
+            }
+            if request_id.is_empty() {
+                let _ = write_error(
+                    &mut stream,
+                    "invalid_command",
+                    "a scene command requires a non-empty request_id",
+                );
+                continue;
+            }
+            if !wire_command_is_granted(&command, granted_capabilities) {
+                if let Err(error) = discard_scene_command_payload(
+                    &command,
+                    &mut stream,
+                    &mut frame_reader,
+                    &control,
+                ) {
+                    close_protocol_violation(&mut stream, &manager, session_id, &error.to_string());
+                    return;
+                }
+                let _ = write_command_response(
+                    &mut stream,
+                    &request_id,
+                    HostCommandResponse::Error {
+                        code: "capability_denied",
+                        message:
+                            "the command requires a capability that this session was not granted"
+                                .to_owned(),
+                    },
+                );
+                continue;
+            }
+            let command =
+                match read_scene_command(command, &mut stream, &mut frame_reader, &control) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        let _ = write_error(&mut stream, "invalid_command", &error.to_string());
+                        continue;
+                    }
+                };
+            if !command_is_granted(&command, granted_capabilities) {
+                let _ = write_command_response(
+                    &mut stream,
+                    &request_id,
+                    HostCommandResponse::Error {
+                        code: "capability_denied",
+                        message:
+                            "the command requires a capability that this session was not granted"
+                                .to_owned(),
+                    },
+                );
+                continue;
+            }
+            let response =
+                dispatch_host_command(&broker, &control, session_id, request_id.clone(), command);
+            match response {
+                Ok(response) => {
+                    if write_command_response(&mut stream, &request_id, response).is_err() {
+                        close_disconnected_session(&manager, session_id);
+                        return;
+                    }
+                }
+                Err(_) if control.is_shutting_down() => {
+                    close_session(
+                        &mut stream,
+                        &manager,
+                        session_id,
+                        SessionCloseReason::HostShutdown,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let _ = write_command_response(
+                        &mut stream,
+                        &request_id,
+                        HostCommandResponse::Error {
+                            code: "host_unavailable",
+                            message: error.to_string(),
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+        let client_message = match client_message_from_frame(frame) {
             Ok(message) => message,
             Err(error) => {
                 close_protocol_violation(&mut stream, &manager, session_id, &error.to_string());
@@ -455,6 +676,17 @@ fn handle_connection(
             handshake_complete = true;
             connection_guard.complete_handshake();
         }
+    }
+}
+
+struct SessionCleanup {
+    session_id: SessionId,
+    broker: HostActionBroker,
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.broker.cleanup(self.session_id);
     }
 }
 
@@ -528,7 +760,12 @@ fn capabilities_from_wire(capabilities: &[WireCapability]) -> CapabilitySet {
     CapabilitySet::from_capabilities(&protocol_capabilities)
 }
 
-fn client_message_from_wire(message: WireClientMessage) -> Result<ClientMessage> {
+fn client_message_from_frame(frame: WireFrame) -> Result<ClientMessage> {
+    let WireFrame::Json(payload) = frame else {
+        return Err(anyhow!("expected a JSON MLP message"));
+    };
+    let message =
+        serde_json::from_slice(&payload).context("could not parse the MLP JSON message")?;
     match message {
         WireClientMessage::Hello { .. } => {
             Err(anyhow!("hello may only be sent at connection start"))
@@ -545,6 +782,7 @@ fn client_message_from_wire(message: WireClientMessage) -> Result<ClientMessage>
             )))
         }
         WireClientMessage::Close => Ok(ClientMessage::Close),
+        WireClientMessage::Command { .. } => Err(anyhow!("a scene command was not handled")),
     }
 }
 
@@ -557,8 +795,180 @@ fn read_client_message(
     frame_reader.read_next(stream, deadline, Some(control))
 }
 
+fn read_client_frame(
+    stream: &mut LocalSocketStream,
+    frame_reader: &mut FrameReader,
+    deadline: Option<Instant>,
+    control: &ServerControl,
+) -> Result<FrameRead<WireFrame>> {
+    frame_reader.read_next_frame(stream, deadline, Some(control))
+}
+
 fn write_host_message(stream: &mut LocalSocketStream, message: HostMessage) -> Result<()> {
     write_frame(stream, &WireHostMessage::from(message))
+}
+
+fn write_command_response(
+    stream: &mut LocalSocketStream,
+    request_id: &str,
+    response: HostCommandResponse,
+) -> Result<()> {
+    match response {
+        HostCommandResponse::Success(result) => write_frame(
+            stream,
+            &WireHostMessage::Result {
+                request_id: request_id.to_owned(),
+                result: result.into(),
+            },
+        ),
+        HostCommandResponse::Error { code, message } => write_frame(
+            stream,
+            &WireHostMessage::CommandError {
+                request_id: request_id.to_owned(),
+                code: code.to_owned(),
+                message,
+            },
+        ),
+    }
+}
+
+fn dispatch_host_command(
+    broker: &HostActionBroker,
+    control: &ServerControl,
+    session_id: SessionId,
+    request_id: String,
+    command: SceneCommand,
+) -> Result<HostCommandResponse> {
+    let (response_sender, response_receiver) = mpsc::sync_channel(1);
+    broker.submit(HostCommandRequest {
+        session_id,
+        request_id,
+        command,
+        response: response_sender,
+    })?;
+    loop {
+        if control.is_shutting_down() {
+            return Err(anyhow!("the MLP host is shutting down"));
+        }
+        match response_receiver.recv_timeout(LISTENER_POLL_INTERVAL) {
+            Ok(response) => return Ok(response),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("the MLP host command response channel closed"));
+            }
+        }
+    }
+}
+
+fn read_scene_command(
+    command: WireSceneCommand,
+    stream: &mut LocalSocketStream,
+    frame_reader: &mut FrameReader,
+    control: &ServerControl,
+) -> Result<SceneCommand> {
+    let upload_length = command.upload_length()?;
+    let pixels = if let Some(length) = upload_length {
+        Some(read_texture_upload(stream, frame_reader, control, length, true)?.unwrap_or_default())
+    } else {
+        None
+    };
+    command.into_scene_command(pixels)
+}
+
+fn discard_scene_command_payload(
+    command: &WireSceneCommand,
+    stream: &mut LocalSocketStream,
+    frame_reader: &mut FrameReader,
+    control: &ServerControl,
+) -> Result<()> {
+    if let Some(length) = command.upload_length()? {
+        let _ = read_texture_upload(stream, frame_reader, control, length, false)?;
+    }
+    Ok(())
+}
+
+fn read_texture_upload(
+    stream: &mut LocalSocketStream,
+    frame_reader: &mut FrameReader,
+    control: &ServerControl,
+    length: usize,
+    retain_pixels: bool,
+) -> Result<Option<Vec<u8>>> {
+    let mut received = 0_usize;
+    let mut pixels = retain_pixels.then(|| Vec::with_capacity(length));
+    while received < length {
+        let frame = read_client_frame(stream, frame_reader, None, control)?;
+        let FrameRead::Message(WireFrame::Binary(fragment)) = frame else {
+            return Err(anyhow!(
+                "RGBA8 texture uploads require consecutive binary frames"
+            ));
+        };
+        if fragment.is_empty() {
+            return Err(anyhow!("RGBA8 texture upload frames may not be empty"));
+        }
+        received = received
+            .checked_add(fragment.len())
+            .context("texture upload byte count overflows this platform")?;
+        if received > length {
+            return Err(anyhow!(
+                "RGBA8 texture upload exceeds its declared byte length"
+            ));
+        }
+        if let Some(pixels) = pixels.as_mut() {
+            pixels.extend_from_slice(&fragment);
+        }
+    }
+    Ok(pixels)
+}
+
+fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilitySet) -> bool {
+    match command {
+        WireSceneCommand::UploadTexture { .. } | WireSceneCommand::DestroyTexture { .. } => {
+            capabilities.contains(Capability::Resources)
+        }
+        WireSceneCommand::CreateRoot { content, .. }
+        | WireSceneCommand::CreateChild { content, .. }
+        | WireSceneCommand::SetContent { content, .. } => {
+            capabilities.contains(Capability::Scene)
+                && (!content.uses_texture() || capabilities.contains(Capability::Resources))
+        }
+        WireSceneCommand::UpdateNode { .. }
+        | WireSceneCommand::Reparent { .. }
+        | WireSceneCommand::RemoveNode { .. } => capabilities.contains(Capability::Scene),
+    }
+}
+
+fn command_is_granted(command: &SceneCommand, capabilities: CapabilitySet) -> bool {
+    match command {
+        SceneCommand::UploadTexture { .. } | SceneCommand::DestroyTexture { .. } => {
+            capabilities.contains(Capability::Resources)
+        }
+        SceneCommand::CreateRoot { .. }
+        | SceneCommand::CreateChild { .. }
+        | SceneCommand::UpdateNode { .. }
+        | SceneCommand::SetContent { .. }
+        | SceneCommand::Reparent { .. }
+        | SceneCommand::RemoveNode { .. } => {
+            capabilities.contains(Capability::Scene)
+                && (!command_uses_texture(command) || capabilities.contains(Capability::Resources))
+        }
+    }
+}
+
+fn command_uses_texture(command: &SceneCommand) -> bool {
+    matches!(
+        command,
+        SceneCommand::CreateRoot {
+            content: ContentInput::Image { .. },
+            ..
+        } | SceneCommand::CreateChild {
+            content: ContentInput::Image { .. },
+            ..
+        } | SceneCommand::SetContent {
+            content: ContentInput::Image { .. },
+            ..
+        }
+    )
 }
 
 fn write_error(stream: &mut LocalSocketStream, code: &str, message: &str) -> Result<()> {
@@ -582,6 +992,11 @@ enum FrameRead<T> {
     Shutdown,
 }
 
+enum WireFrame {
+    Json(Vec<u8>),
+    Binary(Vec<u8>),
+}
+
 impl FrameReader {
     fn read_next<T: DeserializeOwned>(
         &mut self,
@@ -594,6 +1009,9 @@ impl FrameReader {
                 return Ok(FrameRead::Shutdown);
             }
             if let Some(message) = self.take_complete_frame()? {
+                let WireFrame::Json(message) = message else {
+                    return Err(anyhow!("expected a JSON MLP frame"));
+                };
                 return serde_json::from_slice(&message)
                     .context("could not parse the MLP JSON message")
                     .map(FrameRead::Message);
@@ -620,7 +1038,39 @@ impl FrameReader {
         }
     }
 
-    fn take_complete_frame(&mut self) -> Result<Option<Vec<u8>>> {
+    fn read_next_frame(
+        &mut self,
+        stream: &mut LocalSocketStream,
+        deadline: Option<Instant>,
+        control: Option<&ServerControl>,
+    ) -> Result<FrameRead<WireFrame>> {
+        loop {
+            if control.is_some_and(ServerControl::is_shutting_down) {
+                return Ok(FrameRead::Shutdown);
+            }
+            if let Some(frame) = self.take_complete_frame()? {
+                return Ok(FrameRead::Message(frame));
+            }
+            let mut received = [0_u8; 8192];
+            match stream.read(&mut received) {
+                Ok(0) => {
+                    if empty_read_is_disconnected(stream)
+                        .context("could not inspect the MLP connection state")?
+                    {
+                        return Ok(FrameRead::Disconnected);
+                    }
+                    wait_for_data(deadline)?;
+                }
+                Ok(count) => self.bytes.extend_from_slice(&received[..count]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if read_disconnected(&error) => return Ok(FrameRead::Disconnected),
+                Err(error) if read_would_block(&error) => wait_for_data(deadline)?,
+                Err(error) => return Err(error).context("could not read the MLP frame"),
+            }
+        }
+    }
+
+    fn take_complete_frame(&mut self) -> Result<Option<WireFrame>> {
         if self.bytes.len() < 4 {
             return Ok(None);
         }
@@ -641,9 +1091,17 @@ impl FrameReader {
         if self.bytes.len() < frame_end {
             return Ok(None);
         }
-        let payload = self.bytes[4..frame_end].to_vec();
+        if length == 0 {
+            return Err(anyhow!("MLP frames must include a frame kind"));
+        }
+        let kind = self.bytes[4];
+        let payload = self.bytes[5..frame_end].to_vec();
         self.bytes.drain(..frame_end);
-        Ok(Some(payload))
+        match kind {
+            b'J' => Ok(Some(WireFrame::Json(payload))),
+            b'B' => Ok(Some(WireFrame::Binary(payload))),
+            _ => Err(anyhow!("MLP frame has an unknown kind")),
+        }
     }
 }
 
@@ -723,18 +1181,33 @@ fn read_would_block(error: &io::Error) -> bool {
 
 fn write_frame<T: Serialize>(stream: &mut LocalSocketStream, message: &T) -> Result<()> {
     let payload = serde_json::to_vec(message).context("could not encode the MLP JSON message")?;
-    if payload.len() > MAX_FRAME_BYTES {
+    write_raw_frame(stream, b'J', &payload)
+}
+
+#[cfg(test)]
+fn write_binary_frame(stream: &mut LocalSocketStream, payload: &[u8]) -> Result<()> {
+    write_raw_frame(stream, b'B', payload)
+}
+
+fn write_raw_frame(stream: &mut LocalSocketStream, kind: u8, payload: &[u8]) -> Result<()> {
+    let frame_length = payload
+        .len()
+        .checked_add(1)
+        .context("the MLP frame is too large")?;
+    if frame_length > MAX_FRAME_BYTES {
         return Err(anyhow!(
-            "the MLP frame is {} bytes; the limit is {MAX_FRAME_BYTES}",
-            payload.len()
+            "the MLP frame is {frame_length} bytes; the limit is {MAX_FRAME_BYTES}"
         ));
     }
-    let length = u32::try_from(payload.len()).context("the MLP frame is too large")?;
+    let length = u32::try_from(frame_length).context("the MLP frame is too large")?;
     stream
         .write_all(&length.to_be_bytes())
         .context("could not write the MLP frame length")?;
     stream
-        .write_all(&payload)
+        .write_all(&[kind])
+        .context("could not write the MLP frame kind")?;
+    stream
+        .write_all(payload)
         .context("could not write the MLP frame payload")?;
     stream.flush().context("could not flush the MLP frame")
 }
@@ -754,6 +1227,228 @@ enum WireClientMessage {
         message: String,
     },
     Close,
+    Command {
+        request_id: String,
+        command: WireSceneCommand,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum WireSceneCommand {
+    CreateRoot {
+        #[serde(default)]
+        layer: WireSceneLayer,
+        properties: WireNodeProperties,
+        content: WireNodeContent,
+    },
+    CreateChild {
+        parent: String,
+        properties: WireNodeProperties,
+        content: WireNodeContent,
+    },
+    UpdateNode {
+        node: String,
+        properties: WireNodePropertiesPatch,
+    },
+    SetContent {
+        node: String,
+        content: WireNodeContent,
+    },
+    Reparent {
+        node: String,
+        parent: Option<String>,
+    },
+    RemoveNode {
+        node: String,
+    },
+    UploadTexture {
+        width: u32,
+        height: u32,
+    },
+    DestroyTexture {
+        texture: String,
+    },
+}
+
+impl WireSceneCommand {
+    fn upload_length(&self) -> Result<Option<usize>> {
+        let Self::UploadTexture { width, height } = self else {
+            return Ok(None);
+        };
+        let bytes = rgba8_byte_len(*width, *height).context("invalid RGBA8 texture dimensions")?;
+        if bytes > MAX_TEXTURE_BYTES {
+            return Err(anyhow!(
+                "a texture may not exceed {MAX_TEXTURE_BYTES} bytes"
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn into_scene_command(self, pixels: Option<Vec<u8>>) -> Result<SceneCommand> {
+        match self {
+            Self::CreateRoot {
+                layer,
+                properties,
+                content,
+            } => Ok(SceneCommand::CreateRoot {
+                layer: layer.into_scene(),
+                properties: properties.into_input(),
+                content: content.into_input()?,
+            }),
+            Self::CreateChild {
+                parent,
+                properties,
+                content,
+            } => Ok(SceneCommand::CreateChild {
+                parent: parse_node_handle(&parent)?,
+                properties: properties.into_input(),
+                content: content.into_input()?,
+            }),
+            Self::UpdateNode { node, properties } => Ok(SceneCommand::UpdateNode {
+                node: parse_node_handle(&node)?,
+                properties: properties.into_patch(),
+            }),
+            Self::SetContent { node, content } => Ok(SceneCommand::SetContent {
+                node: parse_node_handle(&node)?,
+                content: content.into_input()?,
+            }),
+            Self::Reparent { node, parent } => Ok(SceneCommand::Reparent {
+                node: parse_node_handle(&node)?,
+                parent: parent.as_deref().map(parse_node_handle).transpose()?,
+            }),
+            Self::RemoveNode { node } => Ok(SceneCommand::RemoveNode {
+                node: parse_node_handle(&node)?,
+            }),
+            Self::UploadTexture { width, height } => Ok(SceneCommand::UploadTexture {
+                width,
+                height,
+                pixels: pixels
+                    .ok_or_else(|| anyhow!("an RGBA8 texture upload requires binary pixels"))?,
+            }),
+            Self::DestroyTexture { texture } => Ok(SceneCommand::DestroyTexture {
+                texture: parse_texture_handle(&texture)?,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireSceneLayer {
+    Underlay,
+    #[default]
+    Overlay,
+}
+
+impl WireSceneLayer {
+    const fn into_scene(self) -> SceneLayer {
+        match self {
+            Self::Underlay => SceneLayer::Underlay,
+            Self::Overlay => SceneLayer::Overlay,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct WireNodeProperties {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    #[serde(default = "default_visible")]
+    visible: bool,
+    #[serde(default)]
+    clip_children: bool,
+    #[serde(default)]
+    z_index: i32,
+}
+
+const fn default_visible() -> bool {
+    true
+}
+
+impl WireNodeProperties {
+    fn into_input(self) -> NodePropertiesInput {
+        NodePropertiesInput {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            visible: self.visible,
+            clip_children: self.clip_children,
+            z_index: self.z_index,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct WireNodePropertiesPatch {
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+    visible: Option<bool>,
+    clip_children: Option<bool>,
+    z_index: Option<i32>,
+}
+
+impl WireNodePropertiesPatch {
+    fn into_patch(self) -> NodePropertiesPatch {
+        NodePropertiesPatch {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            visible: self.visible,
+            clip_children: self.clip_children,
+            z_index: self.z_index,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireNodeContent {
+    Empty,
+    Solid { color: [u8; 4] },
+    Image { texture: String, opacity: f32 },
+}
+
+impl WireNodeContent {
+    fn into_input(self) -> Result<ContentInput> {
+        match self {
+            Self::Empty => Ok(ContentInput::Empty),
+            Self::Solid { color } => Ok(ContentInput::Solid { color }),
+            Self::Image { texture, opacity } => Ok(ContentInput::Image {
+                texture: parse_texture_handle(&texture)?,
+                opacity,
+            }),
+        }
+    }
+
+    const fn uses_texture(&self) -> bool {
+        matches!(self, Self::Image { .. })
+    }
+}
+
+fn parse_node_handle(value: &str) -> Result<NodeHandle> {
+    parse_handle(value, "node-").map(NodeHandle::new)
+}
+
+fn parse_texture_handle(value: &str) -> Result<TextureHandle> {
+    parse_handle(value, "texture-").map(TextureHandle::new)
+}
+
+fn parse_handle(value: &str, prefix: &str) -> Result<u64> {
+    let numeric = value
+        .strip_prefix(prefix)
+        .ok_or_else(|| anyhow!("invalid resource handle"))?;
+    let value = numeric.parse::<u64>().context("invalid resource handle")?;
+    if value == 0 {
+        return Err(anyhow!("invalid resource handle"));
+    }
+    Ok(value)
 }
 
 struct WireHello {
@@ -865,6 +1560,37 @@ enum WireHostMessage {
         code: String,
         message: String,
     },
+    Result {
+        request_id: String,
+        result: WireCommandResult,
+    },
+    CommandError {
+        request_id: String,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireCommandResult {
+    Node { node: String },
+    Texture { texture: String },
+    Acknowledged,
+}
+
+impl From<SceneCommandResult> for WireCommandResult {
+    fn from(result: SceneCommandResult) -> Self {
+        match result {
+            SceneCommandResult::Node(node) => Self::Node {
+                node: node.to_string(),
+            },
+            SceneCommandResult::Texture(texture) => Self::Texture {
+                texture: texture.to_string(),
+            },
+            SceneCommandResult::Acknowledged => Self::Acknowledged,
+        }
+    }
 }
 
 impl From<HostMessage> for WireHostMessage {
@@ -1024,6 +1750,17 @@ mod tests {
         assert_eq!(server.session_count().unwrap(), expected);
     }
 
+    fn wait_for_host_action(server: &MlpServer) -> HostAction {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if let Some(action) = server.drain_host_actions().into_iter().next() {
+                return action;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the MLP host action did not arrive")
+    }
+
     #[test]
     fn authenticated_client_completes_the_framed_handshake() {
         let server = MlpServer::start(CapabilitySet::from_capabilities(&[
@@ -1036,7 +1773,7 @@ mod tests {
         send_client(&mut client, hello(&server, vec!["scene", "timing"]));
         let init = receive_host(&mut client);
         assert_eq!(init["type"], "init");
-        assert_eq!(init["protocol"], json!({ "major": 1, "minor": 0 }));
+        assert_eq!(init["protocol"], json!({ "major": 1, "minor": 1 }));
         assert_eq!(init["capabilities"], json!(["scene"]));
         assert_eq!(
             init["context"],
@@ -1055,6 +1792,85 @@ mod tests {
         assert_eq!(closed["type"], "closed");
         assert_eq!(closed["reason"], json!({ "kind": "client_requested" }));
         wait_for_session_count(&server, 0);
+    }
+
+    #[test]
+    fn forwards_ordered_binary_texture_uploads_to_the_host_thread() {
+        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene", "resources"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "texture-request".to_owned(),
+                command: WireSceneCommand::UploadTexture {
+                    width: 1,
+                    height: 1,
+                },
+            },
+        );
+        write_binary_frame(&mut client, &[1, 2, 3, 4]).unwrap();
+
+        let HostAction::Command(request) = wait_for_host_action(&server) else {
+            panic!("an active session should forward texture uploads as commands");
+        };
+        assert_eq!(request.request_id, "texture-request");
+        assert_eq!(
+            request.command,
+            SceneCommand::UploadTexture {
+                width: 1,
+                height: 1,
+                pixels: vec![1, 2, 3, 4],
+            }
+        );
+        request.respond(HostCommandResponse::Success(SceneCommandResult::Texture(
+            TextureHandle::new(7),
+        )));
+
+        let result = receive_host(&mut client);
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["request_id"], "texture-request");
+        assert_eq!(
+            result["result"],
+            json!({ "kind": "texture", "texture": "texture-7" })
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn rejects_commands_outside_the_negotiated_capabilities() {
+        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "denied-upload".to_owned(),
+                command: WireSceneCommand::UploadTexture {
+                    width: 1,
+                    height: 1,
+                },
+            },
+        );
+        write_binary_frame(&mut client, &[0; 4]).unwrap();
+
+        let error = receive_host(&mut client);
+        assert_eq!(error["type"], "command_error");
+        assert_eq!(error["request_id"], "denied-upload");
+        assert_eq!(error["code"], "capability_denied");
+        assert!(server.drain_host_actions().is_empty());
     }
 
     #[test]

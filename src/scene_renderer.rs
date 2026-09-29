@@ -1,4 +1,7 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use anyhow::{Context, Result};
 use moditty::{
@@ -82,10 +85,16 @@ struct GpuImage {
 
 #[derive(Clone, Copy)]
 struct Draw {
-    texture: TextureId,
+    source: DrawSource,
     first_vertex: u32,
     layer: SceneLayer,
     scissor: ScissorRect,
+}
+
+#[derive(Clone, Copy)]
+enum DrawSource {
+    Texture(TextureId),
+    Solid([u8; 4]),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +129,7 @@ pub struct ImageRenderer {
     vertex_buffer: Buffer,
     vertex_capacity: u64,
     gpu_images: HashMap<TextureId, GpuImage>,
+    gpu_solids: HashMap<[u8; 4], GpuImage>,
     draws: Vec<Draw>,
 }
 
@@ -150,6 +160,7 @@ impl ImageRenderer {
             vertex_buffer,
             vertex_capacity: IMAGE_VERTEX_STRIDE,
             gpu_images: HashMap::new(),
+            gpu_solids: HashMap::new(),
             draws: Vec::new(),
         }
     }
@@ -165,17 +176,37 @@ impl ImageRenderer {
         self.gpu_images
             .retain(|texture, _| textures.texture(*texture).is_some());
 
+        let paint_order = scene.paint_order();
+        let solid_colors = paint_order
+            .iter()
+            .filter_map(|node_id| scene.node(*node_id))
+            .filter_map(|node| match node.content() {
+                NodeContent::Solid(solid) => Some(solid.color()),
+                NodeContent::Empty | NodeContent::Image(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        self.gpu_solids
+            .retain(|color, _| solid_colors.contains(color));
+
         let mut vertices = Vec::new();
         self.draws.clear();
-        for node_id in scene.paint_order() {
+        for node_id in paint_order {
             let Some(node) = scene.node(node_id) else {
                 continue;
             };
-            let NodeContent::Image(image) = node.content() else {
-                continue;
-            };
-            let Some(texture) = textures.texture(image.texture()) else {
-                continue;
+            let (source, opacity) = match node.content() {
+                NodeContent::Empty => continue,
+                NodeContent::Image(image) => {
+                    let Some(texture) = textures.texture(image.texture()) else {
+                        continue;
+                    };
+                    self.ensure_gpu_image(device, queue, image.texture(), texture)?;
+                    (DrawSource::Texture(image.texture()), image.opacity())
+                }
+                NodeContent::Solid(solid) => {
+                    self.ensure_gpu_solid(device, queue, solid.color())?;
+                    (DrawSource::Solid(solid.color()), 1.0)
+                }
             };
             let bounds = scene.world_bounds(node_id)?;
             let Some(visible_bounds) = scene.visible_bounds(node_id)? else {
@@ -186,14 +217,13 @@ impl ImageRenderer {
             };
             let Some(quad) = image_vertices(
                 bounds,
-                image.opacity(),
+                opacity,
                 viewport.width,
                 viewport.height,
                 viewport.scale_factor,
             ) else {
                 continue;
             };
-            self.ensure_gpu_image(device, queue, image.texture(), texture)?;
             let first_vertex = u32::try_from(self.draws.len())
                 .ok()
                 .and_then(|count| count.checked_mul(VERTICES_PER_IMAGE))
@@ -202,7 +232,7 @@ impl ImageRenderer {
                 append_vertex(&mut vertices, vertex);
             }
             self.draws.push(Draw {
-                texture: image.texture(),
+                source,
                 first_vertex,
                 layer: node.layer(),
                 scissor,
@@ -223,7 +253,11 @@ impl ImageRenderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         for draw in self.draws.iter().filter(|draw| draw.layer == layer) {
-            let Some(image) = self.gpu_images.get(&draw.texture) else {
+            let image = match draw.source {
+                DrawSource::Texture(texture) => self.gpu_images.get(&texture),
+                DrawSource::Solid(color) => self.gpu_solids.get(&color),
+            };
+            let Some(image) = image else {
                 continue;
             };
             pass.set_bind_group(0, &image.bind_group, &[]);
@@ -250,15 +284,42 @@ impl ImageRenderer {
         if self.gpu_images.contains_key(&texture_id) {
             return Ok(());
         }
-        let bytes_per_row = texture
-            .width()
+        let image = self.create_gpu_image(
+            device,
+            queue,
+            texture.width(),
+            texture.height(),
+            texture.pixels(),
+        )?;
+        self.gpu_images.insert(texture_id, image);
+        Ok(())
+    }
+
+    fn ensure_gpu_solid(&mut self, device: &Device, queue: &Queue, color: [u8; 4]) -> Result<()> {
+        if self.gpu_solids.contains_key(&color) {
+            return Ok(());
+        }
+        let image = self.create_gpu_image(device, queue, 1, 1, &color)?;
+        self.gpu_solids.insert(color, image);
+        Ok(())
+    }
+
+    fn create_gpu_image(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<GpuImage> {
+        let bytes_per_row = width
             .checked_mul(4)
             .context("texture row size overflows wgpu's upload layout")?;
         let gpu_texture = device.create_texture(&TextureDescriptor {
             label: Some("moditty scene image"),
             size: Extent3d {
-                width: texture.width(),
-                height: texture.height(),
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -275,15 +336,15 @@ impl ImageRenderer {
                 origin: Origin3d::ZERO,
                 aspect: TextureAspect::All,
             },
-            texture.pixels(),
+            pixels,
             TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(texture.height()),
+                rows_per_image: Some(height),
             },
             Extent3d {
-                width: texture.width(),
-                height: texture.height(),
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
         );
@@ -302,14 +363,10 @@ impl ImageRenderer {
                 },
             ],
         });
-        self.gpu_images.insert(
-            texture_id,
-            GpuImage {
-                _texture: gpu_texture,
-                bind_group,
-            },
-        );
-        Ok(())
+        Ok(GpuImage {
+            _texture: gpu_texture,
+            bind_group,
+        })
     }
 
     fn ensure_vertex_capacity(&mut self, device: &Device, required: u64) {

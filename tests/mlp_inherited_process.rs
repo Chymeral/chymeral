@@ -55,7 +55,7 @@ fn run_inherited_client() -> Result<(), Box<dyn Error>> {
         &mut stream,
         &json!({
             "type": "hello",
-            "protocol": { "major": 1, "minor": 0 },
+            "protocol": { "major": 1, "minor": 1 },
             "token": token,
             "capabilities": ["scene", "input"]
         }),
@@ -79,8 +79,9 @@ fn run_inherited_client() -> Result<(), Box<dyn Error>> {
 
 fn write_json(stream: &mut LocalSocketStream, message: &Value) -> Result<(), Box<dyn Error>> {
     let payload = serde_json::to_vec(message)?;
-    let length = u32::try_from(payload.len())?;
+    let length = u32::try_from(payload.len() + 1)?;
     stream.write_all(&length.to_be_bytes())?;
+    stream.write_all(b"J")?;
     stream.write_all(&payload)?;
     stream.flush()?;
     Ok(())
@@ -93,7 +94,15 @@ fn read_json(stream: &mut LocalSocketStream) -> Result<Value, Box<dyn Error>> {
     if length > MAX_FRAME_BYTES {
         return Err(format!("MLP frame exceeds the {MAX_FRAME_BYTES}-byte limit").into());
     }
-    let mut payload = vec![0_u8; length];
+    if length == 0 {
+        return Err("MLP frame is missing its kind".into());
+    }
+    let mut kind = [0_u8; 1];
+    stream.read_exact(&mut kind)?;
+    if kind != *b"J" {
+        return Err("expected a JSON MLP frame".into());
+    }
+    let mut payload = vec![0_u8; length - 1];
     stream.read_exact(&mut payload)?;
     Ok(serde_json::from_slice(&payload)?)
 }
