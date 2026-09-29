@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use moditty::transport::SessionEnvironment;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use winit::event_loop::EventLoopProxy;
 
@@ -21,11 +22,18 @@ pub struct Pty {
 }
 
 impl Pty {
-    pub fn spawn(size: PtySize, event_proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
+    pub fn spawn(
+        size: PtySize,
+        event_proxy: EventLoopProxy<UserEvent>,
+        session_environment: &SessionEnvironment,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size).context("could not create a PTY")?;
         let mut command = default_shell_command();
         command.env("TERM", "xterm-256color");
+        for (name, value) in session_environment.variables() {
+            command.env(name, value);
+        }
 
         let mut child = pair
             .slave

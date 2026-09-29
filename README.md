@@ -672,8 +672,8 @@ Rust o dependencias gráficas del host.
 
 M10 implementa dentro del core el primer contrato de MLP: versión `1.0`,
 sesiones concurrentes, negociación de capacidades, handshake `Init`/`Start`,
-fallos y handles opacos aislados por sesión. Esta capa no abre conexiones ni
-ejecuta procesos; M11 añadirá el transporte que intercambiará estos mensajes.
+fallos y handles opacos aislados por sesión. M11 lo conecta a un transporte
+local real, pero todavía no acepta comandos de escena, recursos ni eventos.
 
 MLP tendrá dos direcciones lógicas en una sesión bidireccional:
 
@@ -692,12 +692,61 @@ El host valida cada comando antes de aplicarlo, asocia los recursos a la
 conexión que los creó y los libera al cerrar, fallar o desconectar el programa.
 Un programa no obtiene referencias ni acceso directo a la memoria del host.
 
-La primera implementación utilizará un transporte local privado: socket de
-dominio Unix en Linux y named pipe en Windows. El endpoint y un secreto de
-sesión se heredarán sólo por los procesos iniciados desde la terminal Moditty.
-MLP seguirá separado de ese transporte para permitir adaptadores futuros sin
+M11 usa un transporte local privado: socket de dominio Unix en Linux y named
+pipe en Windows. Cada ventana crea un endpoint efímero y un token aleatorio de
+256 bits; el shell y todo proceso que éste inicie reciben ambos mediante
+`MODITTY_MLP_ENDPOINT` y `MODITTY_MLP_TOKEN`. No se escriben en configuración,
+no persisten tras cerrar la ventana y no existe un servicio global al que un
+proceso externo pueda conectarse. El token evita conexiones accidentales, pero
+M11 no pretende ser un sandbox ni sustituye la seguridad del usuario del
+sistema.
+
+MLP sigue separado de ese transporte para permitir adaptadores futuros sin
 alterar la API, pero `stdio`, red, memoria compartida, WASM y carga de código
 nativo quedan fuera de este alcance inicial.
+
+### Transporte MLP v1 (M11)
+
+El flujo de bytes de M11 está compuesto por frames con una longitud `u32`
+big-endian seguida de un objeto JSON UTF-8. Cada frame, incluyendo el JSON,
+tiene un límite de 1 MiB. Los identificadores se serializan como strings para
+no perder precisión en lenguajes cuyo tipo numérico no representa todos los
+enteros de 64 bits.
+
+La primera frame debe ser `hello` y debe llegar dentro de cinco segundos. Lleva
+la versión `{ "major": 1, "minor": 0 }`, el token heredado y la lista de
+capacidades solicitadas (`scene`, `resources`, `input`, `timing`). Tras validar
+el token y negociar capacidades, la sesión sigue exactamente este orden:
+
+```text
+programa → hello
+Moditty  → init
+programa → init_complete
+Moditty  → start
+programa → started
+          running
+```
+
+`init` contiene el id de sesión, la versión concedida, capacidades concedidas y
+un contexto inicial. M11 entrega por ahora un contexto vacío: el lanzador y los
+argumentos de programa entrarán en el alcance de paquetes posterior. Durante o
+después del handshake, el programa puede enviar `fault` con su fase y mensaje,
+o `close`; el host responde `closed` y elimina sólo esa sesión. Una desconexión,
+mensaje malformado, orden inválido o timeout también elimina esa sesión sin
+afectar a las demás.
+
+Como límite de recursos, una ventana admite hasta 16 conexiones que aún no han
+completado `started`; las excedentes se cierran inmediatamente sin crear una
+sesión o se rechazan por capacidad antes de establecer el stream. Las sesiones
+que ya están ejecutándose no comparten ese límite. Al
+cerrar Moditty, el host deja de aceptar conexiones, entrega `closed` con razón
+`host_shutdown` a cada cliente que siga conectado y espera la limpieza de sus
+handlers antes de liberar el endpoint.
+
+M11 no inicia programas, no interpreta sus argumentos, no expone el token como
+API de alto nivel y no entrega aún `Event`, `Tick`, `Frame`, comandos de escena
+ni recursos. Un SDK de M14 encapsulará estos detalles; hasta entonces son un
+contrato de transporte probado, no una interfaz de usuario final.
 
 ## SDKs de cliente e independencia de lenguaje
 
@@ -935,7 +984,7 @@ sobre ellos hasta expirar.
 
 ## Orden aproximado de desarrollo
 
-M1–M10 están completados. `testing_tools.scene` y el `Program` de M2 son
+M1–M11 están completados. `testing_tools.scene` y el `Program` de M2 son
 infraestructura interna de prueba; no son un mecanismo de ejecución de
 aplicaciones ni una API pública.
 
@@ -950,7 +999,7 @@ M7  mouse/focus
 M8  drag and drop + herramientas de prueba
 M9  clipping/layers + jerarquía de pruebas
 M10 contrato de programa y tipos internos de MLP ✓
-M11 sesión local MLP: transporte, handshake, Init/Start y limpieza
+M11 sesión local MLP: transporte, handshake, Init/Start y limpieza ✓
 M12 comandos de escena y recursos con ownership por programa
 M13 entrega de Event/Tick/Frame y ciclo de cierre de programa
 M14 SDK de referencia, pruebas de conformidad y primer programa de prueba
@@ -962,7 +1011,7 @@ El lenguaje del primer SDK o programa de prueba no condicionará MLP. Python,
 Lua, JavaScript, C#, Go, Rust, C, C++ y Zig son candidatos equivalentes;
 también será válida una implementación independiente del protocolo.
 
-### Estado de M10
+### Estado de M10 y M11
 
 M10 define y prueba dentro del core el contrato que un programa externo usará:
 versión de MLP, identidad y capacidades de sesión, mensajes de handshake,
@@ -972,9 +1021,15 @@ programa. Después de entregar `Closed`, el host puede descartar el registro
 terminado sin afectar las sesiones activas. El contrato mantiene la semántica
 canónica de M2 sin filtrar tipos del backend.
 
-M10 no abre sockets ni named pipes, no inicia procesos, no expone comandos de
-escena a aplicaciones y no crea SDKs. Esas responsabilidades comienzan,
-respectivamente, en M11, M12–M13 y M14.
+M11 abre el endpoint privado antes del shell e inyecta sus dos variables de
+entorno en éste; por herencia, también llegan a los programas que ejecute. Sus
+tests recorren el framing, token inválido, negociación, el handshake completo,
+el cierre, `HostShutdown`, el límite de handshakes y la limpieza al desconectar.
+Una prueba de integración inicia además un proceso hijo independiente que sólo
+recibe las variables heredadas e implementa el framing MLP crudo. M11 no inicia
+programas por sí mismo, no expone comandos de escena a aplicaciones y no crea
+SDKs. Esas responsabilidades corresponden, respectivamente, a los paquetes,
+M12–M13 y M14.
 
 ## Principios que deben preservarse
 

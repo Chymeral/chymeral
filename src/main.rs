@@ -26,8 +26,10 @@ use moditty::runtime::{
     Runtime, RuntimeCommand, RuntimeResult, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
 };
 use moditty::{
+    protocol::CapabilitySet,
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
     scene::{ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer, Transform},
+    transport::MlpServer,
 };
 use portable_pty::PtySize;
 use wgpu::{
@@ -128,6 +130,7 @@ struct WindowState {
     background: BackgroundRenderer,
     terminal: Terminal,
     pty: Pty,
+    _mlp_server: MlpServer,
     runtime: Runtime<TerminalProgram>,
     diagnostics: Diagnostics,
     scene: Scene,
@@ -169,7 +172,12 @@ impl WindowState {
                 blue: appearance.foreground.color.blue,
             },
         );
-        let pty = Pty::spawn(pty_size(columns, rows, physical_size), event_proxy)?;
+        let mlp_server = MlpServer::start(CapabilitySet::ALL)?;
+        let pty = Pty::spawn(
+            pty_size(columns, rows, physical_size),
+            event_proxy,
+            mlp_server.environment(),
+        )?;
         let runtime = Runtime::new(TerminalProgram::default(), RUNTIME_TICK_INTERVAL)?;
         let diagnostics =
             Diagnostics::new(diagnostics_shortcuts, Instant::now(), runtime.metrics());
@@ -281,6 +289,7 @@ impl WindowState {
             background,
             terminal,
             pty,
+            _mlp_server: mlp_server,
             runtime,
             diagnostics,
             scene,

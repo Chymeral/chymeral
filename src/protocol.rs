@@ -192,6 +192,7 @@ pub enum SessionCloseReason {
     ProgramFault(ProgramFault),
     HostShutdown,
     ProtocolViolation,
+    TransportDisconnected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
