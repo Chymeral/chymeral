@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use moditty::scene::SceneLayer;
+use chymeral::scene::SceneLayer;
 use serde::Deserialize;
 
 use crate::diagnostics::{DiagnosticsShortcuts, Shortcut};
@@ -191,7 +191,7 @@ pub fn load() -> Result<LoadedConfig> {
 }
 
 fn config_path() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("MODITTY_CONFIG") {
+    if let Some(path) = env::var_os("CHYMERAL_CONFIG") {
         return Some(PathBuf::from(path));
     }
 
@@ -203,7 +203,7 @@ fn platform_config_path() -> Option<PathBuf> {
     env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| home_directory().map(|home| home.join("AppData").join("Roaming")))
-        .map(|directory| directory.join("moditty").join("moditty.toml"))
+        .map(|directory| directory.join("chymeral").join("chymeral.toml"))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -211,7 +211,7 @@ fn platform_config_path() -> Option<PathBuf> {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| home_directory().map(|home| home.join(".config")))
-        .map(|directory| directory.join("moditty").join("moditty.toml"))
+        .map(|directory| directory.join("chymeral").join("chymeral.toml"))
 }
 
 fn home_directory() -> Option<PathBuf> {
@@ -817,14 +817,14 @@ mod tests {
                 opacity = 0.65
                 fit = "contain"
             "#,
-            Path::new("/tmp/moditty-config"),
+            Path::new("/tmp/chymeral-config"),
         )
         .unwrap();
 
         assert_eq!(
             appearance.font.source,
             FontSource::File {
-                path: "/tmp/moditty-config/fonts/display.otf".into(),
+                path: "/tmp/chymeral-config/fonts/display.otf".into(),
                 face_index: 2,
             }
         );
@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(
             appearance.background,
             Background::Image {
-                path: "/tmp/moditty-config/images/night.gif".into(),
+                path: "/tmp/chymeral-config/images/night.gif".into(),
                 opacity: 0.65,
                 fit: ImageFit::Contain,
             }
@@ -847,7 +847,7 @@ mod tests {
                 color = "#0A1B2C"
                 opacity = 0.4
             "##,
-            Path::new("/tmp/moditty-config"),
+            Path::new("/tmp/chymeral-config"),
         )
         .unwrap();
 
@@ -877,7 +877,7 @@ mod tests {
                 color = "#0A1B2C"
                 opacity = 0.4
             "##,
-            Path::new("/tmp/moditty-config"),
+            Path::new("/tmp/chymeral-config"),
         )
         .unwrap();
 
@@ -898,7 +898,7 @@ mod tests {
                 [terminal.font]
                 cell_width = "adaptive"
             "#,
-                Path::new("/tmp/moditty-config"),
+                Path::new("/tmp/chymeral-config"),
             )
             .is_err()
         );
@@ -912,7 +912,7 @@ mod tests {
                 [terminal.foreground]
                 colour = "#DDEEFF"
             "##,
-                Path::new("/tmp/moditty-config"),
+                Path::new("/tmp/chymeral-config"),
             )
             .is_err()
         );
@@ -927,7 +927,7 @@ mod tests {
                 diagnostics_ticks = "Ctrl+T"
                 diagnostics_frames = "Super+F"
             "#,
-            Path::new("/tmp/moditty-config"),
+            Path::new("/tmp/chymeral-config"),
         )
         .unwrap();
 
@@ -947,7 +947,7 @@ mod tests {
                 [input.shortcuts]
                 diagnostics_events = "E"
             "#,
-                Path::new("/tmp/moditty-config"),
+                Path::new("/tmp/chymeral-config"),
             )
             .is_err()
         );
@@ -962,7 +962,7 @@ mod tests {
                 diagnostics_events = "Ctrl+Shift+E"
                 diagnostics_ticks = "Ctrl+Shift+E"
             "#,
-                Path::new("/tmp/moditty-config"),
+                Path::new("/tmp/chymeral-config"),
             )
             .is_err()
         );
@@ -978,14 +978,14 @@ mod tests {
                 duration_ms = 1250
                 opacity = 0.65
             "#,
-            Path::new("/tmp/moditty-config"),
+            Path::new("/tmp/chymeral-config"),
         )
         .unwrap();
 
         assert_eq!(
             config.startup_splash,
             Some(StartupSplash {
-                path: "/tmp/moditty-config/images/splash.png".into(),
+                path: "/tmp/chymeral-config/images/splash.png".into(),
                 duration: Duration::from_millis(1250),
                 opacity: 0.65,
             })
@@ -1012,7 +1012,7 @@ mod tests {
                 opacity = 1.1
             "#,
         ] {
-            assert!(parse_config(contents, Path::new("/tmp/moditty-config")).is_err());
+            assert!(parse_config(contents, Path::new("/tmp/chymeral-config")).is_err());
         }
     }
 
@@ -1041,7 +1041,7 @@ mod tests {
                 height = 80.0
                 color = "#0066FF"
             "##,
-            Path::new("/tmp/moditty-config"),
+            Path::new("/tmp/chymeral-config"),
         )
         .unwrap();
 
@@ -1106,7 +1106,7 @@ mod tests {
                 height = 40.0
                 color = "#445566"
             "##,
-            Path::new("/tmp/moditty-config"),
+            Path::new("/tmp/chymeral-config"),
         )
         .unwrap();
         let scene = config.testing_scene.unwrap();
@@ -1214,7 +1214,7 @@ mod tests {
                 color = "#FFFFFF"
             "##,
         ] {
-            assert!(parse_config(contents, Path::new("/tmp/moditty-config")).is_err());
+            assert!(parse_config(contents, Path::new("/tmp/chymeral-config")).is_err());
         }
     }
 }

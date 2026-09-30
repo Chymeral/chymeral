@@ -24,7 +24,7 @@ use wgpu::{
 };
 
 use crate::config::{Background, ImageFit, Rgb};
-use moditty::resources::Texture as ResourceTexture;
+use chymeral::resources::Texture as ResourceTexture;
 
 const MAX_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
@@ -197,7 +197,7 @@ impl ImageBackground {
             .min(MAX_IMAGE_DIMENSION);
         let decoded = DecodedImage::load(path, opacity, max_dimension)?;
         let texture = device.create_texture(&TextureDescriptor {
-            label: Some("moditty background image"),
+            label: Some("chymeral background image"),
             size: decoded.size,
             mip_level_count: 1,
             sample_count: 1,
@@ -208,7 +208,7 @@ impl ImageBackground {
         });
         let texture_view = texture.create_view(&TextureViewDescriptor::default());
         let sampler = device.create_sampler(&SamplerDescriptor {
-            label: Some("moditty background sampler"),
+            label: Some("chymeral background sampler"),
             address_mode_u: AddressMode::ClampToEdge,
             address_mode_v: AddressMode::ClampToEdge,
             address_mode_w: AddressMode::ClampToEdge,
@@ -218,14 +218,14 @@ impl ImageBackground {
             ..Default::default()
         });
         let transform_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("moditty background transform"),
+            label: Some("chymeral background transform"),
             size: 16,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bind_group_layout = background_bind_group_layout(device);
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("moditty background bind group"),
+            label: Some("chymeral background bind group"),
             layout: &bind_group_layout,
             entries: &[
                 BindGroupEntry {
@@ -441,7 +441,7 @@ fn image_limits(max_dimension: u32) -> Limits {
 
 fn background_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("moditty background bind group layout"),
+        label: Some("chymeral background bind group layout"),
         entries: &[
             BindGroupLayoutEntry {
                 binding: 0,
@@ -479,16 +479,16 @@ fn background_pipeline(
     bind_group_layout: &BindGroupLayout,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("moditty background shader"),
+        label: Some("chymeral background shader"),
         source: ShaderSource::Wgsl(Cow::Borrowed(IMAGE_SHADER)),
     });
     let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("moditty background pipeline layout"),
+        label: Some("chymeral background pipeline layout"),
         bind_group_layouts: &[Some(bind_group_layout)],
         immediate_size: 0,
     });
     device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("moditty background pipeline"),
+        label: Some("chymeral background pipeline"),
         layout: Some(&layout),
         vertex: VertexState {
             module: &shader,
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn decodes_all_gif_frames_for_animation() {
         let path =
-            std::env::temp_dir().join(format!("moditty-{}-animation.gif", std::process::id()));
+            std::env::temp_dir().join(format!("chymeral-{}-animation.gif", std::process::id()));
         let first = Frame::from_parts(
             RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255])),
             0,
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn loads_a_static_splash_without_premultiplying_its_alpha() {
-        let path = std::env::temp_dir().join(format!("moditty-{}-splash.png", std::process::id()));
+        let path = std::env::temp_dir().join(format!("chymeral-{}-splash.png", std::process::id()));
         RgbaImage::from_pixel(2, 1, Rgba([200, 100, 50, 128]))
             .save(&path)
             .unwrap();

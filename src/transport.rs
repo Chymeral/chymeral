@@ -32,8 +32,8 @@ use crate::{
     scene::SceneLayer,
 };
 
-pub const MLP_ENDPOINT_ENV: &str = "MODITTY_MLP_ENDPOINT";
-pub const MLP_TOKEN_ENV: &str = "MODITTY_MLP_TOKEN";
+pub const CLP_ENDPOINT_ENV: &str = "CHYMERAL_CLP_ENDPOINT";
+pub const CLP_TOKEN_ENV: &str = "CHYMERAL_CLP_TOKEN";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_PENDING_HANDSHAKES: usize = 16;
 pub const MAX_PENDING_HOST_ACTIONS: usize = 64;
@@ -59,13 +59,13 @@ impl SessionEnvironment {
 
     pub fn variables(&self) -> [(&'static str, &str); 2] {
         [
-            (MLP_ENDPOINT_ENV, self.endpoint()),
-            (MLP_TOKEN_ENV, self.authentication_token()),
+            (CLP_ENDPOINT_ENV, self.endpoint()),
+            (CLP_TOKEN_ENV, self.authentication_token()),
         ]
     }
 }
 
-pub struct MlpServer {
+pub struct ClpServer {
     environment: SessionEnvironment,
     listener_thread: Option<thread::JoinHandle<()>>,
     manager: Arc<Mutex<SessionManager>>,
@@ -121,7 +121,7 @@ struct HostActionBroker {
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
-impl MlpServer {
+impl ClpServer {
     pub fn start(available_capabilities: CapabilitySet) -> Result<Self> {
         Self::start_with_wake(available_capabilities, || {})
     }
@@ -145,7 +145,7 @@ impl MlpServer {
         let listener_environment = environment.clone();
         let listener_broker = broker.clone();
         let listener_thread = thread::Builder::new()
-            .name("moditty-mlp-listener".to_owned())
+            .name("chymeral-clp-listener".to_owned())
             .spawn(move || {
                 serve_connections(
                     listener,
@@ -155,7 +155,7 @@ impl MlpServer {
                     listener_broker,
                 );
             })
-            .context("could not start the MLP listener")?;
+            .context("could not start the CLP listener")?;
 
         Ok(Self {
             environment,
@@ -175,7 +175,7 @@ impl MlpServer {
         self.manager
             .lock()
             .map(|manager| manager.session_count())
-            .map_err(|_| anyhow!("the MLP session manager is unavailable"))
+            .map_err(|_| anyhow!("the CLP session manager is unavailable"))
     }
 
     pub fn shutdown(&mut self) {
@@ -228,7 +228,7 @@ impl HostActionBroker {
     }
 }
 
-impl Drop for MlpServer {
+impl Drop for ClpServer {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -330,7 +330,7 @@ fn bind_listener() -> Result<(SessionEnvironment, LocalSocketListener)> {
         let name = environment
             .endpoint()
             .to_ns_name::<GenericNamespaced>()
-            .context("could not construct the MLP endpoint name")?;
+            .context("could not construct the CLP endpoint name")?;
         match ListenerOptions::new()
             .name(name)
             .nonblocking(ListenerNonblockingMode::Accept)
@@ -338,16 +338,16 @@ fn bind_listener() -> Result<(SessionEnvironment, LocalSocketListener)> {
         {
             Ok(listener) => return Ok((environment, listener)),
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
-            Err(error) => return Err(error).context("could not bind the local MLP endpoint"),
+            Err(error) => return Err(error).context("could not bind the local CLP endpoint"),
         }
     }
     Err(anyhow!(
-        "could not allocate a unique local MLP endpoint after {ENDPOINT_BIND_ATTEMPTS} attempts"
+        "could not allocate a unique local CLP endpoint after {ENDPOINT_BIND_ATTEMPTS} attempts"
     ))
 }
 
 fn endpoint_name() -> Result<String> {
-    Ok(format!("moditty-mlp-{}", random_hex(16)?))
+    Ok(format!("chymeral-clp-{}", random_hex(16)?))
 }
 
 fn random_token() -> Result<String> {
@@ -359,7 +359,7 @@ fn random_hex(byte_count: usize) -> Result<String> {
 
     let mut bytes = vec![0_u8; byte_count];
     fill_random(&mut bytes).map_err(|error| {
-        anyhow!("could not generate local MLP authentication material: {error}")
+        anyhow!("could not generate local CLP authentication material: {error}")
     })?;
     let mut result = String::with_capacity(byte_count * 2);
     for byte in bytes {
@@ -388,7 +388,7 @@ fn serve_connections(
                 let connection_control = Arc::clone(&control);
                 let connection_broker = broker.clone();
                 if let Err(error) = thread::Builder::new()
-                    .name("moditty-mlp-client".to_owned())
+                    .name("chymeral-clp-client".to_owned())
                     .spawn(move || {
                         handle_connection(
                             stream,
@@ -400,7 +400,7 @@ fn serve_connections(
                         );
                     })
                 {
-                    eprintln!("Moditty: could not serve an MLP client: {error}");
+                    eprintln!("Chymeral: could not serve a CLP client: {error}");
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -409,7 +409,7 @@ fn serve_connections(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 if !control.is_shutting_down() {
-                    eprintln!("Moditty: local MLP listener error: {error}");
+                    eprintln!("Chymeral: local CLP listener error: {error}");
                     thread::sleep(LISTENER_POLL_INTERVAL);
                 }
             }
@@ -426,7 +426,7 @@ fn handle_connection(
     mut connection_guard: ConnectionGuard,
 ) {
     if let Err(error) = stream.set_nonblocking(true) {
-        eprintln!("Moditty: could not configure nonblocking MLP handshake I/O: {error}");
+        eprintln!("Chymeral: could not configure nonblocking CLP handshake I/O: {error}");
         return;
     }
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
@@ -451,7 +451,7 @@ fn handle_connection(
             let _ = write_error(
                 &mut stream,
                 "expected_hello",
-                "the first MLP message must be hello",
+                "the first CLP message must be hello",
             );
             return;
         }
@@ -467,7 +467,7 @@ fn handle_connection(
         let _ = write_error(
             &mut stream,
             "authentication_failed",
-            "the MLP authentication token is invalid",
+            "the CLP authentication token is invalid",
         );
         return;
     }
@@ -482,7 +482,7 @@ fn handle_connection(
             let _ = write_error(
                 &mut stream,
                 "host_failure",
-                "the MLP session manager is unavailable",
+                "the CLP session manager is unavailable",
             );
             return;
         }
@@ -496,7 +496,7 @@ fn handle_connection(
     };
     let granted_capabilities = match &init_message {
         HostMessage::Init(init) => init.granted_capabilities,
-        _ => unreachable!("a newly accepted MLP session always receives init"),
+        _ => unreachable!("a newly accepted CLP session always receives init"),
     };
     let _cleanup = SessionCleanup {
         session_id,
@@ -505,7 +505,7 @@ fn handle_connection(
 
     if let Err(error) = write_host_message(&mut stream, init_message) {
         close_disconnected_session(&manager, session_id);
-        eprintln!("Moditty: could not send MLP init message: {error}");
+        eprintln!("Chymeral: could not send CLP init message: {error}");
         return;
     }
 
@@ -645,7 +645,7 @@ fn handle_connection(
                     &mut stream,
                     &manager,
                     session_id,
-                    "the MLP session manager is unavailable",
+                    "the CLP session manager is unavailable",
                 );
                 return;
             }
@@ -667,7 +667,7 @@ fn handle_connection(
             }
             if let Err(error) = write_result {
                 close_disconnected_session(&manager, session_id);
-                eprintln!("Moditty: could not send an MLP lifecycle message: {error}");
+                eprintln!("Chymeral: could not send a CLP lifecycle message: {error}");
                 return;
             }
         }
@@ -762,10 +762,10 @@ fn capabilities_from_wire(capabilities: &[WireCapability]) -> CapabilitySet {
 
 fn client_message_from_frame(frame: WireFrame) -> Result<ClientMessage> {
     let WireFrame::Json(payload) = frame else {
-        return Err(anyhow!("expected a JSON MLP message"));
+        return Err(anyhow!("expected a JSON CLP message"));
     };
     let message =
-        serde_json::from_slice(&payload).context("could not parse the MLP JSON message")?;
+        serde_json::from_slice(&payload).context("could not parse the CLP JSON message")?;
     match message {
         WireClientMessage::Hello { .. } => {
             Err(anyhow!("hello may only be sent at connection start"))
@@ -848,13 +848,13 @@ fn dispatch_host_command(
     })?;
     loop {
         if control.is_shutting_down() {
-            return Err(anyhow!("the MLP host is shutting down"));
+            return Err(anyhow!("the CLP host is shutting down"));
         }
         match response_receiver.recv_timeout(LISTENER_POLL_INTERVAL) {
             Ok(response) => return Ok(response),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(anyhow!("the MLP host command response channel closed"));
+                return Err(anyhow!("the CLP host command response channel closed"));
             }
         }
     }
@@ -1010,10 +1010,10 @@ impl FrameReader {
             }
             if let Some(message) = self.take_complete_frame()? {
                 let WireFrame::Json(message) = message else {
-                    return Err(anyhow!("expected a JSON MLP frame"));
+                    return Err(anyhow!("expected a JSON CLP frame"));
                 };
                 return serde_json::from_slice(&message)
-                    .context("could not parse the MLP JSON message")
+                    .context("could not parse the CLP JSON message")
                     .map(FrameRead::Message);
             }
 
@@ -1021,7 +1021,7 @@ impl FrameReader {
             match stream.read(&mut received) {
                 Ok(0) => {
                     if empty_read_is_disconnected(stream)
-                        .context("could not inspect the MLP connection state")?
+                        .context("could not inspect the CLP connection state")?
                     {
                         return Ok(FrameRead::Disconnected);
                     }
@@ -1033,7 +1033,7 @@ impl FrameReader {
                 Err(error) if read_would_block(&error) => {
                     wait_for_data(deadline)?;
                 }
-                Err(error) => return Err(error).context("could not read the MLP frame"),
+                Err(error) => return Err(error).context("could not read the CLP frame"),
             }
         }
     }
@@ -1055,7 +1055,7 @@ impl FrameReader {
             match stream.read(&mut received) {
                 Ok(0) => {
                     if empty_read_is_disconnected(stream)
-                        .context("could not inspect the MLP connection state")?
+                        .context("could not inspect the CLP connection state")?
                     {
                         return Ok(FrameRead::Disconnected);
                     }
@@ -1065,7 +1065,7 @@ impl FrameReader {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if read_disconnected(&error) => return Ok(FrameRead::Disconnected),
                 Err(error) if read_would_block(&error) => wait_for_data(deadline)?,
-                Err(error) => return Err(error).context("could not read the MLP frame"),
+                Err(error) => return Err(error).context("could not read the CLP frame"),
             }
         }
     }
@@ -1077,22 +1077,22 @@ impl FrameReader {
         let length = usize::try_from(u32::from_be_bytes(
             self.bytes[..4]
                 .try_into()
-                .expect("the MLP frame length is present"),
+                .expect("the CLP frame length is present"),
         ))
-        .context("the MLP frame length does not fit this platform")?;
+        .context("the CLP frame length does not fit this platform")?;
         if length > MAX_FRAME_BYTES {
             return Err(anyhow!(
-                "the MLP frame is {length} bytes; the limit is {MAX_FRAME_BYTES}"
+                "the CLP frame is {length} bytes; the limit is {MAX_FRAME_BYTES}"
             ));
         }
         let frame_end = 4_usize
             .checked_add(length)
-            .context("the MLP frame length overflows this platform")?;
+            .context("the CLP frame length overflows this platform")?;
         if self.bytes.len() < frame_end {
             return Ok(None);
         }
         if length == 0 {
-            return Err(anyhow!("MLP frames must include a frame kind"));
+            return Err(anyhow!("CLP frames must include a frame kind"));
         }
         let kind = self.bytes[4];
         let payload = self.bytes[5..frame_end].to_vec();
@@ -1100,7 +1100,7 @@ impl FrameReader {
         match kind {
             b'J' => Ok(Some(WireFrame::Json(payload))),
             b'B' => Ok(Some(WireFrame::Binary(payload))),
-            _ => Err(anyhow!("MLP frame has an unknown kind")),
+            _ => Err(anyhow!("CLP frame has an unknown kind")),
         }
     }
 }
@@ -1111,7 +1111,7 @@ fn wait_for_data(deadline: Option<Instant>) -> Result<()> {
         return Ok(());
     };
     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return Err(anyhow!("the MLP handshake timed out"));
+        return Err(anyhow!("the CLP handshake timed out"));
     };
     thread::sleep(remaining.min(LISTENER_POLL_INTERVAL));
     Ok(())
@@ -1180,7 +1180,7 @@ fn read_would_block(error: &io::Error) -> bool {
 }
 
 fn write_frame<T: Serialize>(stream: &mut LocalSocketStream, message: &T) -> Result<()> {
-    let payload = serde_json::to_vec(message).context("could not encode the MLP JSON message")?;
+    let payload = serde_json::to_vec(message).context("could not encode the CLP JSON message")?;
     write_raw_frame(stream, b'J', &payload)
 }
 
@@ -1193,23 +1193,23 @@ fn write_raw_frame(stream: &mut LocalSocketStream, kind: u8, payload: &[u8]) -> 
     let frame_length = payload
         .len()
         .checked_add(1)
-        .context("the MLP frame is too large")?;
+        .context("the CLP frame is too large")?;
     if frame_length > MAX_FRAME_BYTES {
         return Err(anyhow!(
-            "the MLP frame is {frame_length} bytes; the limit is {MAX_FRAME_BYTES}"
+            "the CLP frame is {frame_length} bytes; the limit is {MAX_FRAME_BYTES}"
         ));
     }
-    let length = u32::try_from(frame_length).context("the MLP frame is too large")?;
+    let length = u32::try_from(frame_length).context("the CLP frame is too large")?;
     stream
         .write_all(&length.to_be_bytes())
-        .context("could not write the MLP frame length")?;
+        .context("could not write the CLP frame length")?;
     stream
         .write_all(&[kind])
-        .context("could not write the MLP frame kind")?;
+        .context("could not write the CLP frame kind")?;
     stream
         .write_all(payload)
-        .context("could not write the MLP frame payload")?;
-    stream.flush().context("could not flush the MLP frame")
+        .context("could not write the CLP frame payload")?;
+    stream.flush().context("could not flush the CLP frame")
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1691,11 +1691,11 @@ mod tests {
 
     use super::*;
 
-    fn connect(server: &MlpServer) -> LocalSocketStream {
+    fn connect(server: &ClpServer) -> LocalSocketStream {
         try_connect(server).unwrap()
     }
 
-    fn try_connect(server: &MlpServer) -> io::Result<LocalSocketStream> {
+    fn try_connect(server: &ClpServer) -> io::Result<LocalSocketStream> {
         let name = server
             .environment()
             .endpoint()
@@ -1704,11 +1704,11 @@ mod tests {
         LocalSocketStream::connect(name)
     }
 
-    fn hello(server: &MlpServer, capabilities: Vec<&str>) -> WireClientMessage {
+    fn hello(server: &ClpServer, capabilities: Vec<&str>) -> WireClientMessage {
         WireClientMessage::Hello {
             protocol: WireProtocolVersion {
-                major: crate::protocol::MLP_PROTOCOL_VERSION.major(),
-                minor: crate::protocol::MLP_PROTOCOL_VERSION.minor(),
+                major: crate::protocol::CLP_PROTOCOL_VERSION.major(),
+                minor: crate::protocol::CLP_PROTOCOL_VERSION.minor(),
             },
             token: server.environment().authentication_token().to_owned(),
             capabilities: capabilities
@@ -1734,12 +1734,12 @@ mod tests {
             .unwrap()
         {
             FrameRead::Message(message) => message,
-            FrameRead::Disconnected => panic!("the MLP server disconnected before replying"),
-            FrameRead::Shutdown => panic!("a standalone MLP client cannot receive host shutdown"),
+            FrameRead::Disconnected => panic!("the CLP server disconnected before replying"),
+            FrameRead::Shutdown => panic!("a standalone CLP client cannot receive host shutdown"),
         }
     }
 
-    fn wait_for_session_count(server: &MlpServer, expected: usize) {
+    fn wait_for_session_count(server: &ClpServer, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
             if server.session_count().unwrap() == expected {
@@ -1750,7 +1750,7 @@ mod tests {
         assert_eq!(server.session_count().unwrap(), expected);
     }
 
-    fn wait_for_host_action(server: &MlpServer) -> HostAction {
+    fn wait_for_host_action(server: &ClpServer) -> HostAction {
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
             if let Some(action) = server.drain_host_actions().into_iter().next() {
@@ -1758,12 +1758,12 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("the MLP host action did not arrive")
+        panic!("the CLP host action did not arrive")
     }
 
     #[test]
     fn authenticated_client_completes_the_framed_handshake() {
-        let server = MlpServer::start(CapabilitySet::from_capabilities(&[
+        let server = ClpServer::start(CapabilitySet::from_capabilities(&[
             Capability::Scene,
             Capability::Input,
         ]))
@@ -1796,7 +1796,7 @@ mod tests {
 
     #[test]
     fn forwards_ordered_binary_texture_uploads_to_the_host_thread() {
-        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
         send_client(&mut client, hello(&server, vec!["scene", "resources"]));
         let _ = receive_host(&mut client);
@@ -1846,7 +1846,7 @@ mod tests {
 
     #[test]
     fn rejects_commands_outside_the_negotiated_capabilities() {
-        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
         send_client(&mut client, hello(&server, vec!["scene"]));
         let _ = receive_host(&mut client);
@@ -1875,7 +1875,7 @@ mod tests {
 
     #[test]
     fn rejects_an_invalid_token_without_creating_a_session() {
-        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
         let message = WireClientMessage::Hello {
             protocol: WireProtocolVersion { major: 1, minor: 0 },
@@ -1892,7 +1892,7 @@ mod tests {
 
     #[test]
     fn disconnecting_a_running_client_reclaims_its_session() {
-        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
         send_client(&mut client, hello(&server, vec!["scene"]));
         let _ = receive_host(&mut client);
@@ -1907,7 +1907,7 @@ mod tests {
 
     #[test]
     fn keeps_an_idle_running_client_connected() {
-        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
         send_client(&mut client, hello(&server, vec!["scene"]));
         let _ = receive_host(&mut client);
@@ -1926,7 +1926,7 @@ mod tests {
 
     #[test]
     fn shutdown_closes_running_clients_and_reclaims_their_sessions() {
-        let mut server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let mut server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
         send_client(&mut client, hello(&server, vec!["scene"]));
         let _ = receive_host(&mut client);
@@ -1945,7 +1945,7 @@ mod tests {
 
     #[test]
     fn limits_connections_that_have_not_completed_the_handshake() {
-        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut pending_clients = Vec::with_capacity(MAX_PENDING_HANDSHAKES);
         for _ in 0..MAX_PENDING_HANDSHAKES {
             let mut client = connect(&server);
@@ -2010,7 +2010,7 @@ mod tests {
 
     #[test]
     fn rejects_frames_larger_than_the_protocol_limit() {
-        let server = MlpServer::start(CapabilitySet::ALL).unwrap();
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
         let length = u32::try_from(MAX_FRAME_BYTES + 1).unwrap();
         client.write_all(&length.to_be_bytes()).unwrap();

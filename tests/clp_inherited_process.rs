@@ -5,29 +5,29 @@ use std::{
     process::Command,
 };
 
+use chymeral::{
+    protocol::CapabilitySet,
+    transport::{CLP_ENDPOINT_ENV, CLP_TOKEN_ENV, ClpServer, MAX_FRAME_BYTES},
+};
 use interprocess::local_socket::{
     GenericNamespaced, ToNsName, prelude::LocalSocketStream, traits::Stream as _,
 };
-use moditty::{
-    protocol::CapabilitySet,
-    transport::{MAX_FRAME_BYTES, MLP_ENDPOINT_ENV, MLP_TOKEN_ENV, MlpServer},
-};
 use serde_json::{Value, json};
 
-const CHILD_ENV: &str = "MODITTY_MLP_INHERITED_PROCESS_TEST_CHILD";
+const CHILD_ENV: &str = "CHYMERAL_CLP_INHERITED_PROCESS_TEST_CHILD";
 
 #[test]
-fn inherited_process_completes_the_raw_mlp_handshake() -> Result<(), Box<dyn Error>> {
+fn inherited_process_completes_the_raw_clp_handshake() -> Result<(), Box<dyn Error>> {
     if env::var_os(CHILD_ENV).is_some() {
         return run_inherited_client();
     }
 
-    let server = MlpServer::start(CapabilitySet::ALL)?;
+    let server = ClpServer::start(CapabilitySet::ALL)?;
     let executable = env::current_exe()?;
     let mut command = Command::new(executable);
     command
         .arg("--exact")
-        .arg("inherited_process_completes_the_raw_mlp_handshake")
+        .arg("inherited_process_completes_the_raw_clp_handshake")
         .arg("--nocapture")
         .env(CHILD_ENV, "1");
     for (name, value) in server.environment().variables() {
@@ -37,7 +37,7 @@ fn inherited_process_completes_the_raw_mlp_handshake() -> Result<(), Box<dyn Err
     let output = command.output()?;
     assert!(
         output.status.success(),
-        "the inherited MLP client failed:\nstdout:\n{}\nstderr:\n{}",
+        "the inherited CLP client failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -46,8 +46,8 @@ fn inherited_process_completes_the_raw_mlp_handshake() -> Result<(), Box<dyn Err
 }
 
 fn run_inherited_client() -> Result<(), Box<dyn Error>> {
-    let endpoint = env::var(MLP_ENDPOINT_ENV)?;
-    let token = env::var(MLP_TOKEN_ENV)?;
+    let endpoint = env::var(CLP_ENDPOINT_ENV)?;
+    let token = env::var(CLP_TOKEN_ENV)?;
     let name = endpoint.to_ns_name::<GenericNamespaced>()?;
     let mut stream = LocalSocketStream::connect(name)?;
 
@@ -92,15 +92,15 @@ fn read_json(stream: &mut LocalSocketStream) -> Result<Value, Box<dyn Error>> {
     stream.read_exact(&mut length_bytes)?;
     let length = usize::try_from(u32::from_be_bytes(length_bytes))?;
     if length > MAX_FRAME_BYTES {
-        return Err(format!("MLP frame exceeds the {MAX_FRAME_BYTES}-byte limit").into());
+        return Err(format!("CLP frame exceeds the {MAX_FRAME_BYTES}-byte limit").into());
     }
     if length == 0 {
-        return Err("MLP frame is missing its kind".into());
+        return Err("CLP frame is missing its kind".into());
     }
     let mut kind = [0_u8; 1];
     stream.read_exact(&mut kind)?;
     if kind != *b"J" {
-        return Err("expected a JSON MLP frame".into());
+        return Err("expected a JSON CLP frame".into());
     }
     let mut payload = vec![0_u8; length - 1];
     stream.read_exact(&mut payload)?;

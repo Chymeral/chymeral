@@ -1,5 +1,5 @@
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-compile_error!("Moditty currently supports only Linux and Windows.");
+compile_error!("Chymeral currently supports only Linux and Windows.");
 
 mod background;
 mod config;
@@ -15,22 +15,22 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
-};
-use moditty::interaction::SceneInteraction;
-use moditty::runtime::{
+use chymeral::interaction::SceneInteraction;
+use chymeral::runtime::{
     EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent, KeyState,
     Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton, PointerEvent, Program,
     Runtime, RuntimeCommand, RuntimeResult, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
 };
-use moditty::{
+use chymeral::{
     program_scene::{ProgramSceneError, ProgramSceneResources},
     protocol::CapabilitySet,
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
     scene::{ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer, Transform},
-    transport::{HostAction, HostCommandResponse, MlpServer},
+    transport::{ClpServer, HostAction, HostCommandResponse},
+};
+use glyphon::{
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
 };
 use portable_pty::PtySize;
 use wgpu::{
@@ -68,7 +68,7 @@ const RUNTIME_TICK_INTERVAL: Duration = Duration::from_millis(16);
 pub enum UserEvent {
     PtyOutput,
     PtyClosed,
-    MlpAction,
+    ClpAction,
 }
 
 #[derive(Default)]
@@ -132,7 +132,7 @@ struct WindowState {
     background: BackgroundRenderer,
     terminal: Terminal,
     pty: Pty,
-    mlp_server: MlpServer,
+    clp_server: ClpServer,
     runtime: Runtime<TerminalProgram>,
     diagnostics: Diagnostics,
     scene: Scene,
@@ -175,14 +175,14 @@ impl WindowState {
                 blue: appearance.foreground.color.blue,
             },
         );
-        let mlp_event_proxy = event_proxy.clone();
-        let mlp_server = MlpServer::start_with_wake(CapabilitySet::ALL, move || {
-            let _ = mlp_event_proxy.send_event(UserEvent::MlpAction);
+        let clp_event_proxy = event_proxy.clone();
+        let clp_server = ClpServer::start_with_wake(CapabilitySet::ALL, move || {
+            let _ = clp_event_proxy.send_event(UserEvent::ClpAction);
         })?;
         let pty = Pty::spawn(
             pty_size(columns, rows, physical_size),
             event_proxy,
-            mlp_server.environment(),
+            clp_server.environment(),
         )?;
         let runtime = Runtime::new(TerminalProgram::default(), RUNTIME_TICK_INTERVAL)?;
         let diagnostics =
@@ -217,7 +217,7 @@ impl WindowState {
             && alpha_mode == CompositeAlphaMode::Opaque
         {
             eprintln!(
-                "Moditty: this compositor does not expose premultiplied window transparency; using an opaque surface"
+                "Chymeral: this compositor does not expose premultiplied window transparency; using an opaque surface"
             );
         }
         let surface_config = SurfaceConfiguration {
@@ -296,7 +296,7 @@ impl WindowState {
             background,
             terminal,
             pty,
-            mlp_server,
+            clp_server,
             runtime,
             diagnostics,
             scene,
@@ -385,10 +385,10 @@ impl WindowState {
             .shape_until_scroll(&mut self.font_system, false);
 
         if self.terminal.title().is_empty() {
-            self.window.set_title("Moditty");
+            self.window.set_title("Chymeral");
         } else {
             self.window
-                .set_title(&format!("Moditty — {}", self.terminal.title()));
+                .set_title(&format!("Chymeral — {}", self.terminal.title()));
         }
     }
 
@@ -424,7 +424,7 @@ impl WindowState {
         );
         self.text_buffer
             .shape_until_scroll(&mut self.font_system, false);
-        self.window.set_title("Moditty — Diagnostics");
+        self.window.set_title("Chymeral — Diagnostics");
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -455,7 +455,7 @@ impl WindowState {
         let (columns, rows) = grid_size(size, &self.font, self.scale_factor);
         self.terminal.resize(columns, rows);
         if let Err(error) = self.pty.resize(pty_size(columns, rows, size)) {
-            eprintln!("Moditty: {error:#}");
+            eprintln!("Chymeral: {error:#}");
         }
         self.background.resize(&self.queue, &self.surface_config);
         self.center_splash();
@@ -516,12 +516,12 @@ impl WindowState {
 
     fn write_input(&self, bytes: &[u8]) {
         if let Err(error) = self.pty.write(bytes) {
-            eprintln!("Moditty: {error:#}");
+            eprintln!("Chymeral: {error:#}");
         }
     }
 
-    fn apply_mlp_actions(&mut self) {
-        let actions = self.mlp_server.drain_host_actions();
+    fn apply_clp_actions(&mut self) {
+        let actions = self.clp_server.drain_host_actions();
         if actions.is_empty() {
             return;
         }
@@ -578,7 +578,7 @@ impl WindowState {
                     self.enqueue_event(EngineEvent::Scene(event));
                 }
             }
-            Err(error) => eprintln!("Moditty: could not route pointer event: {error}"),
+            Err(error) => eprintln!("Chymeral: could not route pointer event: {error}"),
         }
     }
 
@@ -589,7 +589,7 @@ impl WindowState {
                     self.enqueue_event(EngineEvent::Scene(event));
                 }
             }
-            Err(error) => eprintln!("Moditty: could not reconcile scene interaction: {error}"),
+            Err(error) => eprintln!("Chymeral: could not reconcile scene interaction: {error}"),
         }
     }
 
@@ -737,11 +737,11 @@ impl WindowState {
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("moditty frame"),
+                label: Some("chymeral frame"),
             });
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("moditty text pass"),
+                label: Some("chymeral text pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -773,7 +773,7 @@ impl WindowState {
     }
 }
 
-struct ModittyApp {
+struct ChymeralApp {
     state: Option<WindowState>,
     modifiers: ModifiersState,
     event_proxy: EventLoopProxy<UserEvent>,
@@ -783,7 +783,7 @@ struct ModittyApp {
     diagnostics_shortcuts: DiagnosticsShortcuts,
 }
 
-impl ModittyApp {
+impl ChymeralApp {
     fn new(
         event_proxy: EventLoopProxy<UserEvent>,
         appearance: Appearance,
@@ -809,20 +809,20 @@ impl ModittyApp {
     }
 }
 
-impl ApplicationHandler<UserEvent> for ModittyApp {
+impl ApplicationHandler<UserEvent> for ChymeralApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
         }
 
         let window_attributes = Window::default_attributes()
-            .with_title("Moditty")
+            .with_title("Chymeral")
             .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
             .with_transparent(self.appearance.background.requires_window_transparency());
         let window = match event_loop.create_window(window_attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
-                eprintln!("Moditty: could not create the window: {error}");
+                eprintln!("Chymeral: could not create the window: {error}");
                 event_loop.exit();
                 return;
             }
@@ -843,7 +843,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
                 self.state = Some(state);
             }
             Err(error) => {
-                eprintln!("Moditty: {error:#}");
+                eprintln!("Chymeral: {error:#}");
                 event_loop.exit();
             }
         }
@@ -863,7 +863,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
                 });
                 event_loop.exit();
             }
-            UserEvent::MlpAction => self.with_state(WindowState::apply_mlp_actions),
+            UserEvent::ClpAction => self.with_state(WindowState::apply_clp_actions),
         }
     }
 
@@ -944,12 +944,12 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
                         if state.runtime.is_faulted() {
                             runtime_error = Some(error);
                         } else {
-                            eprintln!("Moditty: {error:#}");
+                            eprintln!("Chymeral: {error:#}");
                         }
                     }
                 });
                 if let Some(error) = runtime_error {
-                    eprintln!("Moditty: {error:#}");
+                    eprintln!("Chymeral: {error:#}");
                     event_loop.exit();
                 }
             }
@@ -961,7 +961,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
         let mut runtime_error = None;
         self.with_state(|state| {
             let now = Instant::now();
-            state.apply_mlp_actions();
+            state.apply_clp_actions();
             state.apply_pending_resize(now);
             if state
                 .runtime
@@ -999,7 +999,7 @@ impl ApplicationHandler<UserEvent> for ModittyApp {
             }
         });
         if let Some(error) = runtime_error {
-            eprintln!("Moditty: {error:#}");
+            eprintln!("Chymeral: {error:#}");
             event_loop.exit();
         }
     }
@@ -1091,7 +1091,7 @@ fn install_testing_scene(
             )?;
             ids.insert(testing_node.id.as_str(), node);
             eprintln!(
-                "Moditty: testing scene node {:?} uses {node:?}",
+                "Chymeral: testing scene node {:?} uses {node:?}",
                 testing_node.id
             );
             created += 1;
@@ -1429,12 +1429,12 @@ fn configure_font_system(font: &FontAppearance) -> Result<(FontSystem, String)> 
 fn main() -> Result<()> {
     let loaded_config = config::load()?;
     if let Some(path) = &loaded_config.path {
-        eprintln!("Moditty: loaded configuration from {}", path.display());
+        eprintln!("Chymeral: loaded configuration from {}", path.display());
     }
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("could not create the event loop")?;
-    let mut app = ModittyApp::new(
+    let mut app = ChymeralApp::new(
         event_loop.create_proxy(),
         loaded_config.appearance,
         loaded_config.startup_splash,
@@ -1465,7 +1465,7 @@ mod tests {
         select_present_mode, select_surface_format, splash_properties, terminal_input,
         terminal_input_with_text, testing_node_properties,
     };
-    use moditty::{
+    use chymeral::{
         resources::{Texture, TextureStore},
         runtime::{
             EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent,
@@ -1691,7 +1691,7 @@ mod tests {
         assert_eq!(properties.transform.y(), 25.0);
         assert_eq!(
             properties.bounds,
-            moditty::scene::Rect::new(0.0, 0.0, 20.0, 10.0).unwrap()
+            chymeral::scene::Rect::new(0.0, 0.0, 20.0, 10.0).unwrap()
         );
     }
 
@@ -1716,7 +1716,7 @@ mod tests {
         assert_eq!(properties.transform.y(), 48.0);
         assert_eq!(
             properties.bounds,
-            moditty::scene::Rect::new(0.0, 0.0, 120.0, 80.0).unwrap()
+            chymeral::scene::Rect::new(0.0, 0.0, 120.0, 80.0).unwrap()
         );
         assert_eq!(properties.z_index, 3);
     }

@@ -4,7 +4,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-pub const MLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
+pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion {
@@ -291,7 +291,7 @@ impl Display for ProtocolError {
         match self {
             Self::UnsupportedVersion { received } => write!(
                 formatter,
-                "MLP version {received} is not supported; expected {MLP_PROTOCOL_VERSION}"
+                "CLP version {received} is not supported; expected {CLP_PROTOCOL_VERSION}"
             ),
             Self::SessionIdExhausted => {
                 formatter.write_str("could not allocate another session ID")
@@ -374,7 +374,7 @@ impl SessionManager {
         hello: ClientHello,
         context: ProgramInitContext,
     ) -> Result<(SessionId, HostMessage), ProtocolError> {
-        if hello.protocol_version != MLP_PROTOCOL_VERSION {
+        if hello.protocol_version != CLP_PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion {
                 received: hello.protocol_version,
             });
@@ -395,7 +395,7 @@ impl SessionManager {
         Ok((
             session_id,
             HostMessage::Init(ProgramInit {
-                protocol_version: MLP_PROTOCOL_VERSION,
+                protocol_version: CLP_PROTOCOL_VERSION,
                 session_id,
                 granted_capabilities: capabilities,
                 context,
@@ -560,7 +560,7 @@ mod tests {
 
     fn hello(capabilities: CapabilitySet) -> ClientHello {
         ClientHello {
-            protocol_version: MLP_PROTOCOL_VERSION,
+            protocol_version: CLP_PROTOCOL_VERSION,
             requested_capabilities: capabilities,
         }
     }
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(
             message,
             HostMessage::Init(ProgramInit {
-                protocol_version: MLP_PROTOCOL_VERSION,
+                protocol_version: CLP_PROTOCOL_VERSION,
                 session_id,
                 granted_capabilities: CapabilitySet::from_capabilities(&[
                     Capability::Scene,

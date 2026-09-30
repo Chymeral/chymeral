@@ -262,6 +262,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "chymeral"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "getrandom 0.3.4",
+ "glyphon",
+ "image",
+ "interprocess",
+ "pollster",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "toml",
+ "unicode-width",
+ "vte",
+ "wgpu",
+ "windows-sys 0.61.2",
+ "winit",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1031,27 +1052,6 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
-]
-
-[[package]]
-name = "moditty"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "getrandom 0.3.4",
- "glyphon",
- "image",
- "interprocess",
- "pollster",
- "portable-pty",
- "serde",
- "serde_json",
- "toml",
- "unicode-width",
- "vte",
- "wgpu",
- "windows-sys 0.61.2",
- "winit",
 ]
 
 [[package]]

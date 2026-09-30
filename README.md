@@ -1,14 +1,21 @@
-# Moditty
+# Chymeral
 
-Moditty es un motor de terminal extensible escrito en Rust.
+Chymeral es un runtime gráfico minimalista, alojado por una terminal
+programable y escrito en Rust.
 
-Su objetivo inicial es comportarse como una terminal extremadamente mínima y funcional, pero su propósito real es servir como runtime para programas que construyen TUIs avanzadas con capacidades de interacción que normalmente son difíciles o imposibles de implementar limpiamente sobre una terminal tradicional.
+Su superficie inicial se comporta como una terminal extremadamente mínima y
+funcional. Su propósito es ofrecer a programas externos un runtime gráfico
+portable con las primitivas necesarias para construir interfaces propias, sin
+imponer un toolkit de widgets ni ocultar que el programa también conserva su
+interfaz convencional de terminal.
 
-Moditty debe pensarse más como un pequeño motor gráfico/event-driven cuyo objeto principal por defecto es una terminal, y no simplemente como un emulador de terminal al que posteriormente se le añaden funciones.
+Chymeral debe pensarse como un pequeño runtime gráfico guiado por eventos cuyo
+objeto principal predeterminado es una terminal, no como un emulador de
+terminal al que posteriormente se le añaden funciones.
 
 ## Objetivo del producto
 
-La experiencia inicial de Moditty debe ser deliberadamente mínima:
+La experiencia inicial de Chymeral debe ser deliberadamente mínima:
 
 * abrir una ventana;
 * ejecutar el shell del usuario mediante PTY;
@@ -18,7 +25,8 @@ La experiencia inicial de Moditty debe ser deliberadamente mínima:
 * aceptar teclado;
 * soportar resize y comportamiento normal de una terminal.
 
-Sobre esa base, Moditty debe proporcionar una API propia que permita construir interfaces TUI avanzadas y elementos interactivos.
+Sobre esa base, Chymeral debe proporcionar un contrato propio que permita
+construir interfaces gráficas y elementos interactivos.
 
 Entre las capacidades futuras de esta API estarán:
 
@@ -44,7 +52,8 @@ Entre las capacidades futuras de esta API estarán:
 * clipboard;
 * superficies o nodos renderizables.
 
-Estas capacidades deben ser primitivas del motor. Moditty no debe convertirse directamente en un toolkit de widgets.
+Estas capacidades deben ser primitivas del runtime. Chymeral no debe
+convertirse directamente en un toolkit de widgets.
 
 No deben existir primitivas de alto nivel como:
 
@@ -54,29 +63,35 @@ create_checkbox()
 create_file_browser()
 ```
 
-La API debe ofrecer primitivas sobre las cuales terceros puedan desarrollar sus propios frameworks TUI.
+La API debe ofrecer primitivas sobre las cuales terceros puedan desarrollar sus
+propios frameworks de interfaz.
 
 Conceptualmente:
 
 ```text
-Moditty Engine
+Chymeral Runtime
      │
      ├── Terminal tradicional
      │
      ├── API y protocolo del motor
      │
-     ├── Programas Moditty
+     ├── Programas Chymeral
      │
-     └── Frameworks TUI de terceros
+     └── Frameworks de interfaz de terceros
 ```
 
-Una aplicación tradicional como bash, vim o htop debe poder ejecutarse normalmente sin conocer nada de Moditty.
+Una aplicación tradicional como bash, vim o htop debe poder ejecutarse
+normalmente sin conocer nada de Chymeral.
 
-Una aplicación diseñada específicamente para Moditty podrá usar las capacidades avanzadas del motor.
+Una aplicación diseñada específicamente para Chymeral podrá usar las
+capacidades avanzadas del runtime.
 
 ## Filosofía de plataforma
 
-Moditty debe tratar las TUIs avanzadas como programas ejecutados sobre una plataforma. No existe una categoría conceptual de "mod": un programa Moditty es software distribuible con Moditty como dependencia de instalación y con acceso opcional a sus capacidades de runtime.
+Chymeral trata las interfaces gráficas como programas ejecutados sobre una
+plataforma. No existe una categoría conceptual de "mod": un programa Chymeral
+es software distribuible con Chymeral como dependencia de instalación y con
+acceso opcional a sus capacidades de runtime.
 
 La terminal no debe imponer cómo debe verse o funcionar una interfaz.
 
@@ -98,7 +113,8 @@ TerminalSurface
 
 Los widgets, layouts complejos, editores, navegadores de archivos, interfaces visuales y demás abstracciones deben poder ser creados como librerías de programas externos.
 
-El objetivo es que el ecosistema pueda construir cosas encima de Moditty sin necesitar modificar el core.
+El objetivo es que el ecosistema pueda construir cosas encima de Chymeral sin
+necesitar modificar el core.
 
 El espíritu del sistema debe ser similar al de un motor de videojuegos altamente modeable:
 
@@ -114,11 +130,11 @@ programas/frameworks
 experiences
 ```
 
-pero aplicado a una terminal y a aplicaciones TUI.
+pero aplicado a una terminal y a aplicaciones gráficas.
 
 ## Arquitectura fundamental
 
-El grid de terminal NO debe ser el sistema gráfico de Moditty.
+El grid de terminal NO debe ser el sistema gráfico de Chymeral.
 
 Debe existir como una superficie renderizable dentro del motor.
 
@@ -214,7 +230,7 @@ Terminal PTY:
 portable-pty
 ```
 
-Debe quedar detrás de una abstracción propia de Moditty.
+Debe quedar detrás de una abstracción propia de Chymeral.
 
 Parser ANSI/VT:
 
@@ -222,7 +238,7 @@ Parser ANSI/VT:
 vte
 ```
 
-Se utilizará como parser, pero Moditty mantendrá su propio estado y grid de terminal.
+Se utilizará como parser, pero Chymeral mantendrá su propio estado y grid de terminal.
 
 Imágenes:
 
@@ -265,7 +281,7 @@ No introducir Tokio inicialmente salvo que aparezca una necesidad arquitectónic
 
 ## Regla arquitectónica crítica
 
-La API pública de Moditty NO debe exponer tipos de dependencias externas.
+La API pública de Chymeral NO debe exponer tipos de dependencias externas.
 
 Nunca hacer que una interfaz pública dependa directamente de tipos como:
 
@@ -279,7 +295,7 @@ portable_pty::PtyPair
 
 Estas dependencias son detalles internos del backend.
 
-Moditty debe definir sus propios tipos:
+Chymeral debe definir sus propios tipos:
 
 ```rust
 EngineEvent
@@ -348,7 +364,7 @@ enum EngineEvent {
 }
 ```
 
-Los eventos de winit deben ser traducidos a eventos de Moditty antes de llegar a sistemas superiores.
+Los eventos de winit deben ser traducidos a eventos de Chymeral antes de llegar a sistemas superiores.
 
 Pipeline esperado:
 
@@ -568,7 +584,7 @@ El destino se obtiene con hit testing de los bounds visibles. El origen y todos
 sus descendientes se excluyen para impedir soltarse sobre sí mismo, pero un
 ancestro del origen sigue siendo un destino válido. En la liberación primaria,
 un destino produce `Drop` seguido de `DragEnd`; fuera de un destino sólo se
-emite `DragEnd`. Moditty no mueve nodos ni cambia su contenido automáticamente:
+emite `DragEnd`. Chymeral no mueve nodos ni cambia su contenido automáticamente:
 el consumidor de los eventos decide cualquier efecto visual o lógico.
 
 La captura de M8 es lógica, no un grab del cursor del sistema. Por ello, salir
@@ -624,10 +640,10 @@ La API debe diferenciar conceptualmente hit-testing de colisiones, aunque intern
 
 ## Modelo de programas
 
-Los consumidores de las capacidades avanzadas de Moditty son programas, no
-mods ni plugins cargados por el host. Un programa Moditty se distribuye e
+Los consumidores de las capacidades avanzadas de Chymeral son programas, no
+mods ni plugins cargados por el host. Un programa Chymeral se distribuye e
 instala como cualquier otro programa de terminal; su paquete o instalador
-declara una versión mínima de Moditty como dependencia.
+declara una versión mínima de Chymeral como dependencia.
 
 Un programa puede ser un binario nativo para Windows o Linux, o un lanzador
 empaquetado que inicia un runtime como Python, Lua, JavaScript, .NET o Java.
@@ -635,7 +651,7 @@ El host no conoce ni selecciona el lenguaje: sólo inicia y se comunica con el
 ejecutable indicado por el paquete. Por ello Rust, C, C++, Zig, Go y cualquier
 otro lenguaje capaz de implementar el contrato tienen el mismo estatus.
 
-Al ejecutarlo desde el shell contenido en Moditty, debe sentirse normal:
+Al ejecutarlo desde el shell contenido en Chymeral, debe sentirse normal:
 
 ```text
 PS> mi-programa.exe
@@ -644,42 +660,42 @@ $ mi-programa
 
 Sus argumentos, `stdin`, `stdout`, `stderr` y código de salida conservan la
 semántica de un programa convencional. El shell y las aplicaciones que no
-conocen Moditty siguen funcionando sin cambios.
+conocen Chymeral siguen funcionando sin cambios.
 
-Un programa que use Moditty hereda información privada de la sesión actual y
+Un programa que use Chymeral hereda información privada de la sesión actual y
 abre un canal con el host mediante su SDK. Por ese canal solicita recursos de
 escena y recibe el ciclo de vida, eventos y tiempo del runtime; sus flujos
 estándar continúan unidos al PTY.
 
 ```text
-shell dentro de Moditty
+shell dentro de Chymeral
   └── programa
        ├── stdin / stdout / stderr ──> PTY y terminal convencional
-       └── SDK de Moditty ───────────> canal privado ──> host
+       └── SDK de Chymeral ──────────> canal privado ──> host
 ```
 
-Si el programa se inicia fuera de una sesión Moditty, el SDK no tendrá un
+Si el programa se inicia fuera de una sesión Chymeral, el SDK no tendrá un
 endpoint al que conectarse. La política final —modo CLI alternativo o error
-explícito de requisito— corresponde al programa; Moditty no requiere un
+explícito de requisito— corresponde al programa; Chymeral no requiere un
 servicio global para que sus programas se ejecuten.
 
 ## Contrato entre programa y runtime
 
-La frontera pública será un protocolo local, versionado y neutral al lenguaje.
-Su nombre provisional es **MLP** (*Moditty Link Protocol*). No es una syscall:
+La frontera pública es un protocolo local, versionado y neutral al lenguaje.
+Su nombre es **CLP** (*Chymeral Link Protocol*). No es una syscall:
 es un contrato de mensajes entre procesos que evita exponer memoria, tipos de
 Rust o dependencias gráficas del host.
 
-M10 implementa dentro del core el primer contrato de MLP y M11 lo conecta a un
+M10 implementa dentro del core el primer contrato de CLP y M11 lo conecta a un
 transporte local real. M12 eleva el protocolo a la versión `1.1` y añade el
 primer conjunto de comandos: escena, rectángulos sólidos, imágenes RGBA8 y
 recursos opacos aislados por sesión. Todavía no entrega eventos ni tiempo.
 
-MLP tendrá dos direcciones lógicas en una sesión bidireccional:
+CLP tendrá dos direcciones lógicas en una sesión bidireccional:
 
 ```text
-Moditty → programa: Init, Start, Event, Tick, Frame, Resize, errores
-programa → Moditty: comandos, lotes de escena, recursos, suscripciones
+Chymeral → programa: Init, Start, Event, Tick, Frame, Resize, errores
+programa → Chymeral: comandos, lotes de escena, recursos, suscripciones
 ```
 
 `Init`, `Start`, `Event`, `Tick` y `Frame` preservarán las semánticas ya
@@ -695,17 +711,17 @@ Un programa no obtiene referencias ni acceso directo a la memoria del host.
 M11 usa un transporte local privado: socket de dominio Unix en Linux y named
 pipe en Windows. Cada ventana crea un endpoint efímero y un token aleatorio de
 256 bits; el shell y todo proceso que éste inicie reciben ambos mediante
-`MODITTY_MLP_ENDPOINT` y `MODITTY_MLP_TOKEN`. No se escriben en configuración,
+`CHYMERAL_CLP_ENDPOINT` y `CHYMERAL_CLP_TOKEN`. No se escriben en configuración,
 no persisten tras cerrar la ventana y no existe un servicio global al que un
 proceso externo pueda conectarse. El token evita conexiones accidentales, pero
 M11 no pretende ser un sandbox ni sustituye la seguridad del usuario del
 sistema.
 
-MLP sigue separado de ese transporte para permitir adaptadores futuros sin
+CLP sigue separado de ese transporte para permitir adaptadores futuros sin
 alterar la API, pero `stdio`, red, memoria compartida, WASM y carga de código
 nativo quedan fuera de este alcance inicial.
 
-### Transporte MLP v1.1 (M11–M12)
+### Transporte CLP v1.1 (M11–M12)
 
 El flujo de bytes está compuesto por frames con una longitud `u32` big-endian,
 un discriminante de un byte y su payload. `J` identifica un objeto JSON UTF-8;
@@ -721,9 +737,9 @@ el token y negociar capacidades, la sesión sigue exactamente este orden:
 
 ```text
 programa → hello
-Moditty  → init
+Chymeral → init
 programa → init_complete
-Moditty  → start
+Chymeral → start
 programa → started
           running
 ```
@@ -740,13 +756,13 @@ Como límite de recursos, una ventana admite hasta 16 conexiones que aún no han
 completado `started`; las excedentes se cierran inmediatamente sin crear una
 sesión o se rechazan por capacidad antes de establecer el stream. Las sesiones
 que ya están ejecutándose no comparten ese límite. Al
-cerrar Moditty, el host deja de aceptar conexiones, entrega `closed` con razón
+cerrar Chymeral, el host deja de aceptar conexiones, entrega `closed` con razón
 `host_shutdown` a cada cliente que siga conectado y espera la limpieza de sus
 handlers antes de liberar el endpoint.
 
 M11–M12 no inician programas, no interpretan sus argumentos, no exponen el
 token como API de alto nivel y no entregan aún `Event`, `Tick` ni `Frame`. Un
-SDK de M14 encapsulará estos detalles; hasta entonces MLP es un contrato crudo
+SDK de M14 encapsulará estos detalles; hasta entonces CLP es un contrato crudo
 probado, no una interfaz de usuario final.
 
 ### Comandos de escena M12
@@ -759,8 +775,8 @@ el anterior haya respondido.
 
 ```text
 programa → { type: "command", request_id, command: { op: ... } }
-Moditty  → { type: "result", request_id, result: ... }
-Moditty  → { type: "command_error", request_id, code, message }
+Chymeral → { type: "result", request_id, result: ... }
+Chymeral → { type: "command_error", request_id, code, message }
 ```
 
 Las operaciones de escena son `create_root`, `create_child`, `update_node`,
@@ -779,7 +795,7 @@ pintura y composición de M3–M9. `underlay` queda detrás del texto de termina
 `upload_texture` declara `width` y `height`; debe seguirle inmediatamente una
 secuencia de frames `B` que contenga exactamente `width * height * 4` bytes
 RGBA8. La respuesta entrega `texture-N`. No existe Base64, rutas del host ni
-lectura de archivos por parte de Moditty. `destroy_texture` sólo tiene éxito
+lectura de archivos por parte de Chymeral. `destroy_texture` sólo tiene éxito
 cuando ningún nodo la referencia: el programa debe primero cambiar o eliminar
 esos nodos.
 
@@ -792,7 +808,7 @@ hasta 128 MiB; además, ancho y alto no pueden superar el límite de la GPU
 seleccionada por la ventana. Sobrepasar esos límites devuelve `command_error`
 recuperable.
 
-El handler MLP nunca muta `wgpu`, `Scene` ni `TextureStore` directamente.
+El handler CLP nunca muta `wgpu`, `Scene` ni `TextureStore` directamente.
 Encola los comandos en una cola acotada para el hilo de ventana, espera la
 respuesta y éste reconcilia interacción y solicita el redraw. Las notificaciones
 de limpieza viajan por un canal separado para que cerrar muchas sesiones nunca
@@ -802,21 +818,21 @@ gráfico y preserva el acceso de un solo hilo a la UI.
 ## SDKs de cliente e independencia de lenguaje
 
 Un SDK es una biblioteca de cliente enlazada, incluida o implementada por el
-programa. Traduce las convenciones de un lenguaje a MLP; no es un plugin que
-Moditty cargue ni un requisito de instalación dentro del host.
+programa. Traduce las convenciones de un lenguaje a CLP; no es un plugin que
+Chymeral cargue ni un requisito de instalación dentro del host.
 
 ```text
 Python / Lua / JavaScript / C# / Go / Rust / C / C++ / Zig
                          ↓
-                SDK o implementación propia de MLP
+                SDK o implementación propia de CLP
                          ↓
-                      Moditty
+                     Chymeral
 ```
 
 Un programa nativo puede enlazar un SDK estático y distribuir un único binario.
 Un runtime interpretado puede incluir su launcher y dependencias en su paquete.
 Los SDKs oficiales son conveniencia y conformance, no una lista cerrada de
-lenguajes permitidos: cualquier implementación correcta de MLP es válida.
+lenguajes permitidos: cualquier implementación correcta de CLP es válida.
 
 El nombre **MLExtension** queda descartado como pieza arquitectónica central.
 Podrá reutilizarse más adelante para un adaptador opcional de un lenguaje, pero
@@ -825,45 +841,45 @@ host para ejecutar programas ordinarios.
 
 ## Paquetes y manifiestos de programa
 
-Los instaladores de programas resuelven la dependencia de Moditty y registran
+Los instaladores de programas resuelven la dependencia de Chymeral y registran
 su comando en el entorno del usuario como harían con cualquier aplicación. Un
 manifiesto de programa, cuando sea necesario, describirá sólo metadatos de
 ejecución y compatibilidad, nunca el lenguaje como parte del contrato.
 
-Los campos iniciales previstos son identificador, versión mínima de MLP,
+Los campos iniciales previstos son identificador, versión mínima de CLP,
 ejecutable o launcher por plataforma y capacidades solicitadas. La forma del
 paquete, el gestor de instalación y un registro central de programas no forman
 parte del core inicial.
 
 ## Esquema de protocolo e IDL futura
 
-MLP comenzará con mensajes tipados para el ciclo de vida, eventos y comandos
+CLP comenzará con mensajes tipados para el ciclo de vida, eventos y comandos
 que realmente existan. No se añadirá una llamada genérica de valores dinámicos
 ni una IDL antes de que el conjunto inicial de comandos se estabilice.
 
 Cuando haya más de un SDK, una IDL neutral podrá convertirse en la fuente de
-verdad de MLP y generar bindings, documentación y pruebas de conformidad. Esa
+verdad de CLP y generar bindings, documentación y pruebas de conformidad. Esa
 IDL debe describir handles, mensajes, errores, versiones y capacidades; no debe
-filtrar tipos de `winit`, `wgpu`, Rust ni ningún backend de Moditty.
+filtrar tipos de `winit`, `wgpu`, Rust ni ningún backend de Chymeral.
 
 ## Estructura conceptual del proyecto
 
 La estructura futura puede aproximarse a:
 
 ```text
-moditty/
+chymeral/
 ├── Cargo.toml
 ├── crates/
-│   ├── moditty-core/
-│   ├── moditty-events/
-│   ├── moditty-scene/
-│   ├── moditty-render/
-│   ├── moditty-render-wgpu/
-│   ├── moditty-text/
-│   ├── moditty-terminal/
-│   ├── moditty-pty/
-│   ├── moditty-protocol/
-│   └── moditty-session/
+│   ├── chymeral-core/
+│   ├── chymeral-events/
+│   ├── chymeral-scene/
+│   ├── chymeral-render/
+│   ├── chymeral-render-wgpu/
+│   ├── chymeral-text/
+│   ├── chymeral-terminal/
+│   ├── chymeral-pty/
+│   ├── chymeral-protocol/
+│   └── chymeral-session/
 │
 ├── protocol/
 └── examples/
@@ -875,7 +891,7 @@ Crear únicamente los crates necesarios para cada milestone y separar componente
 
 ## Alcance original de M1
 
-M1 no implementa programas externos, MLP, SDKs ni una API pública.
+M1 no implementa programas externos, CLP, SDKs ni una API pública.
 
 No implementar un toolkit de UI.
 
@@ -931,9 +947,9 @@ M1 está orientado a Linux y Windows. En Windows requiere Windows 10 1809 o post
 cargo run
 ```
 
-La implementación actual abre una ventana, crea una sesión de terminal con el shell definido en `$SHELL` (o `/bin/sh`) en Linux y `COMSPEC` (o `cmd.exe`) en Windows, usa `TERM=xterm-256color`, procesa su salida en un estado y grid propios y la renderiza con `wgpu` y `glyphon`. `MODITTY_SHELL` permite indicar un ejecutable alternativo en ambas plataformas.
+La implementación actual abre una ventana, crea una sesión de terminal con el shell definido en `$SHELL` (o `/bin/sh`) en Linux y `COMSPEC` (o `cmd.exe`) en Windows, usa `TERM=xterm-256color`, procesa su salida en un estado y grid propios y la renderiza con `wgpu` y `glyphon`. `CHYMERAL_SHELL` permite indicar un ejecutable alternativo en ambas plataformas.
 
-Incluye entrada de texto UTF-8, atajos de control, teclas de navegación habituales, resize de ventana y PTY, título OSC 0/2, pantalla alternativa y scrollback interno acotado. Cuando el shell termina, Moditty cierra la ventana.
+Incluye entrada de texto UTF-8, atajos de control, teclas de navegación habituales, resize de ventana y PTY, título OSC 0/2, pantalla alternativa y scrollback interno acotado. Cuando el shell termina, Chymeral cierra la ventana.
 
 El intérprete implementa los controles de línea, tabulación y retroceso, cursor CSI, regiones de scroll, inserción, borrado, pantalla alternativa y colores SGR de 8/16/256 colores, RGB y negrita.
 
@@ -941,19 +957,19 @@ Todavía no es una emulación VT completa: selección, navegación visual del sc
 
 ### Configuración gráfica base
 
-Moditty carga opcionalmente `moditty.toml` desde `MODITTY_CONFIG`. Si esa variable no existe, busca `moditty/moditty.toml` bajo `XDG_CONFIG_HOME` (o `~/.config`) en Linux y `%APPDATA%` en Windows. La plantilla del repositorio está en `moditty.toml.example`. Las claves desconocidas se rechazan para evitar configuraciones con errores tipográficos.
+Chymeral carga opcionalmente `chymeral.toml` desde `CHYMERAL_CONFIG`. Si esa variable no existe, busca `chymeral/chymeral.toml` bajo `XDG_CONFIG_HOME` (o `~/.config`) en Linux y `%APPDATA%` en Windows. La plantilla del repositorio está en `chymeral.toml.example`. Las claves desconocidas se rechazan para evitar configuraciones con errores tipográficos.
 
-La fuente puede venir del sistema o de cualquier archivo que el motor de fuentes pueda cargar. En una colección, `face_index` selecciona exactamente la cara indicada. Moditty no rechaza fuentes por no ser monoespaciadas; el grid conserva celdas lógicas fijas, aunque los avances visuales de una fuente proporcional pueden no coincidir con sus celdas. `size`, `line_height` y `cell_width` usan píxeles lógicos y se escalan con el DPI del monitor. Las fuentes corruptas o incompatibles producen un error al iniciar.
+La fuente puede venir del sistema o de cualquier archivo que el motor de fuentes pueda cargar. En una colección, `face_index` selecciona exactamente la cara indicada. Chymeral no rechaza fuentes por no ser monoespaciadas; el grid conserva celdas lógicas fijas, aunque los avances visuales de una fuente proporcional pueden no coincidir con sus celdas. `size`, `line_height` y `cell_width` usan píxeles lógicos y se escalan con el DPI del monitor. Las fuentes corruptas o incompatibles producen un error al iniciar.
 
 El color predeterminado de texto se define con `terminal.foreground.color` en formato `#RRGGBB`. Los programas que emiten colores ANSI mantienen sus propios colores; `SGR 0` y `SGR 39` restauran el color configurado. El texto y cursor son opacos: `opacity` no se aplica a ellos.
 
 El fondo admite un color hexadecimal `#RRGGBB` o una imagen PNG, JPEG o GIF. Los GIF se animan según sus frames; `opacity` se aplica solo al fondo, multiplicándose con el alfa propio de la imagen. Las opciones `cover`, `contain` y `stretch` controlan su ajuste. Para evitar agotar recursos, cada imagen queda limitada a 8192×8192 píxeles y 64 MiB decodificados; un GIF admite hasta 300 frames y 128 MiB en total.
 
-Cuando el fondo tiene alfa, Moditty solicita una ventana transparente al compositor. Si el compositor no expone una superficie compatible, la aplicación continúa con una superficie opaca.
+Cuando el fondo tiene alfa, Chymeral solicita una ventana transparente al compositor. Si el compositor no expone una superficie compatible, la aplicación continúa con una superficie opaca.
 
 `appearance.startup_splash` habilita una pantalla de inicio estética opcional.
 Al activarla, `image` es obligatoria, se resuelve relativa al archivo
-`moditty.toml` y debe referirse a una imagen PNG, JPG o JPEG estática. La imagen
+`chymeral.toml` y debe referirse a una imagen PNG, JPG o JPEG estática. La imagen
 se conserva a su tamaño natural en píxeles lógicos, se centra sobre la terminal
 y desaparece después de `duration_ms`; `opacity` es independiente del fondo y
 del texto. Los GIF y cualquier otro formato animado se rechazan expresamente
@@ -962,9 +978,9 @@ la sección completa y el comportamiento predeterminado es no mostrar splash.
 
 ### Diagnóstico del runtime
 
-Las vistas internas de diagnóstico permiten comprobar visualmente la integración de M2 sin alterar la sesión del shell. Se activan desde `[input.shortcuts]` en `moditty.toml`; los valores predeterminados son `Ctrl+Shift+E` para eventos, `Ctrl+Shift+T` para ticks y `Ctrl+Shift+F` para frames. Cada atajo debe incluir al menos un modificador y una única letra ASCII.
+Las vistas internas de diagnóstico permiten comprobar visualmente la integración de M2 sin alterar la sesión del shell. Se activan desde `[input.shortcuts]` en `chymeral.toml`; los valores predeterminados son `Ctrl+Shift+E` para eventos, `Ctrl+Shift+T` para ticks y `Ctrl+Shift+F` para frames. Cada atajo debe incluir al menos un modificador y una única letra ASCII.
 
-La vista es modal y permanece abierta hasta pulsar `Escape`. Limpia sólo la representación visual de Moditty: el PTY continúa procesando la salida del shell, pero los caracteres escritos mientras el diagnóstico está activo no se envían a éste. Al volver, se muestra la terminal en su estado actual.
+La vista es modal y permanece abierta hasta pulsar `Escape`. Limpia sólo la representación visual de Chymeral: el PTY continúa procesando la salida del shell, pero los caracteres escritos mientras el diagnóstico está activo no se envían a éste. Al volver, se muestra la terminal en su estado actual.
 
 `events` muestra los sucesos canónicos de teclado, puntero, scroll, foco,
 terminal y escena, incluidos los de drag. El texto imprimible y los eventos
@@ -1025,7 +1041,7 @@ puede elegir `layer = "underlay"` o `"overlay"`; los hijos siempre heredan
 la de su raíz. `clip_children = true` permite confirmar que la parte del hijo
 fuera del padre desaparece y no recibe hover ni drag.
 
-Al iniciar, Moditty escribe la relación entre cada `id` y su `NodeId` en
+Al iniciar, Chymeral escribe la relación entre cada `id` y su `NodeId` en
 stderr; `Ctrl+Shift+E` muestra después los `SceneEvent` asociados a esos
 handles. Así se pueden probar hover, foco, orden de superposición, clipping y
 drag and drop sin recursos externos. Los nodos de prueba siguen las mismas
@@ -1049,8 +1065,8 @@ M6  hit testing
 M7  mouse/focus
 M8  drag and drop + herramientas de prueba
 M9  clipping/layers + jerarquía de pruebas
-M10 contrato de programa y tipos internos de MLP ✓
-M11 sesión local MLP: transporte, handshake, Init/Start y limpieza ✓
+M10 contrato de programa y tipos internos de CLP ✓
+M11 sesión local CLP: transporte, handshake, Init/Start y limpieza ✓
 M12 comandos de escena y recursos con ownership por programa ✓
 M13 entrega de Event/Tick/Frame y ciclo de cierre de programa
 M14 SDK de referencia, pruebas de conformidad y primer programa de prueba
@@ -1058,14 +1074,14 @@ M15 manifiesto mínimo de programa, capacidades y compatibilidad de paquete
 M16 IDL sólo si más de un SDK justifica generación de bindings
 ```
 
-El lenguaje del primer SDK o programa de prueba no condicionará MLP. Python,
+El lenguaje del primer SDK o programa de prueba no condicionará CLP. Python,
 Lua, JavaScript, C#, Go, Rust, C, C++ y Zig son candidatos equivalentes;
 también será válida una implementación independiente del protocolo.
 
 ### Estado de M10, M11 y M12
 
 M10 define y prueba dentro del core el contrato que un programa externo usará:
-versión de MLP, identidad y capacidades de sesión, mensajes de handshake,
+versión de CLP, identidad y capacidades de sesión, mensajes de handshake,
 transiciones `Init`/`Start`, mensajes de fallo y handles aislados por sesión.
 Las sesiones son concurrentes; un fallo o cierre libera sólo los handles de su
 programa. Después de entregar `Closed`, el host puede descartar el registro
@@ -1077,7 +1093,7 @@ entorno en éste; por herencia, también llegan a los programas que ejecute. Sus
 tests recorren el framing, token inválido, negociación, el handshake completo,
 el cierre, `HostShutdown`, el límite de handshakes y la limpieza al desconectar.
 Una prueba de integración inicia además un proceso hijo independiente que sólo
-recibe las variables heredadas e implementa el framing MLP crudo. M11 no inicia
+recibe las variables heredadas e implementa el framing CLP crudo. M11 no inicia
 programas por sí mismo, no expone comandos de escena a aplicaciones y no crea
 SDKs. M12 añade comandos seriales de escena, rectángulos sólidos, imágenes de
 texturas RGBA8 transferidas en fragmentos binarios, validación de capacidad y
@@ -1094,11 +1110,11 @@ eventos y tiempo corresponden a M13; los paquetes y SDKs, a M14–M15.
 
 3. No acoplar la API pública a crates externos.
 
-4. No convertir Moditty en un toolkit de widgets.
+4. No convertir Chymeral en un toolkit de widgets.
 
 5. El terminal convencional debe seguir funcionando sin ningún programa cliente.
 
-6. Los programas Moditty deben poder alterar profundamente la experiencia sin modificar el core.
+6. Los programas Chymeral deben poder alterar profundamente la experiencia sin modificar el core.
 
 7. El protocolo y los SDKs deben ser independientes de Rust.
 
@@ -1125,6 +1141,6 @@ Cuando trabajes sobre este repositorio:
 * no refactorices partes no relacionadas salvo necesidad;
 * si una decisión arquitectónica contradice esta especificación, señalarla antes de implementarla.
 
-Moditty debe comenzar siendo una terminal extraordinariamente simple y terminar siendo una plataforma extraordinariamente extensible.
+Chymeral debe comenzar siendo una terminal extraordinariamente simple y terminar siendo una plataforma extraordinariamente extensible.
 
 La complejidad debe vivir progresivamente encima del núcleo, no dentro de él.

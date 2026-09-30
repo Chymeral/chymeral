@@ -529,7 +529,7 @@ mod tests {
         manager
             .accept(
                 crate::protocol::ClientHello {
-                    protocol_version: crate::protocol::MLP_PROTOCOL_VERSION,
+                    protocol_version: crate::protocol::CLP_PROTOCOL_VERSION,
                     requested_capabilities: crate::protocol::CapabilitySet::ALL,
                 },
                 Default::default(),
@@ -541,7 +541,7 @@ mod tests {
     fn session_pair() -> (SessionId, SessionId) {
         let mut manager = SessionManager::default();
         let hello = crate::protocol::ClientHello {
-            protocol_version: crate::protocol::MLP_PROTOCOL_VERSION,
+            protocol_version: crate::protocol::CLP_PROTOCOL_VERSION,
             requested_capabilities: crate::protocol::CapabilitySet::ALL,
         };
         let first = manager.accept(hello.clone(), Default::default()).unwrap().0;

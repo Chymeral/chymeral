@@ -32,7 +32,7 @@ opacity = 0.92
 # terminal y desaparece automáticamente. M5 admite PNG y JPEG estáticos.
 [appearance.startup_splash]
 enabled = false
-# image = "images/moditty-splash.png"
+# image = "images/chymeral-splash.png"
 # duration_ms = 1500
 # opacity = 1.0
 

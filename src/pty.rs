@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use moditty::transport::SessionEnvironment;
+use chymeral::transport::SessionEnvironment;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use winit::event_loop::EventLoopProxy;
 
@@ -54,7 +54,7 @@ impl Pty {
         let reader_proxy = event_proxy.clone();
 
         thread::Builder::new()
-            .name("moditty-pty-reader".to_owned())
+            .name("chymeral-pty-reader".to_owned())
             .spawn(move || {
                 let mut buffer = [0_u8; 8192];
                 loop {
@@ -75,7 +75,7 @@ impl Pty {
             .context("could not start the PTY reader")?;
         let monitor_proxy = event_proxy;
         thread::Builder::new()
-            .name("moditty-pty-monitor".to_owned())
+            .name("chymeral-pty-monitor".to_owned())
             .spawn(move || {
                 let _ = child.wait();
                 let _ = monitor_proxy.send_event(UserEvent::PtyClosed);
@@ -111,7 +111,7 @@ impl Pty {
 }
 
 fn default_shell_command() -> CommandBuilder {
-    if let Some(shell) = env::var_os("MODITTY_SHELL") {
+    if let Some(shell) = env::var_os("CHYMERAL_SHELL") {
         return CommandBuilder::new(shell);
     }
 

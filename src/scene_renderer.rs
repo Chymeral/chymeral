@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use moditty::{
+use chymeral::{
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
     scene::{NodeContent, Rect, Scene, SceneLayer},
 };
@@ -137,7 +137,7 @@ impl ImageRenderer {
     pub fn new(device: &Device, surface_config: &SurfaceConfiguration) -> Self {
         let bind_group_layout = image_bind_group_layout(device);
         let sampler = device.create_sampler(&SamplerDescriptor {
-            label: Some("moditty image sampler"),
+            label: Some("chymeral image sampler"),
             address_mode_u: AddressMode::ClampToEdge,
             address_mode_v: AddressMode::ClampToEdge,
             address_mode_w: AddressMode::ClampToEdge,
@@ -148,7 +148,7 @@ impl ImageRenderer {
         });
         let pipeline = image_pipeline(device, surface_config.format, &bind_group_layout);
         let vertex_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("moditty image vertices"),
+            label: Some("chymeral image vertices"),
             size: IMAGE_VERTEX_STRIDE,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -316,7 +316,7 @@ impl ImageRenderer {
             .checked_mul(4)
             .context("texture row size overflows wgpu's upload layout")?;
         let gpu_texture = device.create_texture(&TextureDescriptor {
-            label: Some("moditty scene image"),
+            label: Some("chymeral scene image"),
             size: Extent3d {
                 width,
                 height,
@@ -350,7 +350,7 @@ impl ImageRenderer {
         );
         let texture_view = gpu_texture.create_view(&TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("moditty scene image bind group"),
+            label: Some("chymeral scene image bind group"),
             layout: &self.bind_group_layout,
             entries: &[
                 BindGroupEntry {
@@ -375,7 +375,7 @@ impl ImageRenderer {
         }
         let size = required.checked_next_power_of_two().unwrap_or(required);
         self.vertex_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("moditty image vertices"),
+            label: Some("chymeral image vertices"),
             size,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -386,7 +386,7 @@ impl ImageRenderer {
 
 fn image_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("moditty scene image bind group layout"),
+        label: Some("chymeral scene image bind group layout"),
         entries: &[
             BindGroupLayoutEntry {
                 binding: 0,
@@ -414,16 +414,16 @@ fn image_pipeline(
     bind_group_layout: &BindGroupLayout,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("moditty scene image shader"),
+        label: Some("chymeral scene image shader"),
         source: ShaderSource::Wgsl(Cow::Borrowed(IMAGE_SHADER)),
     });
     let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("moditty scene image pipeline layout"),
+        label: Some("chymeral scene image pipeline layout"),
         bind_group_layouts: &[Some(bind_group_layout)],
         immediate_size: 0,
     });
     device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("moditty scene image pipeline"),
+        label: Some("chymeral scene image pipeline"),
         layout: Some(&layout),
         vertex: VertexState {
             module: &shader,
@@ -536,7 +536,7 @@ fn append_vertex(bytes: &mut Vec<u8>, vertex: [f32; 5]) {
 
 #[cfg(test)]
 mod tests {
-    use moditty::scene::Rect;
+    use chymeral::scene::Rect;
 
     use super::{ImageViewport, ScissorRect, image_vertices, scissor_rect};
 

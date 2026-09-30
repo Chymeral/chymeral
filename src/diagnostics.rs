@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use moditty::runtime::{
+use chymeral::runtime::{
     EngineEvent, Key as EngineKey, KeyEvent as EngineKeyEvent, KeyState, Modifiers, RuntimeMetrics,
 };
 
@@ -165,7 +165,7 @@ impl Diagnostics {
         if self.active.is_some()
             && matches!(
                 event.key,
-                EngineKey::Named(moditty::runtime::NamedKey::Escape)
+                EngineKey::Named(chymeral::runtime::NamedKey::Escape)
             )
             && event.state == KeyState::Pressed
         {
@@ -256,7 +256,7 @@ impl Diagnostics {
             ),
         };
         let mut lines = vec![
-            format!("MODITTY DIAGNOSTICS — {}", view.title()),
+            format!("CHYMERAL DIAGNOSTICS — {}", view.title()),
             "Esc: return to terminal | terminal input is paused".to_owned(),
             metrics_line,
             String::new(),
@@ -344,7 +344,7 @@ fn modifier_text(modifiers: Modifiers) -> String {
 
 #[cfg(test)]
 mod tests {
-    use moditty::{
+    use chymeral::{
         runtime::SceneEvent,
         scene::{NodeProperties, Scene},
     };
@@ -469,7 +469,7 @@ mod tests {
         assert!(diagnostics.is_active());
 
         let escape = EngineKeyEvent {
-            key: EngineKey::Named(moditty::runtime::NamedKey::Escape),
+            key: EngineKey::Named(chymeral::runtime::NamedKey::Escape),
             text: None,
             state: KeyState::Pressed,
             modifiers: Modifiers::default(),
