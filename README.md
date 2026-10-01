@@ -7,7 +7,7 @@
 > A minimalist terminal emulator with a reusable local graphics runtime for
 > applications compatible with CLP.
 
-**Chymeral** (official pronunciation: **“Kímeral”**) keeps the normal terminal
+**Chymeral** keeps the normal terminal
 model intact while giving compatible programs a direct way to render a retained
 2D scene, receive input, and run against a local frame loop. It targets Linux
 and Windows. macOS is intentionally outside the current scope.
