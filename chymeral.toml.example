@@ -1,19 +1,19 @@
 [terminal.font]
 source = "system"
 family = "monospace"
-# Medidas en píxeles lógicos: se adaptan automáticamente al DPI del monitor.
+# Measurements use logical pixels and adapt automatically to display DPI.
 size = 16.0
 line_height = 20.0
 cell_width = "auto"
 
-# Para cargar cualquier fuente que admita el motor desde un archivo local:
+# To load any font supported by the engine from a local file:
 # source = "file"
-# path = "/ruta/absoluta/a/mi-fuente.otf"
-# En Windows también se acepta, por ejemplo, "C:/Users/yo/Fuentes/mi-fuente.otf".
+# path = "/absolute/path/to/my-font.otf"
+# On Windows, for example, "C:/Users/me/Fonts/my-font.otf" is also valid.
 # face_index = 0
 
 [terminal.foreground]
-# Color predeterminado del texto que no especifica un color ANSI.
+# Default color for text that does not specify an ANSI color.
 color = "#E5E7EB"
 
 [terminal.background]
@@ -21,15 +21,15 @@ kind = "color"
 color = "#090B0F"
 opacity = 0.92
 
-# Para usar una imagen en lugar del color:
+# To use an image instead of a color:
 # kind = "image"
 # path = "fondos/aurora.gif"
 # opacity = 0.72
 # fit = "cover"
-# fit también puede ser "contain" o "stretch"
+# fit can also be "contain" or "stretch".
 
-# Pantalla de inicio estética opcional. La imagen se muestra centrada sobre la
-# terminal y desaparece automáticamente. M5 admite PNG y JPEG estáticos.
+# Optional visual startup splash. The image is centered above the terminal and
+# disappears automatically. Static PNG and JPEG images are supported.
 [appearance.startup_splash]
 enabled = false
 # image = "images/chymeral-splash.png"
@@ -37,20 +37,19 @@ enabled = false
 # opacity = 1.0
 
 [input.shortcuts]
-# Atajos internos de diagnóstico. Cada uno abre una vista modal; Escape vuelve
-# a la terminal. Los caracteres escritos mientras la vista está abierta no se
-# envían al shell.
+# Internal diagnostic shortcuts. Each opens a modal view; Escape returns to the
+# terminal. Characters typed while a view is open are not sent to the shell.
 diagnostics_events = "Ctrl+Shift+E"
 diagnostics_ticks = "Ctrl+Shift+T"
 diagnostics_frames = "Ctrl+Shift+F"
 
-# Herramientas internas de prueba. No forman parte de la API de mods y se
-# desactivan por defecto. Los nodos se dibujan sobre la terminal en píxeles
-# lógicos y participan en hit testing, foco y drag and drop.
+# Internal test tools. They are disabled by default. Nodes are drawn over the
+# terminal in logical pixels and participate in hit testing, focus, and
+# drag-and-drop.
 [testing_tools.scene]
 enabled = false
 
-# Un underlay se dibuja detrás del texto de terminal y de todos los overlays.
+# An underlay is drawn behind terminal text and every overlay.
 # [[testing_tools.scene.nodes]]
 # id = "underlay"
 # x = 24.0
@@ -70,7 +69,7 @@ enabled = false
 # color = "#F97316"
 # opacity = 0.85
 # z_index = 0
-# layer = "overlay" # Sólo raíces: "underlay" o "overlay".
+# layer = "overlay" # Roots only: "underlay" or "overlay".
 # clip_children = true
 
 # [[testing_tools.scene.nodes]]
@@ -83,7 +82,7 @@ enabled = false
 # opacity = 0.85
 # z_index = 0
 
-# Para probar clipping, un hijo usa coordenadas locales respecto de su padre.
+# To test clipping, a child uses local coordinates relative to its parent.
 # [[testing_tools.scene.nodes]]
 # id = "clipped-child"
 # parent = "source"
