@@ -460,6 +460,11 @@ impl WindowState {
         self.background.resize(&self.queue, &self.surface_config);
         self.center_splash();
         self.sync_terminal_text(false);
+        self.clp_server.broadcast_resize(
+            self.surface_config.width,
+            self.surface_config.height,
+            self.scale_factor,
+        );
         self.window.request_redraw();
     }
 
@@ -537,6 +542,9 @@ impl WindowState {
                         &mut self.textures,
                     ) {
                         Ok(result) => {
+                            for event in self.program_scene_resources.drain_overlap_events() {
+                                self.enqueue_event(EngineEvent::Scene(event));
+                            }
                             scene_changed = true;
                             HostCommandResponse::Success(result)
                         }
@@ -555,6 +563,14 @@ impl WindowState {
                     );
                     scene_changed = true;
                 }
+                HostAction::SessionStarted { session_id } => {
+                    self.clp_server.activate_session(
+                        session_id,
+                        self.surface_config.width,
+                        self.surface_config.height,
+                        self.scale_factor,
+                    );
+                }
             }
         }
         if scene_changed {
@@ -565,6 +581,21 @@ impl WindowState {
 
     fn enqueue_event(&mut self, event: EngineEvent) {
         self.diagnostics.record_event(&event, Instant::now());
+        match &event {
+            EngineEvent::Scene(scene_event) => {
+                self.clp_server
+                    .broadcast_scene_event(scene_event, |session_id, node| {
+                        self.program_scene_resources
+                            .node_handle_for_session(session_id, node)
+                    });
+            }
+            EngineEvent::Pointer(_) | EngineEvent::Scroll(_) => {
+                if let Some(session_id) = self.focused_program_session() {
+                    self.clp_server.send_raw_input_event(session_id, &event);
+                }
+            }
+            _ => self.clp_server.broadcast_event(&event),
+        }
         if self.runtime.enqueue_event(event) {
             self.window.request_redraw();
         }
@@ -605,6 +636,12 @@ impl WindowState {
         }
     }
 
+    fn focused_program_session(&self) -> Option<chymeral::protocol::SessionId> {
+        self.interaction
+            .focused_node()
+            .and_then(|node| self.program_scene_resources.session_for_node(node))
+    }
+
     fn handle_key_event(&mut self, event: EngineKeyEvent) {
         let was_active = self.diagnostics.is_active();
         if self
@@ -617,21 +654,43 @@ impl WindowState {
             self.window.request_redraw();
             return;
         }
+        if let Some(session_id) = self.focused_program_session() {
+            self.diagnostics
+                .record_event(&EngineEvent::Key(event.clone()), Instant::now());
+            self.clp_server.send_keyboard_event(session_id, &event);
+            self.window.request_redraw();
+            return;
+        }
         self.enqueue_event(EngineEvent::Key(event));
     }
 
     fn run_runtime_frame(&mut self, now: Instant) -> Result<()> {
+        let metrics = self.runtime.metrics();
         self.runtime.run_frame(now)?;
+        self.publish_runtime_timing(metrics);
         self.diagnostics.record_metrics(self.runtime.metrics(), now);
         self.flush_runtime_input();
         Ok(())
     }
 
     fn run_runtime_update(&mut self, now: Instant) -> Result<()> {
+        let metrics = self.runtime.metrics();
         self.runtime.run_update(now)?;
+        self.publish_runtime_timing(metrics);
         self.diagnostics.record_metrics(self.runtime.metrics(), now);
         self.flush_runtime_input();
         Ok(())
+    }
+
+    fn publish_runtime_timing(&self, previous: chymeral::runtime::RuntimeMetrics) {
+        let metrics = self.runtime.metrics();
+        for _ in previous.tick_count..metrics.tick_count {
+            self.clp_server.broadcast_tick(RUNTIME_TICK_INTERVAL);
+        }
+        if metrics.frame_count > previous.frame_count {
+            self.clp_server
+                .broadcast_frame(metrics.last_frame_dt.unwrap_or_default());
+        }
     }
 
     fn flush_runtime_input(&mut self) {
@@ -1029,7 +1088,8 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
         ProgramSceneError::TextureInUse(_) => "texture_in_use",
         ProgramSceneError::TextureLimitExceeded { .. }
         | ProgramSceneError::SessionTextureLimitExceeded { .. }
-        | ProgramSceneError::TextureDimensionLimitExceeded { .. } => "resource_limit",
+        | ProgramSceneError::TextureDimensionLimitExceeded { .. }
+        | ProgramSceneError::OverlapNodeLimitExceeded { .. } => "resource_limit",
         ProgramSceneError::Geometry(_)
         | ProgramSceneError::Image(_)
         | ProgramSceneError::Texture(_) => "invalid_argument",

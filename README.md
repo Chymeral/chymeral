@@ -350,13 +350,7 @@ enum EngineEvent {
     Pointer(PointerEvent),
     Scene(SceneEvent),
 
-    FileHover(FileEvent),
-    FileDrop(FileEvent),
-
     Focus(FocusEvent),
-
-    CollisionEnter(CollisionEvent),
-    CollisionLeave(CollisionEvent),
 
     Terminal(TerminalEvent),
 
@@ -552,6 +546,13 @@ todos los nodos visibles que se superponen con un rectángulo, de frente a fondo
 Ambas consultas usan los bounds mundiales y el mismo orden determinista de
 pintura del scene graph.
 
+M6 ofrece las consultas geométricas base. M13.2 las eleva para programas CLP
+como overlap rectangular opt-in por sesión, con consulta de estado y
+transiciones de entrada/salida. No es un sistema de física: cuerpos, respuesta
+de colisión y colisión barrida siguen siendo trabajo futuro. `hit_test_rect`
+sigue siendo una consulta interna del core; el contrato público de overlap no
+expone consultas globales de la escena.
+
 Un nodo no requiere contenido ni una marca de interactividad para participar:
 M6 sólo resuelve geometría. Por defecto, un hijo puede detectarse fuera de los
 bounds de su padre. M9 permite limitar explícitamente esa herencia visual.
@@ -687,9 +688,10 @@ es un contrato de mensajes entre procesos que evita exponer memoria, tipos de
 Rust o dependencias gráficas del host.
 
 M10 implementa dentro del core el primer contrato de CLP y M11 lo conecta a un
-transporte local real. M12 eleva el protocolo a la versión `1.1` y añade el
-primer conjunto de comandos: escena, rectángulos sólidos, imágenes RGBA8 y
-recursos opacos aislados por sesión. Todavía no entrega eventos ni tiempo.
+transporte local real. M12 elevó el protocolo a `1.1` con comandos de escena y
+recursos RGBA8 aislados. M13 lo elevó a `1.2` y entrega entrada, tiempo,
+redimensionamiento y cierre al programa conectado. M13.2 lo eleva a `1.3` con
+consulta y transiciones de overlap geométrico opcionales.
 
 CLP tendrá dos direcciones lógicas en una sesión bidireccional:
 
@@ -721,7 +723,7 @@ CLP sigue separado de ese transporte para permitir adaptadores futuros sin
 alterar la API, pero `stdio`, red, memoria compartida, WASM y carga de código
 nativo quedan fuera de este alcance inicial.
 
-### Transporte CLP v1.1 (M11–M12)
+### Transporte CLP v1.3 (M11–M13.2)
 
 El flujo de bytes está compuesto por frames con una longitud `u32` big-endian,
 un discriminante de un byte y su payload. `J` identifica un objeto JSON UTF-8;
@@ -731,8 +733,8 @@ precisión en lenguajes cuyo tipo numérico no representa todos los enteros de
 64 bits.
 
 La primera frame debe ser `hello` y debe llegar dentro de cinco segundos. Lleva
-la versión `{ "major": 1, "minor": 1 }`, el token heredado y la lista de
-capacidades solicitadas (`scene`, `resources`, `input`, `timing`). Tras validar
+la versión `{ "major": 1, "minor": 3 }`, el token heredado y la lista de
+capacidades solicitadas (`scene`, `resources`, `input`, `timing`, `overlap`). Tras validar
 el token y negociar capacidades, la sesión sigue exactamente este orden:
 
 ```text
@@ -743,6 +745,11 @@ Chymeral → start
 programa → started
           running
 ```
+
+El host acepta el mismo major y un minor no superior al suyo; `init` devuelve
+la versión menor negociada. Una sesión `1.2` sigue funcionando contra un host
+`1.3`, pero nunca recibe ni puede invocar la capacidad `overlap`; un minor
+futuro o un major distinto se rechazan.
 
 `init` contiene el id de sesión, la versión concedida, capacidades concedidas y
 un contexto inicial. M11 entrega por ahora un contexto vacío: el lanzador y los
@@ -755,15 +762,115 @@ afectar a las demás.
 Como límite de recursos, una ventana admite hasta 16 conexiones que aún no han
 completado `started`; las excedentes se cierran inmediatamente sin crear una
 sesión o se rechazan por capacidad antes de establecer el stream. Las sesiones
-que ya están ejecutándose no comparten ese límite. Al
-cerrar Chymeral, el host deja de aceptar conexiones, entrega `closed` con razón
-`host_shutdown` a cada cliente que siga conectado y espera la limpieza de sus
-handlers antes de liberar el endpoint.
+que ya están ejecutándose no comparten ese límite. M13 añade además una cola
+host→programa acotada a 64 mensajes por sesión. `tick`, `frame`, movimientos
+de puntero, `DragMove` y `Terminal::OutputAvailable` son continuos: si ya hay
+una muestra pendiente de la misma clase, el host conserva sólo la última y la
+coloca después de toda entrada discreta pendiente. Si debe omitir una muestra
+continua, emite `delivery_gap` con sus categorías afectadas antes de reanudar
+la entrega. Una entrada discreta o `resize` desplaza una muestra continua
+pendiente cuando es posible; si la cola contiene únicamente entradas discretas,
+Chymeral termina sólo esa sesión con `host_overloaded` en vez de perder una
+tecla, clic o cierre silenciosamente.
 
-M11–M12 no inician programas, no interpretan sus argumentos, no exponen el
-token como API de alto nivel y no entregan aún `Event`, `Tick` ni `Frame`. Un
-SDK de M14 encapsulará estos detalles; hasta entonces CLP es un contrato crudo
-probado, no una interfaz de usuario final.
+Para observabilidad del host, `ClpServer::notification_metrics()` ofrece una
+instantánea acumulada de muestras coalescidas, muestras continuas descartadas,
+`delivery_gap` emitidos y sesiones terminadas por sobrecarga. Son métricas
+internas del host, no mensajes CLP ni una API de SDK; permiten detectar presión
+de transporte sin exponer el endpoint, token o contenido de entrada.
+
+Al entrar en ejecución, el host activa la sesión en el hilo de la ventana. Si
+tiene `input`, su primera notificación siempre es `resize`; los eventos y los
+callbacks de tiempo se suprimen hasta entonces. Después de `started`, el
+programa puede reemplazar sus suscripciones con:
+
+```json
+{ "type": "subscribe", "subscriptions": ["raw_input", "terminal", "timing"] }
+```
+
+El host confirma el conjunto efectivo con `subscribed`. `raw_input` y
+`terminal` exigen la capacidad `input`; `timing`, la capacidad `timing`. Una
+suscripción no concedida recibe `error { code: "capability_denied" }` y no
+altera el conjunto anterior.
+
+La entrega se separa deliberadamente por alcance:
+
+```text
+input sin suscripción → resize y foco de ventana
+input + escena         → eventos de los nodos que posee la sesión
+input + foco de nodo   → teclado; sin nodo de programa enfocado, va al terminal
+input + raw_input      → puntero y scroll crudos del programa enfocado;
+                         Custom se difunde a las sesiones suscritas
+input + terminal       → estado del terminal
+timing + timing        → tick y frame
+```
+
+El window manager decide qué ventana Chymeral recibe entrada. Dentro de esa
+única ventana activa, un clic primario sobre un nodo de programa actualiza el
+foco de escena y desvía el teclado a la sesión propietaria; un clic en espacio
+vacío devuelve el teclado al terminal. Los eventos de escena no requieren una
+suscripción adicional: son ya dirigidos por ownership.
+
+`event` serializa todos los tipos canónicos ya existentes: `key`, puntero,
+scroll, foco de ventana, terminal y eventos personalizados; conserva teclas,
+modificadores y coordenadas lógicas sin filtrar tipos de `winit`. También
+transporta el canal derivado de escena: `PointerEnter`, `PointerLeave`,
+`PointerMove`, `PointerPress`, `PointerRelease`, `FocusGained`, `FocusLost`,
+`DragStart`, `DragEnter`, `DragLeave`, `DragMove`, `Drop`, `DragEnd` y
+`DragCancel`, `OverlapEnter` y `OverlapLeave`.
+
+Los eventos de escena usan `node-N`, nunca `NodeId`. Un programa recibe sólo
+los handles que posee. Si un drag conecta nodos de sesiones diferentes, cada
+sesión recibe el evento aplicable con su propio handle y el extremo ajeno como
+`null`; así puede reaccionar sin obtener una referencia a recursos de otro
+programa. `resize` se entrega primero al activarse una sesión con `input` y
+tras cada redimensionamiento efectivo; incluye dimensiones físicas,
+dimensiones lógicas y `scale_factor`.
+
+La capacidad `overlap` añade geometría para programas sin mouse —por ejemplo,
+juegos controlados por teclado— sin introducir física. Un nodo declara
+`overlap_enabled: true` al crearse o mediante `update_node`; el valor por
+defecto es `false` y una sesión puede habilitar como máximo 1024 nodos. Después
+de cada creación, `update_node` o `reparent` exitosos, Chymeral compara los
+rectángulos lógicos mundiales de los nodos habilitados de esa sesión y entrega
+`event { kind: "scene", event: { kind: "overlap_enter", first, second } }`
+o su variante `overlap_leave` al cruzar una transición. No intervienen puntero,
+foco, visibilidad, contenido, clipping ni `z_index`; un nodo invisible puede
+ser un collider. Los rectángulos son semiabiertos, por lo que tocar sólo un
+borde no es overlap. No hay comparación ni filtración de handles entre
+sesiones.
+
+`query_overlaps` recibe cualquier `node-N` propio y responde
+`result { kind: "overlaps", overlapping, nodes }`. `nodes` contiene, en orden
+determinista, los nodos propios habilitados que intersectan el rectángulo
+mundial actual del nodo consultado; el nodo consultado no necesita estar
+habilitado. Un programa puede consultar inmediatamente después de mover un
+nodo y restaurar su última posición válida si hay contactos. Los eventos de
+overlap son discretos, no requieren suscripción y sólo se entregan a una
+sesión que negoció `overlap`; nunca se coalescen silenciosamente. Eliminar un
+nodo o cerrar su sesión cancela sus pares sin emitir `overlap_leave`, pues el
+programa ya conoce la eliminación o el cierre. Crear o actualizar
+`overlap_enabled`, y ejecutar `query_overlaps`, exigen las capacidades `scene`
+y `overlap`; sin ellas el comando devuelve `capability_denied`.
+
+`tick` y `frame` respetan el orden del scheduler de M2: un frame puede seguir
+a cero o varios ticks. Ambos llevan `dt_ns` como string decimal para conservar
+precisión en todos los lenguajes. El host conserva el orden de las
+notificaciones discretas de cada sesión y no deja que una muestra continua
+coalescida las adelante. Si una sesión lenta pierde un flujo continuo, antes
+de reanudarlo recibe `delivery_gap` con las categorías afectadas (`raw_input`,
+`scene`, `terminal`, `timing`); debe reconstruir el estado que dependa de ese
+flujo. Los eventos discretos y `resize` nunca se descartan de forma
+silenciosa: si no caben, termina sólo esa sesión con `host_overloaded`.
+
+Al apagar el host, cada programa en ejecución recibe primero
+`closing { reason: host_shutdown }`. Puede responder `close` durante una
+ventana de gracia de 250 ms; entonces, o al expirar la ventana, Chymeral envía
+el `closed` terminal con la misma razón y limpia los recursos de esa sesión.
+Los cierres iniciados por el cliente, por fallo o por violación de protocolo
+siguen entregando directamente su `closed` terminal. M13 no inicia programas,
+no interpreta sus argumentos ni expone un SDK: M14 encapsulará este contrato
+crudo y probado.
 
 ### Comandos de escena M12
 
@@ -780,8 +887,9 @@ Chymeral → { type: "command_error", request_id, code, message }
 ```
 
 Las operaciones de escena son `create_root`, `create_child`, `update_node`,
-`set_content`, `reparent` y `remove_node`. Una creación recibe propiedades
-lógicas `{ x, y, width, height, visible, clip_children, z_index }`; las
+`set_content`, `reparent`, `remove_node` y `query_overlaps`. Una creación recibe
+propiedades lógicas `{ x, y, width, height, visible, clip_children, z_index,
+overlap_enabled }`; las
 actualizaciones son parciales. Los hijos expresan coordenadas locales como el
 scene graph existente. Un root puede declarar `layer: "underlay"` u
 `"overlay"`; si se omite, usa `overlay`.
@@ -1051,7 +1159,7 @@ sobre ellos hasta expirar.
 
 ## Orden aproximado de desarrollo
 
-M1–M12 están completados. `testing_tools.scene` y el `Program` de M2 son
+M1–M13.2 están completados. `testing_tools.scene` y el `Program` de M2 son
 infraestructura interna de prueba; no son un mecanismo de ejecución de
 aplicaciones ni una API pública.
 
@@ -1068,7 +1176,8 @@ M9  clipping/layers + jerarquía de pruebas
 M10 contrato de programa y tipos internos de CLP ✓
 M11 sesión local CLP: transporte, handshake, Init/Start y limpieza ✓
 M12 comandos de escena y recursos con ownership por programa ✓
-M13 entrega de Event/Tick/Frame y ciclo de cierre de programa
+M13 entrega de Event/Tick/Frame, Resize y ciclo de cierre de programa ✓
+M13.2 overlap geométrico opcional por sesión, consulta y transiciones ✓
 M14 SDK de referencia, pruebas de conformidad y primer programa de prueba
 M15 manifiesto mínimo de programa, capacidades y compatibilidad de paquete
 M16 IDL sólo si más de un SDK justifica generación de bindings
@@ -1078,7 +1187,7 @@ El lenguaje del primer SDK o programa de prueba no condicionará CLP. Python,
 Lua, JavaScript, C#, Go, Rust, C, C++ y Zig son candidatos equivalentes;
 también será válida una implementación independiente del protocolo.
 
-### Estado de M10, M11 y M12
+### Estado de M10, M11, M12 y M13
 
 M10 define y prueba dentro del core el contrato que un programa externo usará:
 versión de CLP, identidad y capacidades de sesión, mensajes de handshake,
@@ -1093,14 +1202,26 @@ entorno en éste; por herencia, también llegan a los programas que ejecute. Sus
 tests recorren el framing, token inválido, negociación, el handshake completo,
 el cierre, `HostShutdown`, el límite de handshakes y la limpieza al desconectar.
 Una prueba de integración inicia además un proceso hijo independiente que sólo
-recibe las variables heredadas e implementa el framing CLP crudo. M11 no inicia
-programas por sí mismo, no expone comandos de escena a aplicaciones y no crea
-SDKs. M12 añade comandos seriales de escena, rectángulos sólidos, imágenes de
-texturas RGBA8 transferidas en fragmentos binarios, validación de capacidad y
-propiedad, límites de memoria y limpieza de recursos al terminar una sesión.
-Sus pruebas cubren ownership, limpieza, intento de destrucción de una textura
-en uso y el recorrido real de un upload binario hacia el hilo de host. Los
-eventos y tiempo corresponden a M13; los paquetes y SDKs, a M14–M15.
+recibe las variables heredadas e implementa el framing CLP crudo; recorre
+activación, `resize`, suscripciones, eventos, `tick`, `frame` y cierre. M11 no
+inicia programas por sí mismo, no expone comandos de escena a aplicaciones y
+no crea SDKs. M12 añade comandos seriales de escena, rectángulos sólidos,
+imágenes de texturas RGBA8 transferidas en fragmentos binarios, validación de
+capacidad y propiedad, límites de memoria y limpieza de recursos al terminar
+una sesión. Sus pruebas cubren ownership, limpieza, intento de destrucción de
+una textura en uso y el recorrido real de un upload binario hacia el hilo de
+host. M13
+añade una cola host→programa aislada, entrada canónica serializada, callbacks
+de tick/frame, resize inicial y posterior, suscripciones explícitas para
+flujos optativos, enrutamiento de teclado por foco de nodo, recuperación de
+flujos continuos perdidos y el cierre anunciado durante el apagado. Los
+paquetes y SDKs corresponden a M14–M15. El endurecimiento final de M13 prueba
+la coalescencia y recuperación desde un proceso heredado independiente tanto
+en sockets Unix como en named pipes de Windows; también expone métricas de
+presión del host sin convertirlas en parte del protocolo público. M13.2 añade
+overlap de rectángulos lógicos entre nodos propios que el programa habilita
+explícitamente; no depende del mouse, no revela otros programas y se consulta
+con el mismo contrato serial de comandos.
 
 ## Principios que deben preservarse
 

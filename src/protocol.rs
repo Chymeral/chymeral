@@ -4,7 +4,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
+pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion {
@@ -38,6 +38,7 @@ pub enum Capability {
     Resources,
     Input,
     Timing,
+    Overlap,
 }
 
 impl Capability {
@@ -47,6 +48,7 @@ impl Capability {
             Self::Resources => 1 << 1,
             Self::Input => 1 << 2,
             Self::Timing => 1 << 3,
+            Self::Overlap => 1 << 4,
         }
     }
 }
@@ -60,7 +62,8 @@ impl CapabilitySet {
         Capability::Scene.bit()
             | Capability::Resources.bit()
             | Capability::Input.bit()
-            | Capability::Timing.bit(),
+            | Capability::Timing.bit()
+            | Capability::Overlap.bit(),
     );
 
     pub const fn from_capabilities(capabilities: &[Capability]) -> Self {
@@ -191,6 +194,7 @@ pub enum SessionCloseReason {
     ClientRequested,
     ProgramFault(ProgramFault),
     HostShutdown,
+    HostOverloaded,
     ProtocolViolation,
     TransportDisconnected,
 }
@@ -374,7 +378,9 @@ impl SessionManager {
         hello: ClientHello,
         context: ProgramInitContext,
     ) -> Result<(SessionId, HostMessage), ProtocolError> {
-        if hello.protocol_version != CLP_PROTOCOL_VERSION {
+        if hello.protocol_version.major() != CLP_PROTOCOL_VERSION.major()
+            || hello.protocol_version.minor() > CLP_PROTOCOL_VERSION.minor()
+        {
             return Err(ProtocolError::UnsupportedVersion {
                 received: hello.protocol_version,
             });
@@ -384,6 +390,16 @@ impl SessionManager {
         let capabilities = hello
             .requested_capabilities
             .intersection(self.available_capabilities);
+        let capabilities = if hello.protocol_version.minor() < 3 {
+            capabilities.intersection(CapabilitySet::from_capabilities(&[
+                Capability::Scene,
+                Capability::Resources,
+                Capability::Input,
+                Capability::Timing,
+            ]))
+        } else {
+            capabilities
+        };
         self.sessions.insert(
             session_id,
             Session {
@@ -395,7 +411,7 @@ impl SessionManager {
         Ok((
             session_id,
             HostMessage::Init(ProgramInit {
-                protocol_version: CLP_PROTOCOL_VERSION,
+                protocol_version: hello.protocol_version,
                 session_id,
                 granted_capabilities: capabilities,
                 context,
@@ -614,6 +630,42 @@ mod tests {
                 .contains(Capability::Scene)
         );
         assert_eq!(manager.session_count(), 1);
+    }
+
+    #[test]
+    fn negotiates_the_previous_minor_without_granting_new_capabilities() {
+        let mut manager = SessionManager::default();
+        let version = ProtocolVersion::new(1, 2);
+        let (session_id, message) = manager
+            .accept(
+                ClientHello {
+                    protocol_version: version,
+                    requested_capabilities: CapabilitySet::ALL,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            message,
+            HostMessage::Init(ProgramInit {
+                protocol_version: version,
+                session_id,
+                granted_capabilities: CapabilitySet::from_capabilities(&[
+                    Capability::Scene,
+                    Capability::Resources,
+                    Capability::Input,
+                    Capability::Timing,
+                ]),
+                context: ProgramInitContext::default(),
+            })
+        );
+        assert!(
+            !manager
+                .session_capabilities(session_id)
+                .unwrap()
+                .contains(Capability::Overlap)
+        );
     }
 
     #[test]

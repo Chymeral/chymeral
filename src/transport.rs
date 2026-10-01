@@ -1,8 +1,9 @@
 use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Read, Write},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
@@ -23,13 +24,17 @@ use crate::protocol::{
     ProgramInitContext, ProgramPhase, ProtocolError, ProtocolVersion, SessionCloseReason,
     SessionId, SessionManager,
 };
+use crate::runtime::{
+    EngineEvent, FocusEvent, Key, KeyState, Modifiers, NamedKey, PointerButton, PointerEvent,
+    SceneEvent, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
+};
 use crate::{
     program_scene::{
         ContentInput, MAX_TEXTURE_BYTES, NodeHandle, NodePropertiesInput, NodePropertiesPatch,
         SceneCommand, SceneCommandResult, TextureHandle,
     },
     resources::rgba8_byte_len,
-    scene::SceneLayer,
+    scene::{NodeId, SceneLayer},
 };
 
 pub const CLP_ENDPOINT_ENV: &str = "CHYMERAL_CLP_ENDPOINT";
@@ -37,10 +42,15 @@ pub const CLP_TOKEN_ENV: &str = "CHYMERAL_CLP_TOKEN";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_PENDING_HANDSHAKES: usize = 16;
 pub const MAX_PENDING_HOST_ACTIONS: usize = 64;
+pub const MAX_PENDING_HOST_NOTIFICATIONS: usize = 64;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ENDPOINT_BIND_ATTEMPTS: usize = 8;
+const MAX_HOST_NOTIFICATIONS_PER_ITERATION: usize = 4;
+const WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct SessionEnvironment {
@@ -72,11 +82,14 @@ pub struct ClpServer {
     control: Arc<ServerControl>,
     host_actions: Mutex<Receiver<HostAction>>,
     cleanup_actions: Mutex<Receiver<SessionId>>,
+    lifecycle_actions: Mutex<Receiver<SessionId>>,
+    notifications: Arc<SessionNotifications>,
 }
 
 pub enum HostAction {
     Command(HostCommandRequest),
     Cleanup { session_id: SessionId },
+    SessionStarted { session_id: SessionId },
 }
 
 pub struct HostCommandRequest {
@@ -118,7 +131,395 @@ pub enum HostCommandResponse {
 struct HostActionBroker {
     sender: SyncSender<HostAction>,
     cleanup_sender: mpsc::Sender<SessionId>,
+    lifecycle_sender: mpsc::Sender<SessionId>,
     wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[derive(Clone)]
+enum HostNotification {
+    Event(WireEvent),
+    Tick {
+        dt_ns: String,
+    },
+    Frame {
+        dt_ns: String,
+    },
+    Resize {
+        physical_width: u32,
+        physical_height: u32,
+        logical_width: f64,
+        logical_height: f64,
+        scale_factor: f64,
+    },
+    DeliveryGap {
+        categories: BTreeSet<DeliveryCategory>,
+    },
+}
+
+impl HostNotification {
+    const fn delivery_category(&self) -> Option<DeliveryCategory> {
+        match self {
+            Self::Event(event) => event.delivery_category(),
+            Self::Tick { .. } | Self::Frame { .. } => Some(DeliveryCategory::Timing),
+            Self::Resize { .. } | Self::DeliveryGap { .. } => None,
+        }
+    }
+
+    const fn coalescing_class(&self) -> Option<NotificationCoalescingClass> {
+        match self {
+            Self::Tick { .. } => Some(NotificationCoalescingClass::Tick),
+            Self::Frame { .. } => Some(NotificationCoalescingClass::Frame),
+            Self::Event(WireEvent::PointerMove { .. }) => {
+                Some(NotificationCoalescingClass::RawPointerMove)
+            }
+            Self::Event(WireEvent::Scene {
+                event: WireSceneEvent::PointerMove { .. },
+            }) => Some(NotificationCoalescingClass::ScenePointerMove),
+            Self::Event(WireEvent::Scene {
+                event: WireSceneEvent::DragMove { .. },
+            }) => Some(NotificationCoalescingClass::SceneDragMove),
+            Self::Event(WireEvent::Terminal {
+                state: WireTerminalState::OutputAvailable,
+            }) => Some(NotificationCoalescingClass::TerminalOutputAvailable),
+            Self::Event(_) | Self::Resize { .. } | Self::DeliveryGap { .. } => None,
+        }
+    }
+
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Event(_) => "event",
+            Self::Tick { .. } => "tick",
+            Self::Frame { .. } => "frame",
+            Self::Resize { .. } => "resize",
+            Self::DeliveryGap { .. } => "delivery_gap",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotificationCoalescingClass {
+    Tick,
+    Frame,
+    RawPointerMove,
+    ScenePointerMove,
+    SceneDragMove,
+    TerminalOutputAvailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DeliveryCategory {
+    RawInput,
+    Scene,
+    Terminal,
+    Timing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Subscription {
+    RawInput,
+    Terminal,
+    Timing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubscriptionError {
+    CapabilityDenied,
+    SessionUnavailable,
+}
+
+#[derive(Clone)]
+struct SessionNotificationSender {
+    capabilities: CapabilitySet,
+    queue: Arc<NotificationQueue>,
+    active: bool,
+    subscriptions: BTreeSet<Subscription>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClpNotificationMetrics {
+    pub coalesced_notifications: u64,
+    pub dropped_continuous_notifications: u64,
+    pub delivery_gaps_emitted: u64,
+    pub overloaded_sessions: u64,
+}
+
+#[derive(Default)]
+struct NotificationMetricCounters {
+    coalesced_notifications: AtomicU64,
+    dropped_continuous_notifications: AtomicU64,
+    delivery_gaps_emitted: AtomicU64,
+    overloaded_sessions: AtomicU64,
+}
+
+impl NotificationMetricCounters {
+    fn snapshot(&self) -> ClpNotificationMetrics {
+        ClpNotificationMetrics {
+            coalesced_notifications: self.coalesced_notifications.load(Ordering::Relaxed),
+            dropped_continuous_notifications: self
+                .dropped_continuous_notifications
+                .load(Ordering::Relaxed),
+            delivery_gaps_emitted: self.delivery_gaps_emitted.load(Ordering::Relaxed),
+            overloaded_sessions: self.overloaded_sessions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct NotificationQueue {
+    state: Mutex<NotificationQueueState>,
+    metrics: Arc<NotificationMetricCounters>,
+}
+
+#[derive(Default)]
+struct NotificationQueueState {
+    notifications: VecDeque<HostNotification>,
+    pending_gaps: BTreeSet<DeliveryCategory>,
+    overloaded: bool,
+}
+
+enum NotificationPoll {
+    Notification(HostNotification),
+    Overloaded,
+    Empty,
+}
+
+impl NotificationQueue {
+    fn new(metrics: Arc<NotificationMetricCounters>) -> Self {
+        Self {
+            state: Mutex::new(NotificationQueueState::default()),
+            metrics,
+        }
+    }
+
+    fn push(&self, notification: HostNotification) {
+        let mut state = self.lock_state();
+        if state.overloaded {
+            return;
+        }
+        if let Some(class) = notification.coalescing_class()
+            && let Some(index) = state
+                .notifications
+                .iter()
+                .rposition(|pending| pending.coalescing_class() == Some(class))
+        {
+            let replaced = state
+                .notifications
+                .remove(index)
+                .expect("the pending notification index must be valid");
+            Self::record_gap(&mut state.pending_gaps, replaced.delivery_category());
+            self.metrics
+                .coalesced_notifications
+                .fetch_add(1, Ordering::Relaxed);
+            state.notifications.push_back(notification);
+            return;
+        }
+
+        if state.notifications.len() < MAX_PENDING_HOST_NOTIFICATIONS {
+            state.notifications.push_back(notification);
+            return;
+        }
+
+        if notification.coalescing_class().is_none()
+            && let Some(index) = state
+                .notifications
+                .iter()
+                .position(|pending| pending.coalescing_class().is_some())
+        {
+            let replaced = state
+                .notifications
+                .remove(index)
+                .expect("the pending notification index must be valid");
+            Self::record_gap(&mut state.pending_gaps, replaced.delivery_category());
+            self.metrics
+                .dropped_continuous_notifications
+                .fetch_add(1, Ordering::Relaxed);
+            state.notifications.push_back(notification);
+            return;
+        }
+
+        if notification.coalescing_class().is_some() {
+            Self::record_gap(&mut state.pending_gaps, notification.delivery_category());
+            self.metrics
+                .dropped_continuous_notifications
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        state.overloaded = true;
+        self.metrics
+            .overloaded_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn try_pop(&self) -> NotificationPoll {
+        let mut state = self.lock_state();
+        if state.overloaded {
+            return NotificationPoll::Overloaded;
+        }
+        if !state.pending_gaps.is_empty() {
+            self.metrics
+                .delivery_gaps_emitted
+                .fetch_add(1, Ordering::Relaxed);
+            return NotificationPoll::Notification(HostNotification::DeliveryGap {
+                categories: std::mem::take(&mut state.pending_gaps),
+            });
+        }
+        match state.notifications.pop_front() {
+            Some(notification) => NotificationPoll::Notification(notification),
+            None => NotificationPoll::Empty,
+        }
+    }
+
+    fn record_gap(
+        pending_gaps: &mut BTreeSet<DeliveryCategory>,
+        category: Option<DeliveryCategory>,
+    ) {
+        if let Some(category) = category {
+            pending_gaps.insert(category);
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, NotificationQueueState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionNotifications {
+    sessions: Mutex<BTreeMap<SessionId, SessionNotificationSender>>,
+    metrics: Arc<NotificationMetricCounters>,
+}
+
+impl SessionNotifications {
+    fn register(
+        &self,
+        session_id: SessionId,
+        capabilities: CapabilitySet,
+    ) -> Arc<NotificationQueue> {
+        let queue = Arc::new(NotificationQueue::new(Arc::clone(&self.metrics)));
+        let mut sessions = self.lock_sessions();
+        sessions.insert(
+            session_id,
+            SessionNotificationSender {
+                capabilities,
+                queue: Arc::clone(&queue),
+                active: false,
+                subscriptions: BTreeSet::new(),
+            },
+        );
+        queue
+    }
+
+    fn unregister(&self, session_id: SessionId) {
+        self.lock_sessions().remove(&session_id);
+    }
+
+    fn metrics(&self) -> ClpNotificationMetrics {
+        self.metrics.snapshot()
+    }
+
+    fn activate(&self, session_id: SessionId, initial_resize: HostNotification) -> bool {
+        let mut sessions = self.lock_sessions();
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return false;
+        };
+        if session.active {
+            return true;
+        }
+        if session.capabilities.contains(Capability::Input) {
+            Self::enqueue(session, initial_resize);
+        }
+        session.active = true;
+        true
+    }
+
+    fn set_subscriptions(
+        &self,
+        session_id: SessionId,
+        subscriptions: BTreeSet<Subscription>,
+    ) -> Result<BTreeSet<Subscription>, SubscriptionError> {
+        let mut sessions = self.lock_sessions();
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or(SubscriptionError::SessionUnavailable)?;
+        if subscriptions.iter().any(|subscription| {
+            let capability = match subscription {
+                Subscription::RawInput | Subscription::Terminal => Capability::Input,
+                Subscription::Timing => Capability::Timing,
+            };
+            !session.capabilities.contains(capability)
+        }) {
+            return Err(SubscriptionError::CapabilityDenied);
+        }
+        session.subscriptions = subscriptions;
+        Ok(session.subscriptions.clone())
+    }
+
+    fn broadcast_matching(
+        &self,
+        notification: HostNotification,
+        matches: impl Fn(&SessionNotificationSender) -> bool,
+    ) {
+        let mut sessions = self.lock_sessions();
+        for session in sessions.values_mut() {
+            if session.active && matches(session) {
+                Self::enqueue(session, notification.clone());
+            }
+        }
+    }
+
+    fn send_matching(
+        &self,
+        session_id: SessionId,
+        notification: HostNotification,
+        matches: impl Fn(&SessionNotificationSender) -> bool,
+    ) {
+        let mut sessions = self.lock_sessions();
+        if let Some(session) = sessions.get_mut(&session_id)
+            && session.active
+            && matches(session)
+        {
+            Self::enqueue(session, notification);
+        }
+    }
+
+    fn enqueue(session: &SessionNotificationSender, notification: HostNotification) {
+        session.queue.push(notification);
+    }
+
+    fn broadcast_scene(
+        &self,
+        event: &SceneEvent,
+        node_handle_for: impl Fn(SessionId, NodeId) -> Option<NodeHandle>,
+    ) {
+        let sessions = self.lock_sessions();
+        for (session_id, session) in sessions.iter() {
+            if !session.active {
+                continue;
+            }
+            let Some(event) = WireSceneEvent::from_scene_event(event, |node| {
+                node_handle_for(*session_id, node).map(|handle| handle.to_string())
+            }) else {
+                continue;
+            };
+            if !session.capabilities.contains(event.required_capability()) {
+                continue;
+            }
+            let notification = HostNotification::Event(WireEvent::Scene { event });
+            Self::enqueue(session, notification);
+        }
+    }
+
+    fn lock_sessions(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<SessionId, SessionNotificationSender>> {
+        match self.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 }
 
 impl ClpServer {
@@ -135,15 +536,19 @@ impl ClpServer {
         let manager = Arc::new(Mutex::new(SessionManager::new(available_capabilities)));
         let (host_action_sender, host_actions) = mpsc::sync_channel(MAX_PENDING_HOST_ACTIONS);
         let (cleanup_sender, cleanup_actions) = mpsc::channel();
+        let (lifecycle_sender, lifecycle_actions) = mpsc::channel();
+        let notifications = Arc::new(SessionNotifications::default());
         let broker = HostActionBroker {
             sender: host_action_sender,
             cleanup_sender,
+            lifecycle_sender,
             wake: Arc::new(wake),
         };
         let listener_control = Arc::clone(&control);
         let listener_manager = Arc::clone(&manager);
         let listener_environment = environment.clone();
         let listener_broker = broker.clone();
+        let listener_notifications = Arc::clone(&notifications);
         let listener_thread = thread::Builder::new()
             .name("chymeral-clp-listener".to_owned())
             .spawn(move || {
@@ -153,6 +558,7 @@ impl ClpServer {
                     listener_manager,
                     listener_control,
                     listener_broker,
+                    listener_notifications,
                 );
             })
             .context("could not start the CLP listener")?;
@@ -164,6 +570,8 @@ impl ClpServer {
             control,
             host_actions: Mutex::new(host_actions),
             cleanup_actions: Mutex::new(cleanup_actions),
+            lifecycle_actions: Mutex::new(lifecycle_actions),
+            notifications,
         })
     }
 
@@ -178,12 +586,130 @@ impl ClpServer {
             .map_err(|_| anyhow!("the CLP session manager is unavailable"))
     }
 
+    pub fn notification_metrics(&self) -> ClpNotificationMetrics {
+        self.notifications.metrics()
+    }
+
     pub fn shutdown(&mut self) {
         self.control.request_shutdown();
         if let Some(listener_thread) = self.listener_thread.take() {
             let _ = listener_thread.join();
         }
         self.control.wait_for_handlers();
+    }
+
+    pub fn activate_session(
+        &self,
+        session_id: SessionId,
+        physical_width: u32,
+        physical_height: u32,
+        scale_factor: f64,
+    ) {
+        let _ = self.notifications.activate(
+            session_id,
+            resize_notification(physical_width, physical_height, scale_factor),
+        );
+    }
+
+    pub fn broadcast_event(&self, event: &EngineEvent) {
+        let Some(event) = WireEvent::from_engine_event(event) else {
+            return;
+        };
+        match event {
+            WireEvent::Focus { .. } => self
+                .notifications
+                .broadcast_matching(HostNotification::Event(event), |session| {
+                    session.capabilities.contains(Capability::Input)
+                }),
+            WireEvent::Terminal { .. } => {
+                self.notifications
+                    .broadcast_matching(HostNotification::Event(event), |session| {
+                        session.capabilities.contains(Capability::Input)
+                            && session.subscriptions.contains(&Subscription::Terminal)
+                    })
+            }
+            WireEvent::Custom { .. } => {
+                self.notifications
+                    .broadcast_matching(HostNotification::Event(event), |session| {
+                        session.capabilities.contains(Capability::Input)
+                            && session.subscriptions.contains(&Subscription::RawInput)
+                    })
+            }
+            WireEvent::Key { .. }
+            | WireEvent::PointerMove { .. }
+            | WireEvent::PointerPress { .. }
+            | WireEvent::PointerRelease { .. }
+            | WireEvent::Scroll { .. }
+            | WireEvent::Scene { .. } => {}
+        }
+    }
+
+    pub fn send_keyboard_event(&self, session_id: SessionId, event: &crate::runtime::KeyEvent) {
+        let event = WireEvent::from_engine_event(&EngineEvent::Key(event.clone()))
+            .expect("key events are serializable CLP events");
+        self.notifications
+            .send_matching(session_id, HostNotification::Event(event), |session| {
+                session.capabilities.contains(Capability::Input)
+            });
+    }
+
+    pub fn send_raw_input_event(&self, session_id: SessionId, event: &EngineEvent) {
+        let Some(event) = WireEvent::from_engine_event(event) else {
+            return;
+        };
+        if !matches!(
+            event,
+            WireEvent::PointerMove { .. }
+                | WireEvent::PointerPress { .. }
+                | WireEvent::PointerRelease { .. }
+                | WireEvent::Scroll { .. }
+        ) {
+            return;
+        }
+        self.notifications
+            .send_matching(session_id, HostNotification::Event(event), |session| {
+                session.capabilities.contains(Capability::Input)
+                    && session.subscriptions.contains(&Subscription::RawInput)
+            });
+    }
+
+    pub fn broadcast_scene_event(
+        &self,
+        event: &SceneEvent,
+        node_handle_for: impl Fn(SessionId, NodeId) -> Option<NodeHandle>,
+    ) {
+        self.notifications.broadcast_scene(event, node_handle_for);
+    }
+
+    pub fn broadcast_tick(&self, dt: Duration) {
+        self.notifications.broadcast_matching(
+            HostNotification::Tick {
+                dt_ns: dt.as_nanos().to_string(),
+            },
+            |session| {
+                session.capabilities.contains(Capability::Timing)
+                    && session.subscriptions.contains(&Subscription::Timing)
+            },
+        );
+    }
+
+    pub fn broadcast_frame(&self, dt: Duration) {
+        self.notifications.broadcast_matching(
+            HostNotification::Frame {
+                dt_ns: dt.as_nanos().to_string(),
+            },
+            |session| {
+                session.capabilities.contains(Capability::Timing)
+                    && session.subscriptions.contains(&Subscription::Timing)
+            },
+        );
+    }
+
+    pub fn broadcast_resize(&self, physical_width: u32, physical_height: u32, scale_factor: f64) {
+        self.notifications.broadcast_matching(
+            resize_notification(physical_width, physical_height, scale_factor),
+            |session| session.capabilities.contains(Capability::Input),
+        );
     }
 
     pub fn drain_host_actions(&self) -> Vec<HostAction> {
@@ -196,6 +722,12 @@ impl ClpServer {
             actions.extend(
                 std::iter::from_fn(|| receiver.try_recv().ok())
                     .map(|session_id| HostAction::Cleanup { session_id }),
+            );
+        }
+        if let Ok(receiver) = self.lifecycle_actions.lock() {
+            actions.extend(
+                std::iter::from_fn(|| receiver.try_recv().ok())
+                    .map(|session_id| HostAction::SessionStarted { session_id }),
             );
         }
         actions
@@ -225,6 +757,27 @@ impl HostActionBroker {
         if self.cleanup_sender.send(session_id).is_ok() {
             (self.wake)();
         }
+    }
+
+    fn started(&self, session_id: SessionId) {
+        if self.lifecycle_sender.send(session_id).is_ok() {
+            (self.wake)();
+        }
+    }
+}
+
+fn resize_notification(
+    physical_width: u32,
+    physical_height: u32,
+    scale_factor: f64,
+) -> HostNotification {
+    let scale_factor = scale_factor.max(f64::MIN_POSITIVE);
+    HostNotification::Resize {
+        physical_width,
+        physical_height,
+        logical_width: f64::from(physical_width) / scale_factor,
+        logical_height: f64::from(physical_height) / scale_factor,
+        scale_factor,
     }
 }
 
@@ -375,6 +928,7 @@ fn serve_connections(
     manager: Arc<Mutex<SessionManager>>,
     control: Arc<ServerControl>,
     broker: HostActionBroker,
+    notifications: Arc<SessionNotifications>,
 ) {
     while !control.is_shutting_down() {
         match listener.accept() {
@@ -387,6 +941,7 @@ fn serve_connections(
                 let connection_manager = Arc::clone(&manager);
                 let connection_control = Arc::clone(&control);
                 let connection_broker = broker.clone();
+                let connection_notifications = Arc::clone(&notifications);
                 if let Err(error) = thread::Builder::new()
                     .name("chymeral-clp-client".to_owned())
                     .spawn(move || {
@@ -396,6 +951,7 @@ fn serve_connections(
                             connection_manager,
                             connection_control,
                             connection_broker,
+                            connection_notifications,
                             connection_guard,
                         );
                     })
@@ -423,6 +979,7 @@ fn handle_connection(
     manager: Arc<Mutex<SessionManager>>,
     control: Arc<ServerControl>,
     broker: HostActionBroker,
+    notifications: Arc<SessionNotifications>,
     mut connection_guard: ConnectionGuard,
 ) {
     if let Err(error) = stream.set_nonblocking(true) {
@@ -501,6 +1058,7 @@ fn handle_connection(
     let _cleanup = SessionCleanup {
         session_id,
         broker: broker.clone(),
+        notifications: Arc::clone(&notifications),
     };
 
     if let Err(error) = write_host_message(&mut stream, init_message) {
@@ -509,10 +1067,13 @@ fn handle_connection(
         return;
     }
 
-    let mut handshake_complete = false;
     loop {
-        let deadline = (!handshake_complete).then_some(handshake_deadline);
-        let frame = match read_client_frame(&mut stream, &mut frame_reader, deadline, &control) {
+        let frame = match read_client_frame(
+            &mut stream,
+            &mut frame_reader,
+            Some(handshake_deadline),
+            &control,
+        ) {
             Ok(FrameRead::Message(frame)) => frame,
             Ok(FrameRead::Disconnected) => {
                 close_disconnected_session(&manager, session_id);
@@ -534,100 +1095,28 @@ fn handle_connection(
         };
         if let WireFrame::Json(payload) = &frame
             && let Ok(WireClientMessage::Command {
-                request_id,
-                command,
+                request_id: _,
+                command: _,
             }) = serde_json::from_slice(payload)
         {
-            if !handshake_complete {
-                close_protocol_violation(
-                    &mut stream,
-                    &manager,
-                    session_id,
-                    "commands require a running session",
-                );
-                return;
-            }
-            if request_id.is_empty() {
-                let _ = write_error(
-                    &mut stream,
-                    "invalid_command",
-                    "a scene command requires a non-empty request_id",
-                );
-                continue;
-            }
-            if !wire_command_is_granted(&command, granted_capabilities) {
-                if let Err(error) = discard_scene_command_payload(
-                    &command,
-                    &mut stream,
-                    &mut frame_reader,
-                    &control,
-                ) {
-                    close_protocol_violation(&mut stream, &manager, session_id, &error.to_string());
-                    return;
-                }
-                let _ = write_command_response(
-                    &mut stream,
-                    &request_id,
-                    HostCommandResponse::Error {
-                        code: "capability_denied",
-                        message:
-                            "the command requires a capability that this session was not granted"
-                                .to_owned(),
-                    },
-                );
-                continue;
-            }
-            let command =
-                match read_scene_command(command, &mut stream, &mut frame_reader, &control) {
-                    Ok(command) => command,
-                    Err(error) => {
-                        let _ = write_error(&mut stream, "invalid_command", &error.to_string());
-                        continue;
-                    }
-                };
-            if !command_is_granted(&command, granted_capabilities) {
-                let _ = write_command_response(
-                    &mut stream,
-                    &request_id,
-                    HostCommandResponse::Error {
-                        code: "capability_denied",
-                        message:
-                            "the command requires a capability that this session was not granted"
-                                .to_owned(),
-                    },
-                );
-                continue;
-            }
-            let response =
-                dispatch_host_command(&broker, &control, session_id, request_id.clone(), command);
-            match response {
-                Ok(response) => {
-                    if write_command_response(&mut stream, &request_id, response).is_err() {
-                        close_disconnected_session(&manager, session_id);
-                        return;
-                    }
-                }
-                Err(_) if control.is_shutting_down() => {
-                    close_session(
-                        &mut stream,
-                        &manager,
-                        session_id,
-                        SessionCloseReason::HostShutdown,
-                    );
-                    return;
-                }
-                Err(error) => {
-                    let _ = write_command_response(
-                        &mut stream,
-                        &request_id,
-                        HostCommandResponse::Error {
-                            code: "host_unavailable",
-                            message: error.to_string(),
-                        },
-                    );
-                }
-            }
-            continue;
+            close_protocol_violation(
+                &mut stream,
+                &manager,
+                session_id,
+                "commands require a running session",
+            );
+            return;
+        }
+        if let WireFrame::Json(payload) = &frame
+            && let Ok(WireClientMessage::Subscribe { .. }) = serde_json::from_slice(payload)
+        {
+            close_protocol_violation(
+                &mut stream,
+                &manager,
+                session_id,
+                "subscriptions require a running session",
+            );
+            return;
         }
         let client_message = match client_message_from_frame(frame) {
             Ok(message) => message,
@@ -673,19 +1162,281 @@ fn handle_connection(
         }
 
         if client_started {
-            handshake_complete = true;
             connection_guard.complete_handshake();
+            let notification_queue = notifications.register(session_id, granted_capabilities);
+            broker.started(session_id);
+            run_running_session(
+                &mut stream,
+                &mut frame_reader,
+                &manager,
+                &control,
+                &broker,
+                &notifications,
+                RunningSession {
+                    session_id,
+                    granted_capabilities,
+                    notification_queue,
+                },
+            );
+            return;
         }
     }
+}
+
+struct RunningSession {
+    session_id: SessionId,
+    granted_capabilities: CapabilitySet,
+    notification_queue: Arc<NotificationQueue>,
+}
+
+fn run_running_session(
+    stream: &mut LocalSocketStream,
+    frame_reader: &mut FrameReader,
+    manager: &Arc<Mutex<SessionManager>>,
+    control: &Arc<ServerControl>,
+    broker: &HostActionBroker,
+    notifications: &SessionNotifications,
+    session: RunningSession,
+) {
+    let RunningSession {
+        session_id,
+        granted_capabilities,
+        notification_queue,
+    } = session;
+    loop {
+        if control.is_shutting_down() {
+            close_for_host_shutdown(stream, frame_reader, manager, session_id);
+            return;
+        }
+
+        let mut delivered_notifications = 0;
+        while delivered_notifications < MAX_HOST_NOTIFICATIONS_PER_ITERATION {
+            let notification = match notification_queue.try_pop() {
+                NotificationPoll::Notification(notification) => notification,
+                NotificationPoll::Overloaded => {
+                    close_session(
+                        stream,
+                        manager,
+                        session_id,
+                        SessionCloseReason::HostOverloaded,
+                    );
+                    return;
+                }
+                NotificationPoll::Empty => break,
+            };
+            if let Err(error) = write_host_notification(stream, session_id, notification) {
+                eprintln!(
+                    "Chymeral: could not deliver a CLP host notification for {session_id}: {error:#}"
+                );
+                close_disconnected_session(manager, session_id);
+                return;
+            }
+            delivered_notifications += 1;
+        }
+
+        let frame = match frame_reader.try_read_next_frame(stream, Some(control)) {
+            Ok(Some(FrameRead::Message(frame))) => frame,
+            Ok(Some(FrameRead::Disconnected)) => {
+                close_disconnected_session(manager, session_id);
+                return;
+            }
+            Ok(Some(FrameRead::Shutdown)) => {
+                close_for_host_shutdown(stream, frame_reader, manager, session_id);
+                return;
+            }
+            Ok(None) => {
+                thread::sleep(LISTENER_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => {
+                close_protocol_violation(stream, manager, session_id, &error.to_string());
+                return;
+            }
+        };
+
+        if let WireFrame::Json(payload) = &frame
+            && let Ok(WireClientMessage::Command {
+                request_id,
+                command,
+            }) = serde_json::from_slice(payload)
+        {
+            if request_id.is_empty() {
+                let _ = write_error(
+                    stream,
+                    "invalid_command",
+                    "a scene command requires a non-empty request_id",
+                );
+                continue;
+            }
+            if !wire_command_is_granted(&command, granted_capabilities) {
+                if let Err(error) =
+                    discard_scene_command_payload(&command, stream, frame_reader, control)
+                {
+                    close_protocol_violation(stream, manager, session_id, &error.to_string());
+                    return;
+                }
+                let _ = write_command_response(
+                    stream,
+                    &request_id,
+                    HostCommandResponse::Error {
+                        code: "capability_denied",
+                        message:
+                            "the command requires a capability that this session was not granted"
+                                .to_owned(),
+                    },
+                );
+                continue;
+            }
+            let command = match read_scene_command(command, stream, frame_reader, control) {
+                Ok(command) => command,
+                Err(error) => {
+                    let _ = write_error(stream, "invalid_command", &error.to_string());
+                    continue;
+                }
+            };
+            if !command_is_granted(&command, granted_capabilities) {
+                let _ = write_command_response(
+                    stream,
+                    &request_id,
+                    HostCommandResponse::Error {
+                        code: "capability_denied",
+                        message:
+                            "the command requires a capability that this session was not granted"
+                                .to_owned(),
+                    },
+                );
+                continue;
+            }
+            let response =
+                dispatch_host_command(broker, control, session_id, request_id.clone(), command);
+            match response {
+                Ok(response) => {
+                    if write_command_response(stream, &request_id, response).is_err() {
+                        close_disconnected_session(manager, session_id);
+                        return;
+                    }
+                }
+                Err(_) if control.is_shutting_down() => {
+                    close_for_host_shutdown(stream, frame_reader, manager, session_id);
+                    return;
+                }
+                Err(error) => {
+                    let _ = write_command_response(
+                        stream,
+                        &request_id,
+                        HostCommandResponse::Error {
+                            code: "host_unavailable",
+                            message: error.to_string(),
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+
+        if let WireFrame::Json(payload) = &frame
+            && let Ok(WireClientMessage::Subscribe { subscriptions }) =
+                serde_json::from_slice(payload)
+        {
+            let subscriptions = subscriptions
+                .into_iter()
+                .map(WireSubscription::into_subscription)
+                .collect();
+            match notifications.set_subscriptions(session_id, subscriptions) {
+                Ok(subscriptions) => {
+                    if write_subscribed(stream, session_id, subscriptions).is_err() {
+                        close_disconnected_session(manager, session_id);
+                        return;
+                    }
+                }
+                Err(SubscriptionError::CapabilityDenied) => {
+                    let _ = write_error(
+                        stream,
+                        "capability_denied",
+                        "one or more subscriptions require a capability that this session was not granted",
+                    );
+                }
+                Err(SubscriptionError::SessionUnavailable) => {
+                    close_disconnected_session(manager, session_id);
+                    return;
+                }
+            }
+            continue;
+        }
+
+        let client_message = match client_message_from_frame(frame) {
+            Ok(message) => message,
+            Err(error) => {
+                close_protocol_violation(stream, manager, session_id, &error.to_string());
+                return;
+            }
+        };
+        let response = match manager.lock() {
+            Ok(mut manager) => manager.receive(session_id, client_message),
+            Err(_) => {
+                close_protocol_violation(
+                    stream,
+                    manager,
+                    session_id,
+                    "the CLP session manager is unavailable",
+                );
+                return;
+            }
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                close_protocol_violation(stream, manager, session_id, &error.to_string());
+                return;
+            }
+        };
+        if let Some(response) = response {
+            let terminal = matches!(response, HostMessage::Closed { .. });
+            let write_result = write_host_message(stream, response);
+            if terminal {
+                remove_terminated_session(manager, session_id);
+                return;
+            }
+            if write_result.is_err() {
+                close_disconnected_session(manager, session_id);
+                return;
+            }
+        }
+    }
+}
+
+fn close_for_host_shutdown(
+    stream: &mut LocalSocketStream,
+    frame_reader: &mut FrameReader,
+    manager: &Arc<Mutex<SessionManager>>,
+    session_id: SessionId,
+) {
+    let _ = write_host_closing(stream, session_id, SessionCloseReason::HostShutdown);
+    let deadline = Instant::now() + CLOSE_GRACE_PERIOD;
+    while let Ok(FrameRead::Message(frame)) =
+        frame_reader.read_next_frame(stream, Some(deadline), None)
+    {
+        if matches!(client_message_from_frame(frame), Ok(ClientMessage::Close)) {
+            break;
+        }
+    }
+    close_session(
+        stream,
+        manager,
+        session_id,
+        SessionCloseReason::HostShutdown,
+    );
 }
 
 struct SessionCleanup {
     session_id: SessionId,
     broker: HostActionBroker,
+    notifications: Arc<SessionNotifications>,
 }
 
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
+        self.notifications.unregister(self.session_id);
         self.broker.cleanup(self.session_id);
     }
 }
@@ -783,6 +1534,9 @@ fn client_message_from_frame(frame: WireFrame) -> Result<ClientMessage> {
         }
         WireClientMessage::Close => Ok(ClientMessage::Close),
         WireClientMessage::Command { .. } => Err(anyhow!("a scene command was not handled")),
+        WireClientMessage::Subscribe { .. } => {
+            Err(anyhow!("a subscription update was not handled"))
+        }
     }
 }
 
@@ -806,6 +1560,50 @@ fn read_client_frame(
 
 fn write_host_message(stream: &mut LocalSocketStream, message: HostMessage) -> Result<()> {
     write_frame(stream, &WireHostMessage::from(message))
+}
+
+fn write_host_notification(
+    stream: &mut LocalSocketStream,
+    session_id: SessionId,
+    notification: HostNotification,
+) -> Result<()> {
+    let name = notification.name();
+    write_frame(
+        stream,
+        &WireHostMessage::from_notification(session_id, notification),
+    )
+    .with_context(|| format!("could not write the CLP {name} notification"))
+}
+
+fn write_subscribed(
+    stream: &mut LocalSocketStream,
+    session_id: SessionId,
+    subscriptions: BTreeSet<Subscription>,
+) -> Result<()> {
+    write_frame(
+        stream,
+        &WireHostMessage::Subscribed {
+            session_id: session_id.to_string(),
+            subscriptions: subscriptions
+                .into_iter()
+                .map(WireSubscription::from)
+                .collect(),
+        },
+    )
+}
+
+fn write_host_closing(
+    stream: &mut LocalSocketStream,
+    session_id: SessionId,
+    reason: SessionCloseReason,
+) -> Result<()> {
+    write_frame(
+        stream,
+        &WireHostMessage::Closing {
+            session_id: session_id.to_string(),
+            reason: reason.into(),
+        },
+    )
 }
 
 fn write_command_response(
@@ -931,10 +1729,19 @@ fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilityS
         | WireSceneCommand::SetContent { content, .. } => {
             capabilities.contains(Capability::Scene)
                 && (!content.uses_texture() || capabilities.contains(Capability::Resources))
+                && (!wire_command_uses_overlap(command)
+                    || capabilities.contains(Capability::Overlap))
         }
         WireSceneCommand::UpdateNode { .. }
         | WireSceneCommand::Reparent { .. }
-        | WireSceneCommand::RemoveNode { .. } => capabilities.contains(Capability::Scene),
+        | WireSceneCommand::RemoveNode { .. } => {
+            capabilities.contains(Capability::Scene)
+                && (!wire_command_uses_overlap(command)
+                    || capabilities.contains(Capability::Overlap))
+        }
+        WireSceneCommand::QueryOverlaps { .. } => {
+            capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Overlap)
+        }
     }
 }
 
@@ -951,6 +1758,10 @@ fn command_is_granted(command: &SceneCommand, capabilities: CapabilitySet) -> bo
         | SceneCommand::RemoveNode { .. } => {
             capabilities.contains(Capability::Scene)
                 && (!command_uses_texture(command) || capabilities.contains(Capability::Resources))
+                && (!command_uses_overlap(command) || capabilities.contains(Capability::Overlap))
+        }
+        SceneCommand::QueryOverlaps { .. } => {
+            capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Overlap)
         }
     }
 }
@@ -969,6 +1780,34 @@ fn command_uses_texture(command: &SceneCommand) -> bool {
             ..
         }
     )
+}
+
+fn wire_command_uses_overlap(command: &WireSceneCommand) -> bool {
+    match command {
+        WireSceneCommand::CreateRoot { properties, .. }
+        | WireSceneCommand::CreateChild { properties, .. } => properties.overlap_enabled,
+        WireSceneCommand::UpdateNode { properties, .. } => properties.overlap_enabled.is_some(),
+        WireSceneCommand::SetContent { .. }
+        | WireSceneCommand::Reparent { .. }
+        | WireSceneCommand::RemoveNode { .. }
+        | WireSceneCommand::QueryOverlaps { .. }
+        | WireSceneCommand::UploadTexture { .. }
+        | WireSceneCommand::DestroyTexture { .. } => false,
+    }
+}
+
+fn command_uses_overlap(command: &SceneCommand) -> bool {
+    match command {
+        SceneCommand::CreateRoot { properties, .. }
+        | SceneCommand::CreateChild { properties, .. } => properties.overlap_enabled,
+        SceneCommand::UpdateNode { properties, .. } => properties.overlap_enabled.is_some(),
+        SceneCommand::SetContent { .. }
+        | SceneCommand::Reparent { .. }
+        | SceneCommand::RemoveNode { .. }
+        | SceneCommand::QueryOverlaps { .. }
+        | SceneCommand::UploadTexture { .. }
+        | SceneCommand::DestroyTexture { .. } => false,
+    }
 }
 
 fn write_error(stream: &mut LocalSocketStream, code: &str, message: &str) -> Result<()> {
@@ -1065,6 +1904,45 @@ impl FrameReader {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if read_disconnected(&error) => return Ok(FrameRead::Disconnected),
                 Err(error) if read_would_block(&error) => wait_for_data(deadline)?,
+                Err(error) => return Err(error).context("could not read the CLP frame"),
+            }
+        }
+    }
+
+    fn try_read_next_frame(
+        &mut self,
+        stream: &mut LocalSocketStream,
+        control: Option<&ServerControl>,
+    ) -> Result<Option<FrameRead<WireFrame>>> {
+        if control.is_some_and(ServerControl::is_shutting_down) {
+            return Ok(Some(FrameRead::Shutdown));
+        }
+        if let Some(frame) = self.take_complete_frame()? {
+            return Ok(Some(FrameRead::Message(frame)));
+        }
+
+        let mut received = [0_u8; 8192];
+        loop {
+            match stream.read(&mut received) {
+                Ok(0) => {
+                    if empty_read_is_disconnected(stream)
+                        .context("could not inspect the CLP connection state")?
+                    {
+                        return Ok(Some(FrameRead::Disconnected));
+                    }
+                    return Ok(None);
+                }
+                Ok(count) => {
+                    self.bytes.extend_from_slice(&received[..count]);
+                    if let Some(frame) = self.take_complete_frame()? {
+                        return Ok(Some(FrameRead::Message(frame)));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if read_disconnected(&error) => {
+                    return Ok(Some(FrameRead::Disconnected));
+                }
+                Err(error) if read_would_block(&error) => return Ok(None),
                 Err(error) => return Err(error).context("could not read the CLP frame"),
             }
         }
@@ -1179,17 +2057,17 @@ fn read_would_block(error: &io::Error) -> bool {
     }
 }
 
-fn write_frame<T: Serialize>(stream: &mut LocalSocketStream, message: &T) -> Result<()> {
+fn write_frame<T: Serialize>(stream: &mut impl Write, message: &T) -> Result<()> {
     let payload = serde_json::to_vec(message).context("could not encode the CLP JSON message")?;
     write_raw_frame(stream, b'J', &payload)
 }
 
 #[cfg(test)]
-fn write_binary_frame(stream: &mut LocalSocketStream, payload: &[u8]) -> Result<()> {
+fn write_binary_frame(stream: &mut impl Write, payload: &[u8]) -> Result<()> {
     write_raw_frame(stream, b'B', payload)
 }
 
-fn write_raw_frame(stream: &mut LocalSocketStream, kind: u8, payload: &[u8]) -> Result<()> {
+fn write_raw_frame(stream: &mut impl Write, kind: u8, payload: &[u8]) -> Result<()> {
     let frame_length = payload
         .len()
         .checked_add(1)
@@ -1200,16 +2078,38 @@ fn write_raw_frame(stream: &mut LocalSocketStream, kind: u8, payload: &[u8]) -> 
         ));
     }
     let length = u32::try_from(frame_length).context("the CLP frame is too large")?;
-    stream
-        .write_all(&length.to_be_bytes())
+    write_all_nonblocking(stream, &length.to_be_bytes())
         .context("could not write the CLP frame length")?;
-    stream
-        .write_all(&[kind])
-        .context("could not write the CLP frame kind")?;
-    stream
-        .write_all(payload)
-        .context("could not write the CLP frame payload")?;
-    stream.flush().context("could not flush the CLP frame")
+    write_all_nonblocking(stream, &[kind]).context("could not write the CLP frame kind")?;
+    write_all_nonblocking(stream, payload).context("could not write the CLP frame payload")?;
+    Ok(())
+}
+
+fn write_all_nonblocking(stream: &mut impl Write, mut bytes: &[u8]) -> io::Result<()> {
+    let deadline = Instant::now() + WRITE_STALL_TIMEOUT;
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => wait_for_write_capacity(deadline)?,
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_write_capacity(deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_write_capacity(deadline: Instant) -> io::Result<()> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the CLP peer stopped reading output",
+        ));
+    };
+    thread::sleep(remaining.min(WRITE_RETRY_INTERVAL));
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1230,6 +2130,9 @@ enum WireClientMessage {
     Command {
         request_id: String,
         command: WireSceneCommand,
+    },
+    Subscribe {
+        subscriptions: Vec<WireSubscription>,
     },
 }
 
@@ -1260,6 +2163,9 @@ enum WireSceneCommand {
         parent: Option<String>,
     },
     RemoveNode {
+        node: String,
+    },
+    QueryOverlaps {
         node: String,
     },
     UploadTexture {
@@ -1320,6 +2226,9 @@ impl WireSceneCommand {
             Self::RemoveNode { node } => Ok(SceneCommand::RemoveNode {
                 node: parse_node_handle(&node)?,
             }),
+            Self::QueryOverlaps { node } => Ok(SceneCommand::QueryOverlaps {
+                node: parse_node_handle(&node)?,
+            }),
             Self::UploadTexture { width, height } => Ok(SceneCommand::UploadTexture {
                 width,
                 height,
@@ -1362,6 +2271,8 @@ struct WireNodeProperties {
     clip_children: bool,
     #[serde(default)]
     z_index: i32,
+    #[serde(default)]
+    overlap_enabled: bool,
 }
 
 const fn default_visible() -> bool {
@@ -1378,6 +2289,7 @@ impl WireNodeProperties {
             visible: self.visible,
             clip_children: self.clip_children,
             z_index: self.z_index,
+            overlap_enabled: self.overlap_enabled,
         }
     }
 }
@@ -1391,6 +2303,7 @@ struct WireNodePropertiesPatch {
     visible: Option<bool>,
     clip_children: Option<bool>,
     z_index: Option<i32>,
+    overlap_enabled: Option<bool>,
 }
 
 impl WireNodePropertiesPatch {
@@ -1403,6 +2316,7 @@ impl WireNodePropertiesPatch {
             visible: self.visible,
             clip_children: self.clip_children,
             z_index: self.z_index,
+            overlap_enabled: self.overlap_enabled,
         }
     }
 }
@@ -1479,6 +2393,7 @@ enum WireCapability {
     Resources,
     Input,
     Timing,
+    Overlap,
 }
 
 impl WireCapability {
@@ -1488,6 +2403,7 @@ impl WireCapability {
             Self::Resources => Capability::Resources,
             Self::Input => Capability::Input,
             Self::Timing => Capability::Timing,
+            Self::Overlap => Capability::Overlap,
         }
     }
 }
@@ -1499,6 +2415,35 @@ impl From<Capability> for WireCapability {
             Capability::Resources => Self::Resources,
             Capability::Input => Self::Input,
             Capability::Timing => Self::Timing,
+            Capability::Overlap => Self::Overlap,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum WireSubscription {
+    RawInput,
+    Terminal,
+    Timing,
+}
+
+impl WireSubscription {
+    const fn into_subscription(self) -> Subscription {
+        match self {
+            Self::RawInput => Subscription::RawInput,
+            Self::Terminal => Subscription::Terminal,
+            Self::Timing => Subscription::Timing,
+        }
+    }
+}
+
+impl From<Subscription> for WireSubscription {
+    fn from(subscription: Subscription) -> Self {
+        match subscription {
+            Subscription::RawInput => Self::RawInput,
+            Subscription::Terminal => Self::Terminal,
+            Subscription::Timing => Self::Timing,
         }
     }
 }
@@ -1552,6 +2497,38 @@ enum WireHostMessage {
     Start {
         session_id: String,
     },
+    Event {
+        session_id: String,
+        event: WireEvent,
+    },
+    Tick {
+        session_id: String,
+        dt_ns: String,
+    },
+    Frame {
+        session_id: String,
+        dt_ns: String,
+    },
+    Resize {
+        session_id: String,
+        physical_width: u32,
+        physical_height: u32,
+        logical_width: f64,
+        logical_height: f64,
+        scale_factor: f64,
+    },
+    Subscribed {
+        session_id: String,
+        subscriptions: Vec<WireSubscription>,
+    },
+    DeliveryGap {
+        session_id: String,
+        categories: Vec<WireDeliveryCategory>,
+    },
+    Closing {
+        session_id: String,
+        reason: WireCloseReason,
+    },
     Closed {
         session_id: String,
         reason: WireCloseReason,
@@ -1571,11 +2548,618 @@ enum WireHostMessage {
     },
 }
 
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireEvent {
+    Key {
+        key: WireKey,
+        text: Option<String>,
+        state: WireKeyState,
+        modifiers: WireModifiers,
+        repeat: bool,
+    },
+    PointerMove {
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    PointerPress {
+        button: WirePointerButton,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    PointerRelease {
+        button: WirePointerButton,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    Scroll {
+        position: WireVec2,
+        delta: WireVec2,
+        unit: WireScrollUnit,
+        modifiers: WireModifiers,
+    },
+    Focus {
+        state: WireFocusState,
+    },
+    Scene {
+        event: WireSceneEvent,
+    },
+    Terminal {
+        state: WireTerminalState,
+    },
+    Custom {
+        name: String,
+        payload: Vec<u8>,
+    },
+}
+
+impl WireEvent {
+    fn from_engine_event(event: &EngineEvent) -> Option<Self> {
+        match event {
+            EngineEvent::Key(event) => Some(Self::Key {
+                key: event.key.clone().into(),
+                text: event.text.clone(),
+                state: event.state.into(),
+                modifiers: event.modifiers.into(),
+                repeat: event.repeat,
+            }),
+            EngineEvent::Pointer(PointerEvent::Move {
+                position,
+                modifiers,
+            }) => Some(Self::PointerMove {
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            EngineEvent::Pointer(PointerEvent::Press {
+                button,
+                position,
+                modifiers,
+            }) => Some(Self::PointerPress {
+                button: (*button).into(),
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            EngineEvent::Pointer(PointerEvent::Release {
+                button,
+                position,
+                modifiers,
+            }) => Some(Self::PointerRelease {
+                button: (*button).into(),
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            EngineEvent::Scroll(ScrollEvent {
+                position,
+                delta,
+                unit,
+                modifiers,
+            }) => Some(Self::Scroll {
+                position: (*position).into(),
+                delta: (*delta).into(),
+                unit: (*unit).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            EngineEvent::Focus(event) => Some(Self::Focus {
+                state: (*event).into(),
+            }),
+            EngineEvent::Scene(_) => None,
+            EngineEvent::Terminal(event) => Some(Self::Terminal {
+                state: event.clone().into(),
+            }),
+            EngineEvent::Custom(event) => Some(Self::Custom {
+                name: event.name.clone(),
+                payload: event.payload.clone(),
+            }),
+        }
+    }
+
+    const fn delivery_category(&self) -> Option<DeliveryCategory> {
+        match self {
+            Self::PointerMove { .. } => Some(DeliveryCategory::RawInput),
+            Self::Terminal {
+                state: WireTerminalState::OutputAvailable,
+            } => Some(DeliveryCategory::Terminal),
+            Self::Scene {
+                event: WireSceneEvent::PointerMove { .. } | WireSceneEvent::DragMove { .. },
+            } => Some(DeliveryCategory::Scene),
+            Self::Key { .. }
+            | Self::PointerPress { .. }
+            | Self::PointerRelease { .. }
+            | Self::Scroll { .. }
+            | Self::Focus { .. }
+            | Self::Custom { .. } => Some(DeliveryCategory::RawInput),
+            Self::Terminal {
+                state: WireTerminalState::Exited,
+            } => Some(DeliveryCategory::Terminal),
+            Self::Scene { .. } => Some(DeliveryCategory::Scene),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireDeliveryCategory {
+    RawInput,
+    Scene,
+    Terminal,
+    Timing,
+}
+
+impl From<DeliveryCategory> for WireDeliveryCategory {
+    fn from(category: DeliveryCategory) -> Self {
+        match category {
+            DeliveryCategory::RawInput => Self::RawInput,
+            DeliveryCategory::Scene => Self::Scene,
+            DeliveryCategory::Terminal => Self::Terminal,
+            DeliveryCategory::Timing => Self::Timing,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireSceneEvent {
+    PointerEnter {
+        target: String,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    PointerLeave {
+        target: String,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    PointerMove {
+        target: String,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    PointerPress {
+        target: String,
+        button: WirePointerButton,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    PointerRelease {
+        target: String,
+        button: WirePointerButton,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    FocusGained {
+        target: String,
+    },
+    FocusLost {
+        target: String,
+    },
+    DragStart {
+        source: String,
+        origin: WireVec2,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    DragEnter {
+        source: Option<String>,
+        target: Option<String>,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    DragLeave {
+        source: Option<String>,
+        target: Option<String>,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    DragMove {
+        source: Option<String>,
+        target: Option<String>,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    Drop {
+        source: Option<String>,
+        target: Option<String>,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    DragEnd {
+        source: Option<String>,
+        target: Option<String>,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    DragCancel {
+        source: String,
+        position: WireVec2,
+        modifiers: WireModifiers,
+    },
+    OverlapEnter {
+        first: String,
+        second: String,
+    },
+    OverlapLeave {
+        first: String,
+        second: String,
+    },
+}
+
+impl WireSceneEvent {
+    fn from_scene_event(
+        event: &SceneEvent,
+        mut node_handle_for: impl FnMut(NodeId) -> Option<String>,
+    ) -> Option<Self> {
+        match event {
+            SceneEvent::PointerEnter {
+                target,
+                position,
+                modifiers,
+            } => Some(Self::PointerEnter {
+                target: node_handle_for(*target)?,
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            SceneEvent::PointerLeave {
+                target,
+                position,
+                modifiers,
+            } => Some(Self::PointerLeave {
+                target: node_handle_for(*target)?,
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            SceneEvent::PointerMove {
+                target,
+                position,
+                modifiers,
+            } => Some(Self::PointerMove {
+                target: node_handle_for(*target)?,
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            SceneEvent::PointerPress {
+                target,
+                button,
+                position,
+                modifiers,
+            } => Some(Self::PointerPress {
+                target: node_handle_for(*target)?,
+                button: (*button).into(),
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            SceneEvent::PointerRelease {
+                target,
+                button,
+                position,
+                modifiers,
+            } => Some(Self::PointerRelease {
+                target: node_handle_for(*target)?,
+                button: (*button).into(),
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            SceneEvent::FocusGained { target } => Some(Self::FocusGained {
+                target: node_handle_for(*target)?,
+            }),
+            SceneEvent::FocusLost { target } => Some(Self::FocusLost {
+                target: node_handle_for(*target)?,
+            }),
+            SceneEvent::DragStart {
+                source,
+                origin,
+                position,
+                modifiers,
+            } => Some(Self::DragStart {
+                source: node_handle_for(*source)?,
+                origin: (*origin).into(),
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            SceneEvent::DragEnter {
+                source,
+                target,
+                position,
+                modifiers,
+            } => Self::with_drag_handles(
+                node_handle_for(*source),
+                node_handle_for(*target),
+                |source, target| Self::DragEnter {
+                    source,
+                    target,
+                    position: (*position).into(),
+                    modifiers: (*modifiers).into(),
+                },
+            ),
+            SceneEvent::DragLeave {
+                source,
+                target,
+                position,
+                modifiers,
+            } => Self::with_drag_handles(
+                node_handle_for(*source),
+                node_handle_for(*target),
+                |source, target| Self::DragLeave {
+                    source,
+                    target,
+                    position: (*position).into(),
+                    modifiers: (*modifiers).into(),
+                },
+            ),
+            SceneEvent::DragMove {
+                source,
+                target,
+                position,
+                modifiers,
+            } => Self::with_drag_handles(
+                node_handle_for(*source),
+                target.and_then(&mut node_handle_for),
+                |source, target| Self::DragMove {
+                    source,
+                    target,
+                    position: (*position).into(),
+                    modifiers: (*modifiers).into(),
+                },
+            ),
+            SceneEvent::Drop {
+                source,
+                target,
+                position,
+                modifiers,
+            } => Self::with_drag_handles(
+                node_handle_for(*source),
+                node_handle_for(*target),
+                |source, target| Self::Drop {
+                    source,
+                    target,
+                    position: (*position).into(),
+                    modifiers: (*modifiers).into(),
+                },
+            ),
+            SceneEvent::DragEnd {
+                source,
+                target,
+                position,
+                modifiers,
+            } => Self::with_drag_handles(
+                node_handle_for(*source),
+                target.and_then(&mut node_handle_for),
+                |source, target| Self::DragEnd {
+                    source,
+                    target,
+                    position: (*position).into(),
+                    modifiers: (*modifiers).into(),
+                },
+            ),
+            SceneEvent::DragCancel {
+                source,
+                position,
+                modifiers,
+            } => Some(Self::DragCancel {
+                source: node_handle_for(*source)?,
+                position: (*position).into(),
+                modifiers: (*modifiers).into(),
+            }),
+            SceneEvent::OverlapEnter { first, second } => Some(Self::OverlapEnter {
+                first: node_handle_for(*first)?,
+                second: node_handle_for(*second)?,
+            }),
+            SceneEvent::OverlapLeave { first, second } => Some(Self::OverlapLeave {
+                first: node_handle_for(*first)?,
+                second: node_handle_for(*second)?,
+            }),
+        }
+    }
+
+    const fn required_capability(&self) -> Capability {
+        match self {
+            Self::OverlapEnter { .. } | Self::OverlapLeave { .. } => Capability::Overlap,
+            Self::PointerEnter { .. }
+            | Self::PointerLeave { .. }
+            | Self::PointerMove { .. }
+            | Self::PointerPress { .. }
+            | Self::PointerRelease { .. }
+            | Self::FocusGained { .. }
+            | Self::FocusLost { .. }
+            | Self::DragStart { .. }
+            | Self::DragEnter { .. }
+            | Self::DragLeave { .. }
+            | Self::DragMove { .. }
+            | Self::Drop { .. }
+            | Self::DragEnd { .. }
+            | Self::DragCancel { .. } => Capability::Input,
+        }
+    }
+
+    fn with_drag_handles(
+        source: Option<String>,
+        target: Option<String>,
+        build: impl FnOnce(Option<String>, Option<String>) -> Self,
+    ) -> Option<Self> {
+        (source.is_some() || target.is_some()).then(|| build(source, target))
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireTerminalState {
+    OutputAvailable,
+    Exited,
+}
+
+impl From<TerminalEvent> for WireTerminalState {
+    fn from(event: TerminalEvent) -> Self {
+        match event {
+            TerminalEvent::OutputAvailable => Self::OutputAvailable,
+            TerminalEvent::Exited => Self::Exited,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireKey {
+    Character { value: String },
+    Named { value: String },
+    Dead { value: Option<String> },
+    Unidentified,
+}
+
+impl From<Key> for WireKey {
+    fn from(key: Key) -> Self {
+        match key {
+            Key::Character(value) => Self::Character { value },
+            Key::Named(key) => Self::Named {
+                value: wire_named_key(key),
+            },
+            Key::Dead(value) => Self::Dead {
+                value: value.map(|character| character.to_string()),
+            },
+            Key::Unidentified => Self::Unidentified,
+        }
+    }
+}
+
+fn wire_named_key(key: NamedKey) -> String {
+    match key {
+        NamedKey::Alt => "alt".to_owned(),
+        NamedKey::Backspace => "backspace".to_owned(),
+        NamedKey::Delete => "delete".to_owned(),
+        NamedKey::End => "end".to_owned(),
+        NamedKey::Enter => "enter".to_owned(),
+        NamedKey::Escape => "escape".to_owned(),
+        NamedKey::Home => "home".to_owned(),
+        NamedKey::Insert => "insert".to_owned(),
+        NamedKey::PageDown => "page_down".to_owned(),
+        NamedKey::PageUp => "page_up".to_owned(),
+        NamedKey::Space => "space".to_owned(),
+        NamedKey::Tab => "tab".to_owned(),
+        NamedKey::ArrowDown => "arrow_down".to_owned(),
+        NamedKey::ArrowLeft => "arrow_left".to_owned(),
+        NamedKey::ArrowRight => "arrow_right".to_owned(),
+        NamedKey::ArrowUp => "arrow_up".to_owned(),
+        NamedKey::Other(value) => value,
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireKeyState {
+    Pressed,
+    Released,
+}
+
+impl From<KeyState> for WireKeyState {
+    fn from(state: KeyState) -> Self {
+        match state {
+            KeyState::Pressed => Self::Pressed,
+            KeyState::Released => Self::Released,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct WireModifiers {
+    shift: bool,
+    control: bool,
+    alt: bool,
+    super_key: bool,
+}
+
+impl From<Modifiers> for WireModifiers {
+    fn from(modifiers: Modifiers) -> Self {
+        Self {
+            shift: modifiers.shift,
+            control: modifiers.control,
+            alt: modifiers.alt,
+            super_key: modifiers.super_key,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct WireVec2 {
+    x: f64,
+    y: f64,
+}
+
+impl From<Vec2> for WireVec2 {
+    fn from(position: Vec2) -> Self {
+        Self {
+            x: position.x,
+            y: position.y,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WirePointerButton {
+    Primary,
+    Secondary,
+    Middle,
+    Back,
+    Forward,
+    Other { value: u16 },
+}
+
+impl From<PointerButton> for WirePointerButton {
+    fn from(button: PointerButton) -> Self {
+        match button {
+            PointerButton::Primary => Self::Primary,
+            PointerButton::Secondary => Self::Secondary,
+            PointerButton::Middle => Self::Middle,
+            PointerButton::Back => Self::Back,
+            PointerButton::Forward => Self::Forward,
+            PointerButton::Other(value) => Self::Other { value },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireScrollUnit {
+    Line,
+    Pixel,
+}
+
+impl From<ScrollUnit> for WireScrollUnit {
+    fn from(unit: ScrollUnit) -> Self {
+        match unit {
+            ScrollUnit::Line => Self::Line,
+            ScrollUnit::Pixel => Self::Pixel,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireFocusState {
+    Gained,
+    Lost,
+}
+
+impl From<FocusEvent> for WireFocusState {
+    fn from(event: FocusEvent) -> Self {
+        match event {
+            FocusEvent::Gained => Self::Gained,
+            FocusEvent::Lost => Self::Lost,
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireCommandResult {
-    Node { node: String },
-    Texture { texture: String },
+    Node {
+        node: String,
+    },
+    Texture {
+        texture: String,
+    },
+    Overlaps {
+        overlapping: bool,
+        nodes: Vec<String>,
+    },
     Acknowledged,
 }
 
@@ -1587,6 +3171,10 @@ impl From<SceneCommandResult> for WireCommandResult {
             },
             SceneCommandResult::Texture(texture) => Self::Texture {
                 texture: texture.to_string(),
+            },
+            SceneCommandResult::Overlaps(nodes) => Self::Overlaps {
+                overlapping: !nodes.is_empty(),
+                nodes: nodes.into_iter().map(|node| node.to_string()).collect(),
             },
             SceneCommandResult::Acknowledged => Self::Acknowledged,
         }
@@ -1613,12 +3201,45 @@ impl From<HostMessage> for WireHostMessage {
     }
 }
 
+impl WireHostMessage {
+    fn from_notification(session_id: SessionId, notification: HostNotification) -> Self {
+        let session_id = session_id.to_string();
+        match notification {
+            HostNotification::Event(event) => Self::Event { session_id, event },
+            HostNotification::Tick { dt_ns } => Self::Tick { session_id, dt_ns },
+            HostNotification::Frame { dt_ns } => Self::Frame { session_id, dt_ns },
+            HostNotification::Resize {
+                physical_width,
+                physical_height,
+                logical_width,
+                logical_height,
+                scale_factor,
+            } => Self::Resize {
+                session_id,
+                physical_width,
+                physical_height,
+                logical_width,
+                logical_height,
+                scale_factor,
+            },
+            HostNotification::DeliveryGap { categories } => Self::DeliveryGap {
+                session_id,
+                categories: categories
+                    .into_iter()
+                    .map(WireDeliveryCategory::from)
+                    .collect(),
+            },
+        }
+    }
+}
+
 fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
     [
         Capability::Scene,
         Capability::Resources,
         Capability::Input,
         Capability::Timing,
+        Capability::Overlap,
     ]
     .into_iter()
     .filter(|capability| capabilities.contains(*capability))
@@ -1663,6 +3284,7 @@ enum WireCloseReason {
         message: String,
     },
     HostShutdown,
+    HostOverloaded,
     ProtocolViolation,
     TransportDisconnected,
 }
@@ -1676,6 +3298,7 @@ impl From<SessionCloseReason> for WireCloseReason {
                 message: fault.message,
             },
             SessionCloseReason::HostShutdown => Self::HostShutdown,
+            SessionCloseReason::HostOverloaded => Self::HostOverloaded,
             SessionCloseReason::ProtocolViolation => Self::ProtocolViolation,
             SessionCloseReason::TransportDisconnected => Self::TransportDisconnected,
         }
@@ -1688,6 +3311,9 @@ mod tests {
 
     use interprocess::local_socket::{GenericNamespaced, ToNsName, prelude::LocalSocketStream};
     use serde_json::{Value, json};
+
+    use crate::protocol::{ClientHello, ProgramInitContext, SessionManager};
+    use crate::runtime::KeyEvent;
 
     use super::*;
 
@@ -1718,6 +3344,7 @@ mod tests {
                     "resources" => WireCapability::Resources,
                     "input" => WireCapability::Input,
                     "timing" => WireCapability::Timing,
+                    "overlap" => WireCapability::Overlap,
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -1728,11 +3355,54 @@ mod tests {
         write_frame(stream, &message).unwrap();
     }
 
+    struct IntermittentWriter {
+        bytes: Vec<u8>,
+        write_attempts: usize,
+    }
+
+    impl Write for IntermittentWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.write_attempts += 1;
+            if self.write_attempts == 2 {
+                return Ok(0);
+            }
+            if self.write_attempts == 3 {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let count = bytes.len().min(2);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completes_a_frame_after_zero_byte_and_transient_output_backpressure() {
+        let mut writer = IntermittentWriter {
+            bytes: Vec::new(),
+            write_attempts: 0,
+        };
+
+        write_raw_frame(&mut writer, b'J', b"payload").unwrap();
+
+        assert_eq!(
+            writer.bytes,
+            [0, 0, 0, 8, b'J', b'p', b'a', b'y', b'l', b'o', b'a', b'd']
+        );
+    }
+
     fn receive_host(stream: &mut LocalSocketStream) -> Value {
-        match FrameReader::default()
-            .read_next(stream, None, None)
-            .unwrap()
-        {
+        receive_host_with_reader(stream, &mut FrameReader::default())
+    }
+
+    fn receive_host_with_reader(
+        stream: &mut LocalSocketStream,
+        frame_reader: &mut FrameReader,
+    ) -> Value {
+        match frame_reader.read_next(stream, None, None).unwrap() {
             FrameRead::Message(message) => message,
             FrameRead::Disconnected => panic!("the CLP server disconnected before replying"),
             FrameRead::Shutdown => panic!("a standalone CLP client cannot receive host shutdown"),
@@ -1750,15 +3420,299 @@ mod tests {
         assert_eq!(server.session_count().unwrap(), expected);
     }
 
-    fn wait_for_host_action(server: &ClpServer) -> HostAction {
+    fn wait_for_host_command(server: &ClpServer) -> HostCommandRequest {
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
-            if let Some(action) = server.drain_host_actions().into_iter().next() {
-                return action;
+            if let Some(request) =
+                server
+                    .drain_host_actions()
+                    .into_iter()
+                    .find_map(|action| match action {
+                        HostAction::Command(request) => Some(request),
+                        HostAction::Cleanup { .. } | HostAction::SessionStarted { .. } => None,
+                    })
+            {
+                return request;
             }
             thread::sleep(Duration::from_millis(10));
         }
         panic!("the CLP host action did not arrive")
+    }
+
+    fn wait_for_session_started(server: &ClpServer) -> SessionId {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if let Some(session_id) =
+                server
+                    .drain_host_actions()
+                    .into_iter()
+                    .find_map(|action| match action {
+                        HostAction::SessionStarted { session_id } => Some(session_id),
+                        HostAction::Command(_) | HostAction::Cleanup { .. } => None,
+                    })
+            {
+                return session_id;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the CLP session did not enter its running state")
+    }
+
+    fn session_id() -> SessionId {
+        let mut manager = SessionManager::new(CapabilitySet::ALL);
+        manager
+            .accept(
+                ClientHello {
+                    protocol_version: crate::protocol::CLP_PROTOCOL_VERSION,
+                    requested_capabilities: CapabilitySet::ALL,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap()
+            .0
+    }
+
+    fn next_notification(queue: &NotificationQueue) -> HostNotification {
+        match queue.try_pop() {
+            NotificationPoll::Notification(notification) => notification,
+            NotificationPoll::Overloaded => panic!("the notification queue is overloaded"),
+            NotificationPoll::Empty => panic!("the notification queue is empty"),
+        }
+    }
+
+    #[test]
+    fn activation_delivers_resize_first_and_gates_opt_in_notifications() {
+        let notifications = SessionNotifications::default();
+        let session_id = session_id();
+        let queue = notifications.register(
+            session_id,
+            CapabilitySet::from_capabilities(&[Capability::Input, Capability::Timing]),
+        );
+
+        notifications.broadcast_matching(
+            HostNotification::Tick {
+                dt_ns: "1".to_owned(),
+            },
+            |_| true,
+        );
+        assert!(matches!(queue.try_pop(), NotificationPoll::Empty));
+
+        assert!(notifications.activate(session_id, resize_notification(900, 600, 1.5)));
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::Resize {
+                physical_width: 900,
+                physical_height: 600,
+                ..
+            }
+        ));
+
+        notifications.broadcast_matching(
+            HostNotification::Tick {
+                dt_ns: "2".to_owned(),
+            },
+            |session| session.subscriptions.contains(&Subscription::Timing),
+        );
+        assert!(matches!(queue.try_pop(), NotificationPoll::Empty));
+
+        notifications
+            .set_subscriptions(session_id, BTreeSet::from([Subscription::Timing]))
+            .unwrap();
+        notifications.broadcast_matching(
+            HostNotification::Tick {
+                dt_ns: "3".to_owned(),
+            },
+            |session| session.subscriptions.contains(&Subscription::Timing),
+        );
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::Tick { dt_ns } if dt_ns == "3"
+        ));
+    }
+
+    #[test]
+    fn coalesces_continuous_notifications_to_the_latest_sample() {
+        let notifications = SessionNotifications::default();
+        let session_id = session_id();
+        let queue = notifications.register(session_id, CapabilitySet::NONE);
+        assert!(notifications.activate(session_id, resize_notification(1, 1, 1.0)));
+
+        notifications.broadcast_matching(
+            HostNotification::Tick {
+                dt_ns: "first".to_owned(),
+            },
+            |_| true,
+        );
+        notifications.broadcast_matching(
+            HostNotification::Event(WireEvent::Focus {
+                state: WireFocusState::Gained,
+            }),
+            |_| true,
+        );
+        notifications.broadcast_matching(
+            HostNotification::Tick {
+                dt_ns: "latest".to_owned(),
+            },
+            |_| true,
+        );
+
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::DeliveryGap { categories }
+                if categories == BTreeSet::from([DeliveryCategory::Timing])
+        ));
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::Event(WireEvent::Focus { .. })
+        ));
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::Tick { dt_ns } if dt_ns == "latest"
+        ));
+        assert_eq!(
+            notifications.metrics(),
+            ClpNotificationMetrics {
+                coalesced_notifications: 1,
+                delivery_gaps_emitted: 1,
+                ..ClpNotificationMetrics::default()
+            }
+        );
+    }
+
+    #[test]
+    fn coalesces_terminal_output_availability() {
+        let notifications = SessionNotifications::default();
+        let session_id = session_id();
+        let queue = notifications.register(session_id, CapabilitySet::NONE);
+        assert!(notifications.activate(session_id, resize_notification(1, 1, 1.0)));
+
+        for _ in 0..2 {
+            notifications.broadcast_matching(
+                HostNotification::Event(WireEvent::Terminal {
+                    state: WireTerminalState::OutputAvailable,
+                }),
+                |_| true,
+            );
+        }
+
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::DeliveryGap { categories }
+                if categories == BTreeSet::from([DeliveryCategory::Terminal])
+        ));
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::Event(WireEvent::Terminal {
+                state: WireTerminalState::OutputAvailable,
+            })
+        ));
+    }
+
+    #[test]
+    fn prioritizes_a_discrete_notification_over_a_pending_continuous_one() {
+        let notifications = SessionNotifications::default();
+        let session_id = session_id();
+        let queue = notifications.register(session_id, CapabilitySet::NONE);
+        assert!(notifications.activate(session_id, resize_notification(1, 1, 1.0)));
+
+        for _ in 0..MAX_PENDING_HOST_NOTIFICATIONS - 1 {
+            notifications.broadcast_matching(
+                HostNotification::Event(WireEvent::Focus {
+                    state: WireFocusState::Gained,
+                }),
+                |_| true,
+            );
+        }
+        notifications.broadcast_matching(
+            HostNotification::Frame {
+                dt_ns: "discarded".to_owned(),
+            },
+            |_| true,
+        );
+        notifications.broadcast_matching(
+            HostNotification::Event(WireEvent::Key {
+                key: WireKey::Character {
+                    value: "a".to_owned(),
+                },
+                text: Some("a".to_owned()),
+                state: WireKeyState::Pressed,
+                modifiers: WireModifiers {
+                    shift: false,
+                    control: false,
+                    alt: false,
+                    super_key: false,
+                },
+                repeat: false,
+            }),
+            |_| true,
+        );
+
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::DeliveryGap { categories }
+                if categories == BTreeSet::from([DeliveryCategory::Timing])
+        ));
+        for _ in 0..MAX_PENDING_HOST_NOTIFICATIONS - 1 {
+            assert!(matches!(
+                next_notification(&queue),
+                HostNotification::Event(WireEvent::Focus { .. })
+            ));
+        }
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::Event(WireEvent::Key { .. })
+        ));
+        assert_eq!(
+            notifications.metrics(),
+            ClpNotificationMetrics {
+                dropped_continuous_notifications: 1,
+                delivery_gaps_emitted: 1,
+                ..ClpNotificationMetrics::default()
+            }
+        );
+    }
+
+    #[test]
+    fn overloads_a_session_instead_of_dropping_a_discrete_notification() {
+        let notifications = SessionNotifications::default();
+        let session_id = session_id();
+        let queue = notifications.register(session_id, CapabilitySet::NONE);
+        assert!(notifications.activate(session_id, resize_notification(1, 1, 1.0)));
+
+        for _ in 0..MAX_PENDING_HOST_NOTIFICATIONS {
+            notifications.broadcast_matching(
+                HostNotification::Event(WireEvent::Focus {
+                    state: WireFocusState::Gained,
+                }),
+                |_| true,
+            );
+        }
+        notifications.broadcast_matching(
+            HostNotification::Event(WireEvent::Key {
+                key: WireKey::Character {
+                    value: "a".to_owned(),
+                },
+                text: Some("a".to_owned()),
+                state: WireKeyState::Pressed,
+                modifiers: WireModifiers {
+                    shift: false,
+                    control: false,
+                    alt: false,
+                    super_key: false,
+                },
+                repeat: false,
+            }),
+            |_| true,
+        );
+
+        assert!(matches!(queue.try_pop(), NotificationPoll::Overloaded));
+        assert_eq!(
+            notifications.metrics(),
+            ClpNotificationMetrics {
+                overloaded_sessions: 1,
+                ..ClpNotificationMetrics::default()
+            }
+        );
     }
 
     #[test]
@@ -1773,7 +3727,7 @@ mod tests {
         send_client(&mut client, hello(&server, vec!["scene", "timing"]));
         let init = receive_host(&mut client);
         assert_eq!(init["type"], "init");
-        assert_eq!(init["protocol"], json!({ "major": 1, "minor": 1 }));
+        assert_eq!(init["protocol"], json!({ "major": 1, "minor": 3 }));
         assert_eq!(init["capabilities"], json!(["scene"]));
         assert_eq!(
             init["context"],
@@ -1792,6 +3746,275 @@ mod tests {
         assert_eq!(closed["type"], "closed");
         assert_eq!(closed["reason"], json!({ "kind": "client_requested" }));
         wait_for_session_count(&server, 0);
+    }
+
+    #[test]
+    fn delivers_input_timing_and_resize_messages_after_start() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["input", "timing"]));
+        let init = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+        let session_id = wait_for_session_started(&server);
+
+        server.activate_session(session_id, 900, 600, 1.5);
+        let resize = receive_host(&mut client);
+        assert_eq!(resize["type"], "resize");
+        assert_eq!(resize["physical_width"], 900);
+        assert_eq!(resize["physical_height"], 600);
+        assert_eq!(resize["logical_width"], 600.0);
+        assert_eq!(resize["logical_height"], 400.0);
+        assert_eq!(resize["scale_factor"], 1.5);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Subscribe {
+                subscriptions: vec![WireSubscription::RawInput, WireSubscription::Timing],
+            },
+        );
+        let subscribed = receive_host(&mut client);
+        assert_eq!(subscribed["type"], "subscribed");
+        assert_eq!(subscribed["subscriptions"], json!(["raw_input", "timing"]));
+
+        server.send_keyboard_event(
+            session_id,
+            &KeyEvent {
+                key: Key::Character("a".to_owned()),
+                text: Some("a".to_owned()),
+                state: KeyState::Pressed,
+                modifiers: Modifiers::default(),
+                repeat: false,
+            },
+        );
+        server.broadcast_tick(Duration::from_millis(16));
+        server.broadcast_frame(Duration::from_millis(8));
+
+        let mut host_reader = FrameReader::default();
+        let event = receive_host_with_reader(&mut client, &mut host_reader);
+        assert_eq!(event["type"], "event");
+        assert_eq!(event["session_id"], init["session_id"]);
+        assert_eq!(
+            event["event"],
+            json!({
+                "kind": "key",
+                "key": { "kind": "character", "value": "a" },
+                "text": "a",
+                "state": "pressed",
+                "modifiers": {
+                    "shift": false,
+                    "control": false,
+                    "alt": false,
+                    "super_key": false
+                },
+                "repeat": false
+            })
+        );
+
+        let tick = receive_host_with_reader(&mut client, &mut host_reader);
+        assert_eq!(tick["type"], "tick");
+        assert_eq!(tick["dt_ns"], "16000000");
+
+        let frame = receive_host_with_reader(&mut client, &mut host_reader);
+        assert_eq!(frame["type"], "frame");
+        assert_eq!(frame["dt_ns"], "8000000");
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn delivers_targeted_scene_events_with_owned_node_handles() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["input"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+        let session_id = wait_for_session_started(&server);
+        server.activate_session(session_id, 900, 600, 1.5);
+        let _ = receive_host(&mut client);
+        let mut scene = crate::scene::Scene::new();
+        let node = scene.create_root(crate::scene::NodeProperties::default());
+
+        server.broadcast_scene_event(
+            &SceneEvent::PointerEnter {
+                target: node,
+                position: Vec2 { x: 12.0, y: 24.0 },
+                modifiers: Modifiers::default(),
+            },
+            |candidate_session, candidate_node| {
+                (candidate_session == session_id && candidate_node == node)
+                    .then_some(NodeHandle::new(41))
+            },
+        );
+
+        let event = receive_host(&mut client);
+        assert_eq!(event["type"], "event");
+        assert_eq!(
+            event["event"],
+            json!({
+                "kind": "scene",
+                "event": {
+                    "kind": "pointer_enter",
+                    "target": "node-41",
+                    "position": { "x": 12.0, "y": 24.0 },
+                    "modifiers": {
+                        "shift": false,
+                        "control": false,
+                        "alt": false,
+                        "super_key": false
+                    }
+                }
+            })
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn delivers_overlap_events_to_sessions_with_the_overlap_capability() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["overlap"]));
+        let init = receive_host(&mut client);
+        assert_eq!(init["capabilities"], json!(["overlap"]));
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+        let session_id = wait_for_session_started(&server);
+        server.activate_session(session_id, 900, 600, 1.5);
+
+        let mut scene = crate::scene::Scene::new();
+        let first = scene.create_root(crate::scene::NodeProperties::default());
+        let second = scene.create_root(crate::scene::NodeProperties::default());
+        server.broadcast_scene_event(
+            &SceneEvent::OverlapEnter { first, second },
+            |candidate_session, candidate_node| {
+                (candidate_session == session_id && candidate_node == first)
+                    .then_some(NodeHandle::new(41))
+                    .or_else(|| {
+                        (candidate_session == session_id && candidate_node == second)
+                            .then_some(NodeHandle::new(42))
+                    })
+            },
+        );
+
+        let event = receive_host(&mut client);
+        assert_eq!(event["type"], "event");
+        assert_eq!(
+            event["event"],
+            json!({
+                "kind": "scene",
+                "event": {
+                    "kind": "overlap_enter",
+                    "first": "node-41",
+                    "second": "node-42"
+                }
+            })
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn scene_drag_events_do_not_expose_foreign_node_handles() {
+        let mut scene = crate::scene::Scene::new();
+        let source = scene.create_root(crate::scene::NodeProperties::default());
+        let target = scene.create_root(crate::scene::NodeProperties::default());
+        let event = WireSceneEvent::from_scene_event(
+            &SceneEvent::Drop {
+                source,
+                target,
+                position: Vec2 { x: 12.0, y: 24.0 },
+                modifiers: Modifiers::default(),
+            },
+            |node| (node == target).then_some("node-8".to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "kind": "drop",
+                "source": null,
+                "target": "node-8",
+                "position": { "x": 12.0, "y": 24.0 },
+                "modifiers": {
+                    "shift": false,
+                    "control": false,
+                    "alt": false,
+                    "super_key": false
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_terminal_and_custom_engine_events() {
+        let terminal =
+            WireEvent::from_engine_event(&EngineEvent::Terminal(TerminalEvent::Exited)).unwrap();
+        let custom =
+            WireEvent::from_engine_event(&EngineEvent::Custom(crate::runtime::CustomEvent {
+                name: "refresh".to_owned(),
+                payload: vec![1, 2, 3],
+            }))
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(terminal).unwrap(),
+            json!({ "kind": "terminal", "state": "exited" })
+        );
+        assert_eq!(
+            serde_json::to_value(custom).unwrap(),
+            json!({ "kind": "custom", "name": "refresh", "payload": [1, 2, 3] })
+        );
+    }
+
+    #[test]
+    fn only_delivers_notifications_granted_by_capability() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["timing"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+        let session_id = wait_for_session_started(&server);
+
+        server.activate_session(session_id, 900, 600, 1.5);
+        send_client(
+            &mut client,
+            WireClientMessage::Subscribe {
+                subscriptions: vec![WireSubscription::RawInput],
+            },
+        );
+        let denied = receive_host(&mut client);
+        assert_eq!(denied["type"], "error");
+        assert_eq!(denied["code"], "capability_denied");
+
+        send_client(
+            &mut client,
+            WireClientMessage::Subscribe {
+                subscriptions: vec![WireSubscription::Timing],
+            },
+        );
+        let subscribed = receive_host(&mut client);
+        assert_eq!(subscribed["type"], "subscribed");
+
+        server.broadcast_event(&EngineEvent::Focus(FocusEvent::Gained));
+        server.broadcast_tick(Duration::from_millis(16));
+
+        let tick = receive_host(&mut client);
+        assert_eq!(tick["type"], "tick");
+        assert_eq!(tick["dt_ns"], "16000000");
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
     }
 
     #[test]
@@ -1816,9 +4039,7 @@ mod tests {
         );
         write_binary_frame(&mut client, &[1, 2, 3, 4]).unwrap();
 
-        let HostAction::Command(request) = wait_for_host_action(&server) else {
-            panic!("an active session should forward texture uploads as commands");
-        };
+        let request = wait_for_host_command(&server);
         assert_eq!(request.request_id, "texture-request");
         assert_eq!(
             request.command,
@@ -1870,7 +4091,76 @@ mod tests {
         assert_eq!(error["type"], "command_error");
         assert_eq!(error["request_id"], "denied-upload");
         assert_eq!(error["code"], "capability_denied");
-        assert!(server.drain_host_actions().is_empty());
+        assert!(
+            !server
+                .drain_host_actions()
+                .into_iter()
+                .any(|action| matches!(action, HostAction::Command(_)))
+        );
+    }
+
+    #[test]
+    fn forwards_overlap_queries_and_requires_the_overlap_capability() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene", "overlap"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "overlap-query".to_owned(),
+                command: WireSceneCommand::QueryOverlaps {
+                    node: "node-3".to_owned(),
+                },
+            },
+        );
+        let request = wait_for_host_command(&server);
+        assert_eq!(request.request_id, "overlap-query");
+        assert_eq!(
+            request.command,
+            SceneCommand::QueryOverlaps {
+                node: NodeHandle::new(3)
+            }
+        );
+        request.respond(HostCommandResponse::Success(SceneCommandResult::Overlaps(
+            vec![NodeHandle::new(7), NodeHandle::new(9)],
+        )));
+
+        let result = receive_host(&mut client);
+        assert_eq!(result["type"], "result");
+        assert_eq!(
+            result["result"],
+            json!({
+                "kind": "overlaps",
+                "overlapping": true,
+                "nodes": ["node-7", "node-9"]
+            })
+        );
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+
+        let mut denied_client = connect(&server);
+        send_client(&mut denied_client, hello(&server, vec!["scene"]));
+        let _ = receive_host(&mut denied_client);
+        send_client(&mut denied_client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut denied_client);
+        send_client(&mut denied_client, WireClientMessage::Started);
+        send_client(
+            &mut denied_client,
+            WireClientMessage::Command {
+                request_id: "denied-overlap-query".to_owned(),
+                command: WireSceneCommand::QueryOverlaps {
+                    node: "node-3".to_owned(),
+                },
+            },
+        );
+        let denied = receive_host(&mut denied_client);
+        assert_eq!(denied["type"], "command_error");
+        assert_eq!(denied["code"], "capability_denied");
     }
 
     #[test]
@@ -1933,9 +4223,16 @@ mod tests {
         send_client(&mut client, WireClientMessage::InitComplete);
         let _ = receive_host(&mut client);
         send_client(&mut client, WireClientMessage::Started);
-        wait_for_session_count(&server, 1);
+        let _ = wait_for_session_started(&server);
 
-        server.shutdown();
+        thread::scope(|scope| {
+            let shutdown = scope.spawn(|| server.shutdown());
+            let closing = receive_host(&mut client);
+            assert_eq!(closing["type"], "closing");
+            assert_eq!(closing["reason"], json!({ "kind": "host_shutdown" }));
+            send_client(&mut client, WireClientMessage::Close);
+            shutdown.join().unwrap();
+        });
 
         let closed = receive_host(&mut client);
         assert_eq!(closed["type"], "closed");

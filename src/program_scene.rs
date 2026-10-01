@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt::{Display, Formatter},
 };
@@ -7,6 +7,7 @@ use std::{
 use crate::{
     protocol::SessionId,
     resources::{Texture, TextureError, TextureStore, rgba8_byte_len},
+    runtime::SceneEvent,
     scene::{
         ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer, SolidNode,
         Transform,
@@ -15,6 +16,7 @@ use crate::{
 
 pub const MAX_TEXTURE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SESSION_TEXTURE_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_SESSION_OVERLAP_NODES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeHandle(u64);
@@ -61,6 +63,7 @@ pub struct NodePropertiesInput {
     pub visible: bool,
     pub clip_children: bool,
     pub z_index: i32,
+    pub overlap_enabled: bool,
 }
 
 impl NodePropertiesInput {
@@ -72,6 +75,7 @@ impl NodePropertiesInput {
             visible: self.visible,
             clip_children: self.clip_children,
             z_index: self.z_index,
+            overlap_enabled: self.overlap_enabled,
         })
     }
 }
@@ -85,6 +89,7 @@ pub struct NodePropertiesPatch {
     pub visible: Option<bool>,
     pub clip_children: Option<bool>,
     pub z_index: Option<i32>,
+    pub overlap_enabled: Option<bool>,
 }
 
 impl NodePropertiesPatch {
@@ -97,6 +102,7 @@ impl NodePropertiesPatch {
             visible: self.visible.unwrap_or(properties.visible),
             clip_children: self.clip_children.unwrap_or(properties.clip_children),
             z_index: self.z_index.unwrap_or(properties.z_index),
+            overlap_enabled: self.overlap_enabled.unwrap_or(properties.overlap_enabled),
         }
         .into_scene()
     }
@@ -141,6 +147,9 @@ pub enum SceneCommand {
     RemoveNode {
         node: NodeHandle,
     },
+    QueryOverlaps {
+        node: NodeHandle,
+    },
     UploadTexture {
         width: u32,
         height: u32,
@@ -151,10 +160,11 @@ pub enum SceneCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneCommandResult {
     Node(NodeHandle),
     Texture(TextureHandle),
+    Overlaps(Vec<NodeHandle>),
     Acknowledged,
 }
 
@@ -171,6 +181,7 @@ pub enum ProgramSceneError {
     Scene(crate::scene::SceneError),
     Image(crate::scene::ImageNodeError),
     Texture(TextureError),
+    OverlapNodeLimitExceeded { limit: usize },
     HandleExhausted,
 }
 
@@ -199,6 +210,12 @@ impl Display for ProgramSceneError {
             Self::Scene(error) => Display::fmt(error, formatter),
             Self::Image(error) => Display::fmt(error, formatter),
             Self::Texture(error) => Display::fmt(error, formatter),
+            Self::OverlapNodeLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "a session may enable overlap on at most {limit} nodes"
+                )
+            }
             Self::HandleExhausted => {
                 formatter.write_str("could not allocate another resource handle")
             }
@@ -216,6 +233,8 @@ pub struct ProgramSceneResources {
     nodes: BTreeMap<NodeHandle, OwnedNode>,
     textures: BTreeMap<TextureHandle, OwnedTexture>,
     session_texture_bytes: BTreeMap<SessionId, usize>,
+    overlap_pairs: BTreeSet<OverlapPair>,
+    pending_overlap_events: Vec<SceneEvent>,
 }
 
 #[derive(Clone, Copy)]
@@ -229,6 +248,29 @@ struct OwnedTexture {
     session: SessionId,
     texture: crate::resources::TextureId,
     bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OverlapPair {
+    session: SessionId,
+    first: NodeHandle,
+    second: NodeHandle,
+}
+
+impl OverlapPair {
+    fn new(session: SessionId, first: NodeHandle, second: NodeHandle) -> Self {
+        debug_assert_ne!(first, second);
+        let (first, second) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        Self {
+            session,
+            first,
+            second,
+        }
+    }
 }
 
 impl ProgramSceneResources {
@@ -254,12 +296,14 @@ impl ProgramSceneResources {
                 properties,
                 content,
             } => {
+                self.validate_overlap_capacity(session, false, properties.overlap_enabled, scene)?;
                 let content = self.resolve_content(session, content)?;
                 let node = scene.create_root_in_layer(properties.into_scene()?, layer);
                 scene
                     .set_content(node, content)
                     .expect("a newly created scene root is valid");
                 let handle = self.allocate_node(session, node)?;
+                self.reconcile_overlaps(session, scene)?;
                 Ok(SceneCommandResult::Node(handle))
             }
             SceneCommand::CreateChild {
@@ -267,6 +311,7 @@ impl ProgramSceneResources {
                 properties,
                 content,
             } => {
+                self.validate_overlap_capacity(session, false, properties.overlap_enabled, scene)?;
                 let parent = self.node_for(session, parent)?;
                 let content = self.resolve_content(session, content)?;
                 let node = scene
@@ -276,6 +321,7 @@ impl ProgramSceneResources {
                     .set_content(node, content)
                     .expect("a newly created scene child is valid");
                 let handle = self.allocate_node(session, node)?;
+                self.reconcile_overlaps(session, scene)?;
                 Ok(SceneCommandResult::Node(handle))
             }
             SceneCommand::UpdateNode { node, properties } => {
@@ -287,9 +333,17 @@ impl ProgramSceneResources {
                         node,
                     )?))?
                     .properties();
+                let next = properties.apply(current)?;
+                self.validate_overlap_capacity(
+                    session,
+                    current.overlap_enabled,
+                    next.overlap_enabled,
+                    scene,
+                )?;
                 scene
-                    .set_properties(node, properties.apply(current)?)
+                    .set_properties(node, next)
                     .map_err(ProgramSceneError::Scene)?;
+                self.reconcile_overlaps(session, scene)?;
                 Ok(SceneCommandResult::Acknowledged)
             }
             SceneCommand::SetContent { node, content } => {
@@ -305,6 +359,7 @@ impl ProgramSceneResources {
                 scene
                     .reparent(node, parent)
                     .map_err(ProgramSceneError::Scene)?;
+                self.reconcile_overlaps(session, scene)?;
                 Ok(SceneCommandResult::Acknowledged)
             }
             SceneCommand::RemoveNode { node } => {
@@ -314,8 +369,12 @@ impl ProgramSceneResources {
                     .map_err(ProgramSceneError::Scene)?;
                 self.nodes
                     .retain(|_, owned| scene.node(owned.node).is_some());
+                self.discard_missing_overlap_pairs();
                 Ok(SceneCommandResult::Acknowledged)
             }
+            SceneCommand::QueryOverlaps { node } => Ok(SceneCommandResult::Overlaps(
+                self.overlaps_for(session, node, scene)?,
+            )),
             SceneCommand::UploadTexture {
                 width,
                 height,
@@ -403,6 +462,167 @@ impl ProgramSceneResources {
             }
         }
         self.session_texture_bytes.remove(&session);
+        self.discard_missing_overlap_pairs();
+    }
+
+    pub fn node_handle_for_session(&self, session: SessionId, node: NodeId) -> Option<NodeHandle> {
+        self.nodes.iter().find_map(|(handle, owned)| {
+            (owned.session == session && owned.node == node).then_some(*handle)
+        })
+    }
+
+    pub fn session_for_node(&self, node: NodeId) -> Option<SessionId> {
+        self.nodes
+            .values()
+            .find_map(|owned| (owned.node == node).then_some(owned.session))
+    }
+
+    pub fn drain_overlap_events(&mut self) -> Vec<SceneEvent> {
+        std::mem::take(&mut self.pending_overlap_events)
+    }
+
+    fn validate_overlap_capacity(
+        &self,
+        session: SessionId,
+        previously_enabled: bool,
+        next_enabled: bool,
+        scene: &Scene,
+    ) -> Result<(), ProgramSceneError> {
+        if !next_enabled || previously_enabled {
+            return Ok(());
+        }
+        let enabled = self
+            .nodes
+            .values()
+            .filter(|owned| {
+                owned.session == session
+                    && scene
+                        .node(owned.node)
+                        .is_some_and(|node| node.properties().overlap_enabled)
+            })
+            .count();
+        if enabled >= MAX_SESSION_OVERLAP_NODES {
+            return Err(ProgramSceneError::OverlapNodeLimitExceeded {
+                limit: MAX_SESSION_OVERLAP_NODES,
+            });
+        }
+        Ok(())
+    }
+
+    fn overlaps_for(
+        &self,
+        session: SessionId,
+        source: NodeHandle,
+        scene: &Scene,
+    ) -> Result<Vec<NodeHandle>, ProgramSceneError> {
+        let source = self.node_for(session, source)?;
+        let source_bounds = scene
+            .world_bounds(source)
+            .map_err(ProgramSceneError::Scene)?;
+        let mut overlaps = Vec::new();
+        for (handle, owned) in &self.nodes {
+            if owned.session != session || owned.node == source {
+                continue;
+            }
+            let Some(candidate) = scene.node(owned.node) else {
+                continue;
+            };
+            if !candidate.properties().overlap_enabled {
+                continue;
+            }
+            let candidate_bounds = scene
+                .world_bounds(owned.node)
+                .map_err(ProgramSceneError::Scene)?;
+            if source_bounds.intersects(candidate_bounds) {
+                overlaps.push(*handle);
+            }
+        }
+        Ok(overlaps)
+    }
+
+    fn reconcile_overlaps(
+        &mut self,
+        session: SessionId,
+        scene: &Scene,
+    ) -> Result<(), ProgramSceneError> {
+        let current = self.overlap_pairs_for_session(session, scene)?;
+        let previous = self
+            .overlap_pairs
+            .iter()
+            .filter(|pair| pair.session == session)
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let entered = current
+            .difference(&previous)
+            .copied()
+            .map(|pair| self.overlap_scene_event(pair, true))
+            .collect::<Result<Vec<_>, _>>()?;
+        let left = previous
+            .difference(&current)
+            .copied()
+            .map(|pair| self.overlap_scene_event(pair, false))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.overlap_pairs.retain(|pair| pair.session != session);
+        self.overlap_pairs.extend(current);
+        self.pending_overlap_events.extend(entered);
+        self.pending_overlap_events.extend(left);
+        Ok(())
+    }
+
+    fn overlap_pairs_for_session(
+        &self,
+        session: SessionId,
+        scene: &Scene,
+    ) -> Result<BTreeSet<OverlapPair>, ProgramSceneError> {
+        let nodes = self
+            .nodes
+            .iter()
+            .filter_map(|(handle, owned)| {
+                (owned.session == session
+                    && scene
+                        .node(owned.node)
+                        .is_some_and(|node| node.properties().overlap_enabled))
+                .then_some((*handle, owned.node))
+            })
+            .map(|(handle, node)| {
+                scene
+                    .world_bounds(node)
+                    .map(|bounds| (handle, bounds))
+                    .map_err(ProgramSceneError::Scene)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut pairs = BTreeSet::new();
+        for (index, (first_handle, first_bounds)) in nodes.iter().enumerate() {
+            for (second_handle, second_bounds) in nodes.iter().skip(index + 1) {
+                if first_bounds.intersects(*second_bounds) {
+                    pairs.insert(OverlapPair::new(session, *first_handle, *second_handle));
+                }
+            }
+        }
+        Ok(pairs)
+    }
+
+    fn overlap_scene_event(
+        &self,
+        pair: OverlapPair,
+        entering: bool,
+    ) -> Result<SceneEvent, ProgramSceneError> {
+        let first = self.node_for(pair.session, pair.first)?;
+        let second = self.node_for(pair.session, pair.second)?;
+        Ok(if entering {
+            SceneEvent::OverlapEnter { first, second }
+        } else {
+            SceneEvent::OverlapLeave { first, second }
+        })
+    }
+
+    fn discard_missing_overlap_pairs(&mut self) {
+        self.overlap_pairs.retain(|pair| {
+            self.nodes.contains_key(&pair.first) && self.nodes.contains_key(&pair.second)
+        });
     }
 
     fn set_content(
@@ -558,6 +778,7 @@ mod tests {
             visible: true,
             clip_children: false,
             z_index: 0,
+            overlap_enabled: false,
         }
     }
 
@@ -604,9 +825,14 @@ mod tests {
         };
         assert_eq!(scene.len(), 1);
         assert_eq!(textures.len(), 1);
+        let node = scene.roots()[0];
+        assert_eq!(resources.node_handle_for_session(session, node), Some(root));
+        assert_eq!(resources.session_for_node(node), Some(session));
         resources.cleanup_session(session, &mut scene, &mut textures);
         assert!(scene.is_empty());
         assert!(textures.is_empty());
+        assert_eq!(resources.node_handle_for_session(session, node), None);
+        assert_eq!(resources.session_for_node(node), None);
         assert!(matches!(
             resources.execute(
                 session,
@@ -748,5 +974,332 @@ mod tests {
             Err(ProgramSceneError::InvalidTextureHandle(_))
         ));
         assert!(scene.is_empty());
+    }
+
+    #[test]
+    fn reports_opt_in_overlaps_without_pointer_input() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let collider = |x, y, visible| NodePropertiesInput {
+            x,
+            y,
+            width: 10.0,
+            height: 10.0,
+            visible,
+            clip_children: false,
+            z_index: 0,
+            overlap_enabled: true,
+        };
+
+        let first = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: collider(0.0, 0.0, true),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        assert!(resources.drain_overlap_events().is_empty());
+
+        let second = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: collider(5.0, 0.0, false),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            resources.drain_overlap_events().as_slice(),
+            [SceneEvent::OverlapEnter { .. }]
+        ));
+        assert_eq!(
+            resources
+                .execute(
+                    session,
+                    SceneCommand::QueryOverlaps { node: first },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            SceneCommandResult::Overlaps(vec![second])
+        );
+
+        resources
+            .execute(
+                session,
+                SceneCommand::UpdateNode {
+                    node: second,
+                    properties: NodePropertiesPatch {
+                        x: Some(10.0),
+                        ..NodePropertiesPatch::default()
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(matches!(
+            resources.drain_overlap_events().as_slice(),
+            [SceneEvent::OverlapLeave { .. }]
+        ));
+        assert_eq!(
+            resources
+                .execute(
+                    session,
+                    SceneCommand::QueryOverlaps { node: first },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            SceneCommandResult::Overlaps(vec![])
+        );
+    }
+
+    #[test]
+    fn overlap_queries_are_owned_and_the_source_need_not_be_a_collider() {
+        let (first_session, second_session) = session_pair();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let properties_at = |x, overlap_enabled| NodePropertiesInput {
+            x,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            visible: true,
+            clip_children: false,
+            z_index: 0,
+            overlap_enabled,
+        };
+
+        let source = match resources
+            .execute(
+                first_session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties_at(0.0, false),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        let target = match resources
+            .execute(
+                first_session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties_at(5.0, true),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        let _foreign = resources
+            .execute(
+                second_session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties_at(5.0, true),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+
+        assert!(resources.drain_overlap_events().is_empty());
+        assert_eq!(
+            resources
+                .execute(
+                    first_session,
+                    SceneCommand::QueryOverlaps { node: source },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            SceneCommandResult::Overlaps(vec![target])
+        );
+    }
+
+    #[test]
+    fn overlap_reconciliation_includes_descendants_moved_by_an_ancestor() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let properties_at = |x, overlap_enabled| NodePropertiesInput {
+            x,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            visible: true,
+            clip_children: false,
+            z_index: 0,
+            overlap_enabled,
+        };
+        let _stationary = resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties_at(0.0, true),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        let parent = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties_at(20.0, false),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        let _child = resources
+            .execute(
+                session,
+                SceneCommand::CreateChild {
+                    parent,
+                    properties: properties_at(0.0, true),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(resources.drain_overlap_events().is_empty());
+
+        resources
+            .execute(
+                session,
+                SceneCommand::UpdateNode {
+                    node: parent,
+                    properties: NodePropertiesPatch {
+                        x: Some(5.0),
+                        ..NodePropertiesPatch::default()
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(matches!(
+            resources.drain_overlap_events().as_slice(),
+            [SceneEvent::OverlapEnter { .. }]
+        ));
+    }
+
+    #[test]
+    fn removing_a_node_cancels_overlap_pairs_without_a_leave_event() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let collider = |x| NodePropertiesInput {
+            x,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            visible: true,
+            clip_children: false,
+            z_index: 0,
+            overlap_enabled: true,
+        };
+        let first = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: collider(0.0),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        let second = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: collider(5.0),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            resources.drain_overlap_events().as_slice(),
+            [SceneEvent::OverlapEnter { .. }]
+        ));
+
+        resources
+            .execute(
+                session,
+                SceneCommand::RemoveNode { node: second },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(resources.drain_overlap_events().is_empty());
+        assert_eq!(
+            resources
+                .execute(
+                    session,
+                    SceneCommand::QueryOverlaps { node: first },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            SceneCommandResult::Overlaps(vec![])
+        );
     }
 }

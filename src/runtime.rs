@@ -276,6 +276,14 @@ pub enum SceneEvent {
         position: Vec2,
         modifiers: Modifiers,
     },
+    OverlapEnter {
+        first: NodeId,
+        second: NodeId,
+    },
+    OverlapLeave {
+        first: NodeId,
+        second: NodeId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
