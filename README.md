@@ -868,9 +868,10 @@ Al apagar el host, cada programa en ejecución recibe primero
 ventana de gracia de 250 ms; entonces, o al expirar la ventana, Chymeral envía
 el `closed` terminal con la misma razón y limpia los recursos de esa sesión.
 Los cierres iniciados por el cliente, por fallo o por violación de protocolo
-siguen entregando directamente su `closed` terminal. M13 no inicia programas,
-no interpreta sus argumentos ni expone un SDK: M14 encapsulará este contrato
-crudo y probado.
+siguen entregando directamente su `closed` terminal. M13 no inicia programas
+ni interpreta sus argumentos; M14 encapsula este contrato crudo y probado en
+un crate de cliente Rust independiente, sin convertirlo en una dependencia del
+host ni en un privilegio de lenguaje.
 
 ### Comandos de escena M12
 
@@ -1178,7 +1179,7 @@ M11 sesión local CLP: transporte, handshake, Init/Start y limpieza ✓
 M12 comandos de escena y recursos con ownership por programa ✓
 M13 entrega de Event/Tick/Frame, Resize y ciclo de cierre de programa ✓
 M13.2 overlap geométrico opcional por sesión, consulta y transiciones ✓
-M14 SDK de referencia, pruebas de conformidad y primer programa de prueba
+M14 SDK de referencia Rust, pruebas de conformidad y primer programa de prueba ✓
 M15 manifiesto mínimo de programa, capacidades y compatibilidad de paquete
 M16 IDL sólo si más de un SDK justifica generación de bindings
 ```

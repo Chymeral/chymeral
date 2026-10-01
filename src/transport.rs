@@ -49,6 +49,7 @@ const CLOSE_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ENDPOINT_BIND_ATTEMPTS: usize = 8;
 const MAX_HOST_NOTIFICATIONS_PER_ITERATION: usize = 4;
+const MAX_PENDING_RUNNING_OUTPUT_FRAMES: usize = MAX_HOST_NOTIFICATIONS_PER_ITERATION + 1;
 const WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -182,16 +183,6 @@ impl HostNotification {
                 state: WireTerminalState::OutputAvailable,
             }) => Some(NotificationCoalescingClass::TerminalOutputAvailable),
             Self::Event(_) | Self::Resize { .. } | Self::DeliveryGap { .. } => None,
-        }
-    }
-
-    const fn name(&self) -> &'static str {
-        match self {
-            Self::Event(_) => "event",
-            Self::Tick { .. } => "tick",
-            Self::Frame { .. } => "frame",
-            Self::Resize { .. } => "resize",
-            Self::DeliveryGap { .. } => "delivery_gap",
         }
     }
 }
@@ -1189,6 +1180,64 @@ struct RunningSession {
     notification_queue: Arc<NotificationQueue>,
 }
 
+#[derive(Default)]
+struct RunningFrameWriter {
+    frames: VecDeque<PendingHostFrame>,
+}
+
+struct PendingHostFrame {
+    bytes: Vec<u8>,
+    written: usize,
+}
+
+impl RunningFrameWriter {
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.frames.len() >= MAX_PENDING_RUNNING_OUTPUT_FRAMES
+    }
+
+    fn can_queue_notification(&self) -> bool {
+        self.frames.len() < MAX_HOST_NOTIFICATIONS_PER_ITERATION
+    }
+
+    fn queue(&mut self, message: &impl Serialize) -> Result<()> {
+        if self.is_full() {
+            return Err(anyhow!("the CLP running output queue is full"));
+        }
+        self.frames.push_back(PendingHostFrame {
+            bytes: json_frame_bytes(message)?,
+            written: 0,
+        });
+        Ok(())
+    }
+
+    fn flush(&mut self, stream: &mut impl Write) -> io::Result<()> {
+        loop {
+            let complete = {
+                let Some(frame) = self.frames.front_mut() else {
+                    return Ok(());
+                };
+                while frame.written < frame.bytes.len() {
+                    match stream.write(&frame.bytes[frame.written..]) {
+                        Ok(0) => return Ok(()),
+                        Ok(count) => frame.written += count,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) if read_would_block(&error) => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
+                true
+            };
+            if complete {
+                let _ = self.frames.pop_front();
+            }
+        }
+    }
+}
+
 fn run_running_session(
     stream: &mut LocalSocketStream,
     frame_reader: &mut FrameReader,
@@ -1203,35 +1252,77 @@ fn run_running_session(
         granted_capabilities,
         notification_queue,
     } = session;
+    let mut writer = RunningFrameWriter::default();
+    let mut terminal_response_queued = false;
     loop {
         if control.is_shutting_down() {
-            close_for_host_shutdown(stream, frame_reader, manager, session_id);
+            if writer.is_empty() {
+                close_for_host_shutdown(stream, frame_reader, manager, session_id);
+            } else {
+                terminate_session(manager, session_id, SessionCloseReason::HostShutdown);
+            }
             return;
         }
 
-        let mut delivered_notifications = 0;
-        while delivered_notifications < MAX_HOST_NOTIFICATIONS_PER_ITERATION {
-            let notification = match notification_queue.try_pop() {
-                NotificationPoll::Notification(notification) => notification,
-                NotificationPoll::Overloaded => {
-                    close_session(
-                        stream,
-                        manager,
-                        session_id,
-                        SessionCloseReason::HostOverloaded,
+        if let Err(error) = writer.flush(stream) {
+            eprintln!("Chymeral: could not flush CLP host output for {session_id}: {error:#}");
+            close_disconnected_session(manager, session_id);
+            return;
+        }
+        if terminal_response_queued && writer.is_empty() {
+            remove_terminated_session(manager, session_id);
+            return;
+        }
+
+        if !terminal_response_queued {
+            let mut queued_notifications = 0;
+            while queued_notifications < MAX_HOST_NOTIFICATIONS_PER_ITERATION
+                && writer.can_queue_notification()
+            {
+                let notification = match notification_queue.try_pop() {
+                    NotificationPoll::Notification(notification) => notification,
+                    NotificationPoll::Overloaded => {
+                        if writer.is_empty() {
+                            close_session(
+                                stream,
+                                manager,
+                                session_id,
+                                SessionCloseReason::HostOverloaded,
+                            );
+                        } else {
+                            terminate_session(
+                                manager,
+                                session_id,
+                                SessionCloseReason::HostOverloaded,
+                            );
+                        }
+                        return;
+                    }
+                    NotificationPoll::Empty => break,
+                };
+                if let Err(error) = writer.queue(&WireHostMessage::from_notification(
+                    session_id,
+                    notification,
+                )) {
+                    eprintln!(
+                        "Chymeral: could not queue a CLP host notification for {session_id}: {error:#}"
                     );
+                    close_disconnected_session(manager, session_id);
                     return;
                 }
-                NotificationPoll::Empty => break,
-            };
-            if let Err(error) = write_host_notification(stream, session_id, notification) {
-                eprintln!(
-                    "Chymeral: could not deliver a CLP host notification for {session_id}: {error:#}"
-                );
+                queued_notifications += 1;
+            }
+
+            if let Err(error) = writer.flush(stream) {
+                eprintln!("Chymeral: could not flush CLP host output for {session_id}: {error:#}");
                 close_disconnected_session(manager, session_id);
                 return;
             }
-            delivered_notifications += 1;
+        }
+
+        if writer.is_full() {
+            thread::sleep(LISTENER_POLL_INTERVAL);
+            continue;
         }
 
         let frame = match frame_reader.try_read_next_frame(stream, Some(control)) {
@@ -1261,11 +1352,10 @@ fn run_running_session(
             }) = serde_json::from_slice(payload)
         {
             if request_id.is_empty() {
-                let _ = write_error(
-                    stream,
-                    "invalid_command",
-                    "a scene command requires a non-empty request_id",
-                );
+                let _ = writer.queue(&WireHostMessage::Error {
+                    code: "invalid_command".to_owned(),
+                    message: "a scene command requires a non-empty request_id".to_owned(),
+                });
                 continue;
             }
             if !wire_command_is_granted(&command, granted_capabilities) {
@@ -1275,8 +1365,7 @@ fn run_running_session(
                     close_protocol_violation(stream, manager, session_id, &error.to_string());
                     return;
                 }
-                let _ = write_command_response(
-                    stream,
+                let _ = writer.queue(&command_response_message(
                     &request_id,
                     HostCommandResponse::Error {
                         code: "capability_denied",
@@ -1284,19 +1373,21 @@ fn run_running_session(
                             "the command requires a capability that this session was not granted"
                                 .to_owned(),
                     },
-                );
+                ));
                 continue;
             }
             let command = match read_scene_command(command, stream, frame_reader, control) {
                 Ok(command) => command,
                 Err(error) => {
-                    let _ = write_error(stream, "invalid_command", &error.to_string());
+                    let _ = writer.queue(&WireHostMessage::Error {
+                        code: "invalid_command".to_owned(),
+                        message: error.to_string(),
+                    });
                     continue;
                 }
             };
             if !command_is_granted(&command, granted_capabilities) {
-                let _ = write_command_response(
-                    stream,
+                let _ = writer.queue(&command_response_message(
                     &request_id,
                     HostCommandResponse::Error {
                         code: "capability_denied",
@@ -1304,14 +1395,17 @@ fn run_running_session(
                             "the command requires a capability that this session was not granted"
                                 .to_owned(),
                     },
-                );
+                ));
                 continue;
             }
             let response =
                 dispatch_host_command(broker, control, session_id, request_id.clone(), command);
             match response {
                 Ok(response) => {
-                    if write_command_response(stream, &request_id, response).is_err() {
+                    if writer
+                        .queue(&command_response_message(&request_id, response))
+                        .is_err()
+                    {
                         close_disconnected_session(manager, session_id);
                         return;
                     }
@@ -1321,14 +1415,13 @@ fn run_running_session(
                     return;
                 }
                 Err(error) => {
-                    let _ = write_command_response(
-                        stream,
+                    let _ = writer.queue(&command_response_message(
                         &request_id,
                         HostCommandResponse::Error {
                             code: "host_unavailable",
                             message: error.to_string(),
                         },
-                    );
+                    ));
                 }
             }
             continue;
@@ -1344,17 +1437,19 @@ fn run_running_session(
                 .collect();
             match notifications.set_subscriptions(session_id, subscriptions) {
                 Ok(subscriptions) => {
-                    if write_subscribed(stream, session_id, subscriptions).is_err() {
+                    let message = subscribed_message(session_id, subscriptions);
+                    if writer.queue(&message).is_err() {
                         close_disconnected_session(manager, session_id);
                         return;
                     }
                 }
                 Err(SubscriptionError::CapabilityDenied) => {
-                    let _ = write_error(
-                        stream,
-                        "capability_denied",
-                        "one or more subscriptions require a capability that this session was not granted",
-                    );
+                    let _ = writer.queue(&WireHostMessage::Error {
+                        code: "capability_denied".to_owned(),
+                        message:
+                            "one or more subscriptions require a capability that this session was not granted"
+                                .to_owned(),
+                    });
                 }
                 Err(SubscriptionError::SessionUnavailable) => {
                     close_disconnected_session(manager, session_id);
@@ -1367,7 +1462,11 @@ fn run_running_session(
         let client_message = match client_message_from_frame(frame) {
             Ok(message) => message,
             Err(error) => {
-                close_protocol_violation(stream, manager, session_id, &error.to_string());
+                if writer.is_empty() {
+                    close_protocol_violation(stream, manager, session_id, &error.to_string());
+                } else {
+                    terminate_session(manager, session_id, SessionCloseReason::ProtocolViolation);
+                }
                 return;
             }
         };
@@ -1386,21 +1485,21 @@ fn run_running_session(
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                close_protocol_violation(stream, manager, session_id, &error.to_string());
+                if writer.is_empty() {
+                    close_protocol_violation(stream, manager, session_id, &error.to_string());
+                } else {
+                    terminate_session(manager, session_id, SessionCloseReason::ProtocolViolation);
+                }
                 return;
             }
         };
         if let Some(response) = response {
             let terminal = matches!(response, HostMessage::Closed { .. });
-            let write_result = write_host_message(stream, response);
-            if terminal {
-                remove_terminated_session(manager, session_id);
-                return;
-            }
-            if write_result.is_err() {
+            if writer.queue(&WireHostMessage::from(response)).is_err() {
                 close_disconnected_session(manager, session_id);
                 return;
             }
+            terminal_response_queued = terminal;
         }
     }
 }
@@ -1457,14 +1556,23 @@ fn close_protocol_violation(
 }
 
 fn close_disconnected_session(manager: &Arc<Mutex<SessionManager>>, session_id: SessionId) {
+    terminate_session(
+        manager,
+        session_id,
+        SessionCloseReason::TransportDisconnected,
+    );
+}
+
+fn terminate_session(
+    manager: &Arc<Mutex<SessionManager>>,
+    session_id: SessionId,
+    reason: SessionCloseReason,
+) {
     let mut manager = match manager.lock() {
         Ok(manager) => manager,
         Err(_) => return,
     };
-    if manager
-        .close(session_id, SessionCloseReason::TransportDisconnected)
-        .is_ok()
-    {
+    if manager.close(session_id, reason).is_ok() {
         let _ = manager.remove_terminated(session_id);
     }
 }
@@ -1562,34 +1670,17 @@ fn write_host_message(stream: &mut LocalSocketStream, message: HostMessage) -> R
     write_frame(stream, &WireHostMessage::from(message))
 }
 
-fn write_host_notification(
-    stream: &mut LocalSocketStream,
-    session_id: SessionId,
-    notification: HostNotification,
-) -> Result<()> {
-    let name = notification.name();
-    write_frame(
-        stream,
-        &WireHostMessage::from_notification(session_id, notification),
-    )
-    .with_context(|| format!("could not write the CLP {name} notification"))
-}
-
-fn write_subscribed(
-    stream: &mut LocalSocketStream,
+fn subscribed_message(
     session_id: SessionId,
     subscriptions: BTreeSet<Subscription>,
-) -> Result<()> {
-    write_frame(
-        stream,
-        &WireHostMessage::Subscribed {
-            session_id: session_id.to_string(),
-            subscriptions: subscriptions
-                .into_iter()
-                .map(WireSubscription::from)
-                .collect(),
-        },
-    )
+) -> WireHostMessage {
+    WireHostMessage::Subscribed {
+        session_id: session_id.to_string(),
+        subscriptions: subscriptions
+            .into_iter()
+            .map(WireSubscription::from)
+            .collect(),
+    }
 }
 
 fn write_host_closing(
@@ -1606,27 +1697,17 @@ fn write_host_closing(
     )
 }
 
-fn write_command_response(
-    stream: &mut LocalSocketStream,
-    request_id: &str,
-    response: HostCommandResponse,
-) -> Result<()> {
+fn command_response_message(request_id: &str, response: HostCommandResponse) -> WireHostMessage {
     match response {
-        HostCommandResponse::Success(result) => write_frame(
-            stream,
-            &WireHostMessage::Result {
-                request_id: request_id.to_owned(),
-                result: result.into(),
-            },
-        ),
-        HostCommandResponse::Error { code, message } => write_frame(
-            stream,
-            &WireHostMessage::CommandError {
-                request_id: request_id.to_owned(),
-                code: code.to_owned(),
-                message,
-            },
-        ),
+        HostCommandResponse::Success(result) => WireHostMessage::Result {
+            request_id: request_id.to_owned(),
+            result: result.into(),
+        },
+        HostCommandResponse::Error { code, message } => WireHostMessage::CommandError {
+            request_id: request_id.to_owned(),
+            code: code.to_owned(),
+            message,
+        },
     }
 }
 
@@ -2058,8 +2139,9 @@ fn read_would_block(error: &io::Error) -> bool {
 }
 
 fn write_frame<T: Serialize>(stream: &mut impl Write, message: &T) -> Result<()> {
-    let payload = serde_json::to_vec(message).context("could not encode the CLP JSON message")?;
-    write_raw_frame(stream, b'J', &payload)
+    write_all_nonblocking(stream, &json_frame_bytes(message)?)
+        .context("could not write the CLP JSON frame")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2067,7 +2149,19 @@ fn write_binary_frame(stream: &mut impl Write, payload: &[u8]) -> Result<()> {
     write_raw_frame(stream, b'B', payload)
 }
 
+#[cfg(test)]
 fn write_raw_frame(stream: &mut impl Write, kind: u8, payload: &[u8]) -> Result<()> {
+    write_all_nonblocking(stream, &raw_frame_bytes(kind, payload)?)
+        .context("could not write the CLP frame")?;
+    Ok(())
+}
+
+fn json_frame_bytes(message: &impl Serialize) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(message).context("could not encode the CLP JSON message")?;
+    raw_frame_bytes(b'J', &payload)
+}
+
+fn raw_frame_bytes(kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
     let frame_length = payload
         .len()
         .checked_add(1)
@@ -2078,11 +2172,11 @@ fn write_raw_frame(stream: &mut impl Write, kind: u8, payload: &[u8]) -> Result<
         ));
     }
     let length = u32::try_from(frame_length).context("the CLP frame is too large")?;
-    write_all_nonblocking(stream, &length.to_be_bytes())
-        .context("could not write the CLP frame length")?;
-    write_all_nonblocking(stream, &[kind]).context("could not write the CLP frame kind")?;
-    write_all_nonblocking(stream, payload).context("could not write the CLP frame payload")?;
-    Ok(())
+    let mut bytes = Vec::with_capacity(4 + frame_length);
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.push(kind);
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
 }
 
 fn write_all_nonblocking(stream: &mut impl Write, mut bytes: &[u8]) -> io::Result<()> {
@@ -2092,7 +2186,7 @@ fn write_all_nonblocking(stream: &mut impl Write, mut bytes: &[u8]) -> io::Resul
             Ok(0) => wait_for_write_capacity(deadline)?,
             Ok(written) => bytes = &bytes[written..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if read_would_block(&error) => {
                 wait_for_write_capacity(deadline)?;
             }
             Err(error) => return Err(error),
@@ -3392,6 +3486,76 @@ mod tests {
             writer.bytes,
             [0, 0, 0, 8, b'J', b'p', b'a', b'y', b'l', b'o', b'a', b'd']
         );
+    }
+
+    #[test]
+    fn retains_queued_output_until_transient_backpressure_clears() {
+        let first = json!({ "type": "event", "sequence": 1 });
+        let second = json!({ "type": "event", "sequence": 2 });
+        let expected = [
+            json_frame_bytes(&first).unwrap(),
+            json_frame_bytes(&second).unwrap(),
+        ]
+        .concat();
+        let mut frames = RunningFrameWriter::default();
+        frames.queue(&first).unwrap();
+        frames.queue(&second).unwrap();
+        let mut writer = IntermittentWriter {
+            bytes: Vec::new(),
+            write_attempts: 0,
+        };
+
+        while !frames.is_empty() {
+            frames.flush(&mut writer).unwrap();
+        }
+
+        assert_eq!(writer.bytes, expected);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn preserves_a_running_session_during_named_pipe_backpressure() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["input"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+        let session_id = wait_for_session_started(&server);
+        server.activate_session(session_id, 900, 600, 1.0);
+        let resize = receive_host(&mut client);
+        assert_eq!(resize["type"], "resize");
+        send_client(
+            &mut client,
+            WireClientMessage::Subscribe {
+                subscriptions: vec![WireSubscription::RawInput],
+            },
+        );
+        let _ = receive_host(&mut client);
+
+        let payload = vec![0_u8; 2 * 1024];
+        server.broadcast_event(&EngineEvent::Custom(crate::runtime::CustomEvent {
+            name: "backpressure".to_owned(),
+            payload: payload.clone(),
+        }));
+        thread::sleep(WRITE_STALL_TIMEOUT + Duration::from_millis(250));
+
+        assert_eq!(server.session_count().unwrap(), 1);
+        let event = receive_host(&mut client);
+        assert_eq!(event["type"], "event");
+        assert_eq!(event["event"]["kind"], "custom");
+        assert_eq!(event["event"]["name"], "backpressure");
+        assert_eq!(
+            event["event"]["payload"].as_array().unwrap().len(),
+            payload.len()
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let closed = receive_host(&mut client);
+        assert_eq!(closed["type"], "closed");
+        assert_eq!(closed["reason"], json!({ "kind": "client_requested" }));
+        wait_for_session_count(&server, 0);
     }
 
     fn receive_host(stream: &mut LocalSocketStream) -> Value {
