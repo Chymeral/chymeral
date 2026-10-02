@@ -93,6 +93,31 @@ struct Cursor {
     row: u16,
 }
 
+#[derive(Clone, Debug)]
+struct ScrollbackRow {
+    cells: Vec<Cell>,
+    soft_wrapped: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionPoint {
+    row: usize,
+    column: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalSelection {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectionRange {
+    pub row: u16,
+    pub start_column: u16,
+    pub end_column: u16,
+}
+
 #[derive(Debug)]
 struct Grid {
     columns: u16,
@@ -107,8 +132,11 @@ struct Grid {
     auto_wrap: bool,
     cursor_visible: bool,
     pen: TextStyle,
-    scrollback: VecDeque<Vec<Cell>>,
+    soft_wrapped: Vec<bool>,
+    scrollback: VecDeque<ScrollbackRow>,
     scrollback_capacity: usize,
+    scrollback_generation: u64,
+    scrollback_discarded: u64,
 }
 
 impl Grid {
@@ -135,8 +163,11 @@ impl Grid {
             auto_wrap: true,
             cursor_visible: true,
             pen: default_style,
+            soft_wrapped: vec![false; usize::from(rows)],
             scrollback: VecDeque::new(),
             scrollback_capacity,
+            scrollback_generation: 0,
+            scrollback_discarded: 0,
         }
     }
 
@@ -167,6 +198,7 @@ impl Grid {
     fn clear_row(&mut self, row: u16) {
         let blank = Cell::blank(self.default_style);
         self.row_mut(row).fill(blank);
+        self.soft_wrapped[usize::from(row)] = false;
     }
 
     fn resize(&mut self, columns: u16, rows: u16) {
@@ -188,6 +220,7 @@ impl Grid {
         self.columns = columns;
         self.rows = rows;
         self.cells = cells;
+        self.soft_wrapped.resize(usize::from(rows), false);
         self.cursor.column = self.cursor.column.min(columns - 1);
         self.cursor.row = self.cursor.row.min(rows - 1);
         self.saved_cursor.column = self.saved_cursor.column.min(columns - 1);
@@ -207,6 +240,10 @@ impl Grid {
         self.auto_wrap = true;
         self.cursor_visible = true;
         self.pen = self.default_style;
+        self.soft_wrapped.fill(false);
+        self.scrollback.clear();
+        self.scrollback_generation = 0;
+        self.scrollback_discarded = 0;
     }
 
     fn save_cursor(&mut self) {
@@ -250,6 +287,11 @@ impl Grid {
         }
     }
 
+    fn soft_wrap(&mut self) {
+        self.soft_wrapped[usize::from(self.cursor.row)] = true;
+        self.linefeed();
+    }
+
     fn reverse_index(&mut self) {
         self.wrap_pending = false;
         if self.cursor.row == self.scroll_top {
@@ -263,7 +305,10 @@ impl Grid {
         let count = count.min(self.scroll_bottom - self.scroll_top + 1);
 
         for _ in 0..count {
-            let removed = self.row(self.scroll_top).to_vec();
+            let removed = ScrollbackRow {
+                cells: self.row(self.scroll_top).to_vec(),
+                soft_wrapped: self.soft_wrapped[usize::from(self.scroll_top)],
+            };
             if self.scroll_top == 0 && self.scroll_bottom == self.rows - 1 {
                 self.push_scrollback(removed);
             }
@@ -271,6 +316,7 @@ impl Grid {
             for row in self.scroll_top..self.scroll_bottom {
                 let next = self.row(row + 1).to_vec();
                 self.row_mut(row).clone_from_slice(&next);
+                self.soft_wrapped[usize::from(row)] = self.soft_wrapped[usize::from(row + 1)];
             }
             self.clear_row(self.scroll_bottom);
         }
@@ -283,20 +329,29 @@ impl Grid {
             for row in (self.scroll_top + 1..=self.scroll_bottom).rev() {
                 let previous = self.row(row - 1).to_vec();
                 self.row_mut(row).clone_from_slice(&previous);
+                self.soft_wrapped[usize::from(row)] = self.soft_wrapped[usize::from(row - 1)];
             }
             self.clear_row(self.scroll_top);
         }
     }
 
-    fn push_scrollback(&mut self, row: Vec<Cell>) {
+    fn push_scrollback(&mut self, row: ScrollbackRow) {
         if self.scrollback_capacity == 0 {
             return;
         }
 
         if self.scrollback.len() == self.scrollback_capacity {
             self.scrollback.pop_front();
+            self.scrollback_discarded = self.scrollback_discarded.saturating_add(1);
         }
         self.scrollback.push_back(row);
+        self.scrollback_generation = self.scrollback_generation.saturating_add(1);
+    }
+
+    fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.scrollback_generation = 0;
+        self.scrollback_discarded = 0;
     }
 
     fn cursor_up(&mut self, count: u16) {
@@ -354,8 +409,11 @@ impl Grid {
                 }
                 self.erase_in_line(1);
             }
-            2 => self.cells.fill(Cell::blank(self.default_style)),
-            3 => self.scrollback.clear(),
+            2 => {
+                self.cells.fill(Cell::blank(self.default_style));
+                self.soft_wrapped.fill(false);
+            }
+            3 => self.clear_scrollback(),
             _ => {}
         }
     }
@@ -427,6 +485,7 @@ impl Grid {
             for row in (self.cursor.row + 1..=self.scroll_bottom).rev() {
                 let previous = self.row(row - 1).to_vec();
                 self.row_mut(row).clone_from_slice(&previous);
+                self.soft_wrapped[usize::from(row)] = self.soft_wrapped[usize::from(row - 1)];
             }
             self.clear_row(self.cursor.row);
         }
@@ -442,6 +501,7 @@ impl Grid {
             for row in self.cursor.row..self.scroll_bottom {
                 let next = self.row(row + 1).to_vec();
                 self.row_mut(row).clone_from_slice(&next);
+                self.soft_wrapped[usize::from(row)] = self.soft_wrapped[usize::from(row + 1)];
             }
             self.clear_row(self.scroll_bottom);
         }
@@ -456,14 +516,14 @@ impl Grid {
 
         if self.wrap_pending && self.auto_wrap {
             self.cursor.column = 0;
-            self.linefeed();
+            self.soft_wrap();
         }
         self.wrap_pending = false;
 
         if width == 2 && self.cursor.column == self.columns - 1 {
             if self.auto_wrap {
                 self.cursor.column = 0;
-                self.linefeed();
+                self.soft_wrap();
             } else {
                 self.clear_cell(self.cursor.column, self.cursor.row);
                 return;
@@ -507,14 +567,84 @@ impl Grid {
         }
     }
 
-    fn text_spans(&self, include_cursor: bool, trim_trailing_blanks: bool) -> Vec<TextSpan> {
+    fn display_start(&self, viewport_offset: usize) -> usize {
+        self.scrollback.len().saturating_sub(viewport_offset)
+    }
+
+    fn row_for_global(&self, row: usize) -> Option<&[Cell]> {
+        if row < self.scrollback.len() {
+            self.scrollback.get(row).map(|row| row.cells.as_slice())
+        } else {
+            let row = u16::try_from(row - self.scrollback.len()).ok()?;
+            (row < self.rows).then(|| self.row(row))
+        }
+    }
+
+    fn soft_wrapped_for_global(&self, row: usize) -> Option<bool> {
+        if row < self.scrollback.len() {
+            self.scrollback.get(row).map(|row| row.soft_wrapped)
+        } else {
+            let row = u16::try_from(row - self.scrollback.len()).ok()?;
+            self.soft_wrapped.get(usize::from(row)).copied()
+        }
+    }
+
+    fn selection_start_column(&self, row: usize, column: u16) -> u16 {
+        let Some(cells) = self.row_for_global(row) else {
+            return column;
+        };
+        let mut column = column.min(self.columns);
+        while column > 0 && column < self.columns && cells[usize::from(column)].continuation {
+            column -= 1;
+        }
+        column
+    }
+
+    fn selection_end_column(&self, row: usize, column: u16) -> u16 {
+        let Some(cells) = self.row_for_global(row) else {
+            return column;
+        };
+        let column = column.min(self.columns);
+        if column < self.columns && cells[usize::from(column)].continuation {
+            (column + 1).min(self.columns)
+        } else {
+            column
+        }
+    }
+
+    fn text_spans(
+        &self,
+        include_cursor: bool,
+        trim_trailing_blanks: bool,
+        viewport_offset: usize,
+    ) -> Vec<TextSpan> {
         let mut spans = Vec::new();
+        let start = self.display_start(viewport_offset);
 
         for row in 0..self.rows {
-            let columns = self.rendered_columns(row, include_cursor, trim_trailing_blanks);
+            let global_row = start + usize::from(row);
+            let Some(cells) = self.row_for_global(global_row) else {
+                continue;
+            };
+            let grid_row = global_row
+                .checked_sub(self.scrollback.len())
+                .and_then(|row| u16::try_from(row).ok());
+            let cursor_visible = include_cursor && viewport_offset == 0 && grid_row.is_some();
+            let columns = self.rendered_columns_for_cells(
+                cells,
+                grid_row,
+                cursor_visible,
+                trim_trailing_blanks,
+            );
             for column in 0..columns {
-                let cell = &self.row(row)[usize::from(column)];
-                if include_cursor && self.cursor_visible && self.cursor == (Cursor { column, row })
+                let cell = &cells[usize::from(column)];
+                if cursor_visible
+                    && self.cursor_visible
+                    && self.cursor
+                        == (Cursor {
+                            column,
+                            row: grid_row.expect("cursor visibility requires a grid row"),
+                        })
                 {
                     Self::append_span(&mut spans, "▏", cell.style);
                 } else if !cell.continuation {
@@ -522,7 +652,7 @@ impl Grid {
                 }
             }
             if row + 1 < self.rows {
-                let style = self.row(row)[usize::from(self.columns - 1)].style;
+                let style = cells[usize::from(self.columns - 1)].style;
                 Self::append_span(&mut spans, "\n", style);
             }
         }
@@ -530,7 +660,13 @@ impl Grid {
         spans
     }
 
-    fn rendered_columns(&self, row: u16, include_cursor: bool, trim_trailing_blanks: bool) -> u16 {
+    fn rendered_columns_for_cells(
+        &self,
+        cells: &[Cell],
+        grid_row: Option<u16>,
+        include_cursor: bool,
+        trim_trailing_blanks: bool,
+    ) -> u16 {
         if !trim_trailing_blanks {
             return self.columns;
         }
@@ -538,8 +674,12 @@ impl Grid {
         (0..self.columns)
             .rev()
             .find(|&column| {
-                let cell = &self.row(row)[usize::from(column)];
-                (include_cursor && self.cursor_visible && self.cursor == (Cursor { column, row }))
+                let cell = &cells[usize::from(column)];
+                (include_cursor
+                    && self.cursor_visible
+                    && grid_row
+                        .map(|row| self.cursor == (Cursor { column, row }))
+                        .unwrap_or(false))
                     || (!cell.continuation && cell.text != " ")
             })
             .map_or(0, |column| column + 1)
@@ -562,7 +702,7 @@ impl Grid {
 
     #[cfg(test)]
     fn text(&self, include_cursor: bool) -> String {
-        self.text_spans(include_cursor, false)
+        self.text_spans(include_cursor, false, 0)
             .into_iter()
             .map(|span| span.text)
             .collect()
@@ -744,6 +884,7 @@ struct TerminalState {
     primary_cursor_before_alternate: Cursor,
     title: String,
     responses: Vec<Vec<u8>>,
+    bracketed_paste: bool,
 }
 
 impl TerminalState {
@@ -755,6 +896,7 @@ impl TerminalState {
             primary_cursor_before_alternate: Cursor::default(),
             title: String::new(),
             responses: Vec::new(),
+            bracketed_paste: false,
         }
     }
 
@@ -784,6 +926,7 @@ impl TerminalState {
         self.primary_cursor_before_alternate = Cursor::default();
         self.title.clear();
         self.responses.clear();
+        self.bracketed_paste = false;
     }
 
     fn enter_alternate_screen(&mut self) {
@@ -861,6 +1004,8 @@ impl Perform for TerminalState {
                 'l' if parameters.contains(&25) => self.active_grid_mut().cursor_visible = false,
                 'h' if parameters.contains(&7) => self.active_grid_mut().auto_wrap = true,
                 'l' if parameters.contains(&7) => self.active_grid_mut().auto_wrap = false,
+                'h' if parameters.contains(&2004) => self.bracketed_paste = true,
+                'l' if parameters.contains(&2004) => self.bracketed_paste = false,
                 _ => {}
             }
             return;
@@ -937,6 +1082,10 @@ pub struct Terminal {
     parser: Parser,
     state: TerminalState,
     dirty: bool,
+    viewport_offset: usize,
+    selection: Option<TerminalSelection>,
+    observed_scrollback_generation: u64,
+    observed_scrollback_discarded: u64,
 }
 
 impl Terminal {
@@ -945,16 +1094,25 @@ impl Terminal {
             parser: Parser::new(),
             state: TerminalState::new(columns, rows, foreground),
             dirty: true,
+            viewport_offset: 0,
+            selection: None,
+            observed_scrollback_generation: 0,
+            observed_scrollback_discarded: 0,
         }
     }
 
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.state, bytes);
+        self.reconcile_scrollback();
         self.dirty = true;
     }
 
     pub fn resize(&mut self, columns: u16, rows: u16) {
         self.state.resize(columns, rows);
+        self.viewport_offset = self
+            .viewport_offset
+            .min(self.state.primary.scrollback.len());
+        self.selection = None;
         self.dirty = true;
     }
 
@@ -967,7 +1125,204 @@ impl Terminal {
     }
 
     pub(crate) fn render_spans(&self) -> Vec<TextSpan> {
-        self.state.active_grid().text_spans(true, true)
+        let viewport_offset = matches!(self.state.active, ActiveScreen::Primary)
+            .then_some(self.viewport_offset)
+            .unwrap_or(0);
+        self.state
+            .active_grid()
+            .text_spans(true, true, viewport_offset)
+    }
+
+    pub(crate) fn scroll_view_by(&mut self, lines: i32) -> bool {
+        if !matches!(self.state.active, ActiveScreen::Primary) || lines == 0 {
+            return false;
+        }
+
+        let maximum = self.state.primary.scrollback.len();
+        let previous = self.viewport_offset;
+        if lines.is_positive() {
+            self.viewport_offset = self
+                .viewport_offset
+                .saturating_add(lines.unsigned_abs() as usize)
+                .min(maximum);
+        } else {
+            self.viewport_offset = self
+                .viewport_offset
+                .saturating_sub(lines.unsigned_abs() as usize);
+        }
+        if self.viewport_offset == previous {
+            return false;
+        }
+        self.dirty = true;
+        true
+    }
+
+    pub(crate) fn scroll_to_bottom(&mut self) -> bool {
+        if self.viewport_offset == 0 {
+            return false;
+        }
+        self.viewport_offset = 0;
+        self.dirty = true;
+        true
+    }
+
+    pub(crate) fn begin_selection(&mut self, row: u16, column: u16) -> bool {
+        let Some(point) = self.selection_point(row, column) else {
+            return false;
+        };
+        self.selection = Some(TerminalSelection {
+            anchor: point,
+            focus: point,
+        });
+        true
+    }
+
+    pub(crate) fn extend_selection(&mut self, row: u16, column: u16) -> bool {
+        let Some(point) = self.selection_point(row, column) else {
+            return false;
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return false;
+        };
+        if selection.focus == point {
+            return false;
+        }
+        selection.focus = point;
+        true
+    }
+
+    pub(crate) fn selection_ranges(&self) -> Vec<SelectionRange> {
+        let Some((start, end)) = self.selection_bounds() else {
+            return Vec::new();
+        };
+        let grid = &self.state.primary;
+        let display_start = grid.display_start(self.viewport_offset);
+        let display_end = display_start + usize::from(grid.rows);
+        let first = start.row.max(display_start);
+        let last = end.row.min(display_end.saturating_sub(1));
+        if first > last {
+            return Vec::new();
+        }
+
+        (first..=last)
+            .filter_map(|global_row| {
+                let start_column = if global_row == start.row {
+                    start.column
+                } else {
+                    0
+                };
+                let end_column = if global_row == end.row {
+                    end.column
+                } else {
+                    grid.columns
+                };
+                (start_column < end_column).then_some(SelectionRange {
+                    row: u16::try_from(global_row - display_start).ok()?,
+                    start_column,
+                    end_column,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_bounds()?;
+        let grid = &self.state.primary;
+        let mut text = String::new();
+        for row in start.row..=end.row {
+            let cells = grid.row_for_global(row)?;
+            let start_column = if row == start.row { start.column } else { 0 };
+            let end_column = if row == end.row {
+                end.column
+            } else {
+                grid.columns
+            };
+            let mut line = String::new();
+            for cell in &cells[usize::from(start_column)..usize::from(end_column)] {
+                if !cell.continuation {
+                    line.push_str(&cell.text);
+                }
+            }
+            text.push_str(line.trim_end_matches(' '));
+            if row < end.row && !grid.soft_wrapped_for_global(row).unwrap_or(false) {
+                text.push('\n');
+            }
+        }
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub(crate) fn bracketed_paste_enabled(&self) -> bool {
+        self.state.bracketed_paste
+    }
+
+    fn selection_point(&self, row: u16, column: u16) -> Option<SelectionPoint> {
+        if !matches!(self.state.active, ActiveScreen::Primary) || row >= self.state.primary.rows {
+            return None;
+        }
+        Some(SelectionPoint {
+            row: self.state.primary.display_start(self.viewport_offset) + usize::from(row),
+            column: column.min(self.state.primary.columns),
+        })
+    }
+
+    fn selection_bounds(&self) -> Option<(SelectionPoint, SelectionPoint)> {
+        if !matches!(self.state.active, ActiveScreen::Primary) {
+            return None;
+        }
+        let selection = self.selection?;
+        let (mut start, mut end) = if selection.anchor <= selection.focus {
+            (selection.anchor, selection.focus)
+        } else {
+            (selection.focus, selection.anchor)
+        };
+        let grid = &self.state.primary;
+        start.column = grid.selection_start_column(start.row, start.column);
+        end.column = grid.selection_end_column(end.row, end.column);
+        (start < end).then_some((start, end))
+    }
+
+    fn reconcile_scrollback(&mut self) {
+        let grid = &self.state.primary;
+        if grid.scrollback_generation < self.observed_scrollback_generation
+            || grid.scrollback_discarded < self.observed_scrollback_discarded
+        {
+            self.viewport_offset = 0;
+            self.selection = None;
+        }
+        let pushed = grid
+            .scrollback_generation
+            .saturating_sub(self.observed_scrollback_generation);
+        let discarded = grid
+            .scrollback_discarded
+            .saturating_sub(self.observed_scrollback_discarded);
+        if self.viewport_offset > 0 {
+            self.viewport_offset = self
+                .viewport_offset
+                .saturating_add(usize::try_from(pushed).unwrap_or(usize::MAX))
+                .min(grid.scrollback.len());
+        }
+        if discarded > 0 {
+            let discarded = usize::try_from(discarded).unwrap_or(usize::MAX);
+            let clear_selection = self.selection.as_ref().is_some_and(|selection| {
+                selection.anchor.row < discarded || selection.focus.row < discarded
+            });
+            if clear_selection {
+                self.selection = None;
+            } else if let Some(selection) = self.selection.as_mut()
+                && selection.anchor.row >= discarded
+                && selection.focus.row >= discarded
+            {
+                selection.anchor.row -= discarded;
+                selection.focus.row -= discarded;
+            }
+        }
+        self.observed_scrollback_generation = grid.scrollback_generation;
+        self.observed_scrollback_discarded = grid.scrollback_discarded;
+        self.viewport_offset = self.viewport_offset.min(grid.scrollback.len());
+        if !matches!(self.state.active, ActiveScreen::Primary) {
+            self.viewport_offset = 0;
+            self.selection = None;
+        }
     }
 
     #[cfg(test)]
@@ -977,7 +1332,7 @@ impl Terminal {
 
     #[cfg(test)]
     pub fn visible_spans(&self) -> Vec<TextSpan> {
-        self.state.active_grid().text_spans(false, false)
+        self.state.active_grid().text_spans(false, false, 0)
     }
 
     pub fn title(&self) -> &str {
@@ -1110,6 +1465,115 @@ mod tests {
             .collect();
 
         assert_eq!(rendered, "text\n   ▏");
+    }
+
+    #[test]
+    fn selects_across_scrollback_rows() {
+        let mut terminal = terminal(4, 2);
+        terminal.advance(b"one\r\ntwo\r\nend");
+
+        assert!(terminal.scroll_view_by(1));
+        assert!(terminal.begin_selection(0, 0));
+        assert!(terminal.extend_selection(1, 3));
+
+        assert_eq!(terminal.selected_text(), Some("one\ntwo".to_owned()));
+        assert_eq!(
+            terminal.selection_ranges(),
+            vec![
+                super::SelectionRange {
+                    row: 0,
+                    start_column: 0,
+                    end_column: 4,
+                },
+                super::SelectionRange {
+                    row: 1,
+                    start_column: 0,
+                    end_column: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_keeps_a_wide_character_intact() {
+        let mut terminal = terminal(5, 1);
+        terminal.advance("A界B".as_bytes());
+
+        assert!(terminal.begin_selection(0, 1));
+        assert!(terminal.extend_selection(0, 2));
+
+        assert_eq!(terminal.selected_text(), Some("界".to_owned()));
+        assert_eq!(
+            terminal.selection_ranges(),
+            vec![super::SelectionRange {
+                row: 0,
+                start_column: 1,
+                end_column: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn selection_keeps_combining_marks_with_their_base_character() {
+        let mut terminal = terminal(5, 1);
+        terminal.advance("e\u{301}x".as_bytes());
+
+        assert!(terminal.begin_selection(0, 0));
+        assert!(terminal.extend_selection(0, 1));
+
+        assert_eq!(terminal.selected_text(), Some("e\u{301}".to_owned()));
+    }
+
+    #[test]
+    fn selection_does_not_add_a_newline_for_a_soft_wrapped_row() {
+        let mut terminal = terminal(3, 2);
+        terminal.advance(b"abcdef");
+
+        assert!(terminal.begin_selection(0, 0));
+        assert!(terminal.extend_selection(1, 3));
+
+        assert_eq!(terminal.selected_text(), Some("abcdef".to_owned()));
+    }
+
+    #[test]
+    fn keeps_the_scrollback_view_stable_when_new_output_arrives() {
+        let mut terminal = terminal(4, 2);
+        terminal.advance(b"one\r\ntwo\r\nend");
+        assert!(terminal.scroll_view_by(1));
+
+        terminal.advance(b"\r\nnext");
+        let rendered: String = terminal
+            .render_spans()
+            .into_iter()
+            .map(|span| span.text)
+            .collect();
+
+        assert!(rendered.starts_with("one\ntwo"));
+    }
+
+    #[test]
+    fn clearing_scrollback_invalidates_a_history_selection() {
+        let mut terminal = terminal(4, 2);
+        terminal.advance(b"one\r\ntwo\r\nend");
+        assert!(terminal.scroll_view_by(1));
+        assert!(terminal.begin_selection(0, 0));
+        assert!(terminal.extend_selection(1, 3));
+
+        terminal.advance(b"\x1b[3J");
+
+        assert_eq!(terminal.selected_text(), None);
+        assert!(terminal.selection_ranges().is_empty());
+    }
+
+    #[test]
+    fn tracks_bracketed_paste_mode() {
+        let mut terminal = terminal(4, 1);
+
+        terminal.advance(b"\x1b[?2004h");
+        assert!(terminal.bracketed_paste_enabled());
+
+        terminal.advance(b"\x1b[?2004l");
+        assert!(!terminal.bracketed_paste_enabled());
     }
 
     #[test]

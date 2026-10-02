@@ -57,14 +57,22 @@ uses `$SHELL`, then `/bin/sh`. On Windows it uses `CHYMERAL_SHELL`, then
 
 The terminal provides a PTY-backed ANSI/VT grid with UTF-8 input, common
 control and navigation keys, terminal resizing, OSC 0/2 titles, alternate
-screen support, bounded scrollback, and ANSI SGR colors. It sets
-`TERM=xterm-256color`.
+screen support, bounded scrollback, pointer selection, system-clipboard copy
+and paste, and ANSI SGR colors. It sets `TERM=xterm-256color`.
+
+Use the pointer wheel over unobscured terminal space to view scrollback. Drag
+with the primary pointer button to select primary-screen text, including
+scrollback, then copy it with `Ctrl+Shift+C`. `Ctrl+Shift+V` inserts regular
+system-clipboard text into the PTY without an implicit Enter. For safety,
+multiline text is accepted only while the foreground terminal program has
+enabled bracketed paste (DECSET 2004); Chymeral then sends the standard
+bracketed-paste delimiters. Linux primary selection and middle-click paste are
+not implemented.
 
 This is deliberately a focused terminal implementation, not a promise of every
-VT extension. Features such as selection, visual scrollback navigation, mouse
-terminal protocols, device-query coverage beyond its required startup behavior,
-background color attributes, and text decorations are not a public compatibility
-guarantee at this stage.
+VT extension. Features such as terminal mouse reporting protocols, device-query
+coverage beyond its required startup behavior, background color attributes, and
+text decorations are not a public compatibility guarantee at this stage.
 
 ## 4. Configuration
 

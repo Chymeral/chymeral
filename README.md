@@ -77,16 +77,17 @@ may be relative to the configuration file.
 - [Main Manual](Main_Manual.md) — installation, configuration, terminal
   behavior, CLP concepts, event model, scene model, and testing guidance.
 - [Technical Journal](Technical_Journal.md) — the architectural record and the
-  completed M1–M14 milestones formerly kept in this README.
+  completed M1–M15 milestones formerly kept in this README.
 - [Chymeral Rust SDK](https://github.com/Chymeral/chymeral-rust-sdk) — the
   separate reference Rust client and its conformance examples.
 
 ## Project state
 
-The implementation through M14 is complete: the terminal, local runtime, CLP
-v1.3, overlap support, reference Rust SDK, conformance client, and Linux/Windows
-validation are in place. Future work can add SDKs for other languages and a
-language-neutral IDL without changing Chymeral into a plugin host.
+The implementation through M15 is complete: the terminal, local runtime, CLP
+v1.3, overlap support, reference Rust SDK, conformance client, terminal
+selection, clipboard integration, and Linux/Windows validation are in place.
+Future work can add SDKs for other languages and a language-neutral IDL without
+changing Chymeral into a plugin host.
 
 ## License
 

@@ -24,6 +24,7 @@ use wgpu::{
 
 const VERTICES_PER_IMAGE: u32 = 6;
 const IMAGE_VERTEX_STRIDE: u64 = 20;
+const TERMINAL_SELECTION_COLOR: [u8; 4] = [74, 121, 184, 144];
 const IMAGE_VERTEX_ATTRIBUTES: [VertexAttribute; 3] = [
     VertexAttribute {
         format: VertexFormat::Float32x2,
@@ -92,6 +93,12 @@ struct Draw {
 }
 
 #[derive(Clone, Copy)]
+struct TerminalSelectionDraw {
+    first_vertex: u32,
+    scissor: ScissorRect,
+}
+
+#[derive(Clone, Copy)]
 enum DrawSource {
     Texture(TextureId),
     Solid([u8; 4]),
@@ -128,6 +135,9 @@ pub struct ImageRenderer {
     pipeline: RenderPipeline,
     vertex_buffer: Buffer,
     vertex_capacity: u64,
+    terminal_selection_vertex_buffer: Buffer,
+    terminal_selection_vertex_capacity: u64,
+    terminal_selection_draws: Vec<TerminalSelectionDraw>,
     gpu_images: HashMap<TextureId, GpuImage>,
     gpu_solids: HashMap<[u8; 4], GpuImage>,
     draws: Vec<Draw>,
@@ -153,12 +163,21 @@ impl ImageRenderer {
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let terminal_selection_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("chymeral terminal selection vertices"),
+            size: IMAGE_VERTEX_STRIDE,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             bind_group_layout,
             sampler,
             pipeline,
             vertex_buffer,
             vertex_capacity: IMAGE_VERTEX_STRIDE,
+            terminal_selection_vertex_buffer,
+            terminal_selection_vertex_capacity: IMAGE_VERTEX_STRIDE,
+            terminal_selection_draws: Vec::new(),
             gpu_images: HashMap::new(),
             gpu_solids: HashMap::new(),
             draws: Vec::new(),
@@ -246,6 +265,53 @@ impl ImageRenderer {
         Ok(())
     }
 
+    pub fn prepare_terminal_selection(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        rectangles: &[Rect],
+        viewport: ImageViewport,
+    ) -> Result<()> {
+        self.terminal_selection_draws.clear();
+        if rectangles.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_gpu_solid(device, queue, TERMINAL_SELECTION_COLOR)?;
+        let mut vertices = Vec::new();
+        for rectangle in rectangles {
+            let Some(scissor) = scissor_rect(*rectangle, viewport) else {
+                continue;
+            };
+            let Some(quad) = image_vertices(
+                *rectangle,
+                1.0,
+                viewport.width,
+                viewport.height,
+                viewport.scale_factor,
+            ) else {
+                continue;
+            };
+            let first_vertex = u32::try_from(self.terminal_selection_draws.len())
+                .ok()
+                .and_then(|count| count.checked_mul(VERTICES_PER_IMAGE))
+                .context("too many terminal selection ranges to render")?;
+            for vertex in quad {
+                append_vertex(&mut vertices, vertex);
+            }
+            self.terminal_selection_draws.push(TerminalSelectionDraw {
+                first_vertex,
+                scissor,
+            });
+        }
+
+        self.ensure_terminal_selection_vertex_capacity(device, vertices.len() as u64);
+        if !vertices.is_empty() {
+            queue.write_buffer(&self.terminal_selection_vertex_buffer, 0, &vertices);
+        }
+        Ok(())
+    }
+
     pub fn render_layer<'a>(&'a self, pass: &mut RenderPass<'a>, layer: SceneLayer) {
         if !self.draws.iter().any(|draw| draw.layer == layer) {
             return;
@@ -261,6 +327,30 @@ impl ImageRenderer {
                 continue;
             };
             pass.set_bind_group(0, &image.bind_group, &[]);
+            pass.set_scissor_rect(
+                draw.scissor.x,
+                draw.scissor.y,
+                draw.scissor.width,
+                draw.scissor.height,
+            );
+            pass.draw(
+                draw.first_vertex..draw.first_vertex + VERTICES_PER_IMAGE,
+                0..1,
+            );
+        }
+    }
+
+    pub fn render_terminal_selection<'a>(&'a self, pass: &mut RenderPass<'a>) {
+        if self.terminal_selection_draws.is_empty() {
+            return;
+        }
+        let Some(image) = self.gpu_solids.get(&TERMINAL_SELECTION_COLOR) else {
+            return;
+        };
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, self.terminal_selection_vertex_buffer.slice(..));
+        pass.set_bind_group(0, &image.bind_group, &[]);
+        for draw in &self.terminal_selection_draws {
             pass.set_scissor_rect(
                 draw.scissor.x,
                 draw.scissor.y,
@@ -381,6 +471,20 @@ impl ImageRenderer {
             mapped_at_creation: false,
         });
         self.vertex_capacity = size;
+    }
+
+    fn ensure_terminal_selection_vertex_capacity(&mut self, device: &Device, required: u64) {
+        if required <= self.terminal_selection_vertex_capacity {
+            return;
+        }
+        let size = required.checked_next_power_of_two().unwrap_or(required);
+        self.terminal_selection_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("chymeral terminal selection vertices"),
+            size,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.terminal_selection_vertex_capacity = size;
     }
 }
 

@@ -42,6 +42,7 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 | M13 | Application delivery for event, tick, frame, resize, closing, and close reason. | Continuous notifications may be coalesced, while discrete input and resize are protected from silent loss. |
 | M13.2 | Optional rectangular overlap queries and transitions. | Overlap is geometric, same-session, and deliberately not a physics engine. |
 | M14 | Standalone Rust SDK, conformance client, visual probe, cross-platform CI, and public SDK repository. | The first SDK is a reference client, not a Rust privilege or a host dependency. |
+| M15 | Terminal pointer selection, scrollback viewport, system clipboard, and bracketed paste. | Terminal cells remain the selection model; selection is primary-screen only, and multiline paste is safe by default. |
 
 ## CLP evolution
 
@@ -91,7 +92,7 @@ primitive for placement rules. Neither requires mouse input.
 
 ## Validation record
 
-The M1–M14 implementation has been exercised on Linux and Windows. The core
+The M1–M15 implementation has been exercised on Linux and Windows. The core
 validation suite covers formatting, unit and integration tests, warnings-denied
 Clippy, and release builds. The Rust SDK has a separate GitHub Actions matrix
 for Rust 1.85 and stable on both platforms, including formatting, tests,
@@ -101,6 +102,14 @@ The reference conformance program validates lifecycle, timing subscriptions,
 RGBA8 upload/destruction, scene mutation, same-session overlap, and clean
 session closure. The visual probe validates drag routing and overlap transitions
 while proving that closing a CLP program does not close its terminal.
+
+M15 adds a cell-based selection over primary-screen scrollback and visible
+terminal output, preserving wide characters, combining marks, and soft-wrap
+boundaries. `Ctrl+Shift+C` and `Ctrl+Shift+V` use the regular system clipboard.
+Pasting never inserts Enter; NUL text is rejected, and multiline input requires
+DECSET 2004 so Chymeral can send standard bracketed-paste delimiters. Linux and
+Windows manual checks confirmed selection, clipboard transfer, scrollback,
+single-line paste, both bracketed-paste states, and alternate-screen behavior.
 
 ## Intentional boundaries
 

@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use arboard::Clipboard;
 use chymeral::interaction::SceneInteraction;
 use chymeral::runtime::{
     EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent, KeyState,
@@ -25,7 +26,9 @@ use chymeral::{
     program_scene::{ProgramSceneError, ProgramSceneResources},
     protocol::CapabilitySet,
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
-    scene::{ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer, Transform},
+    scene::{
+        ImageNode, NodeContent, NodeId, NodeProperties, Point, Rect, Scene, SceneLayer, Transform,
+    },
     transport::{ClpServer, HostAction, HostCommandResponse},
 };
 use glyphon::{
@@ -138,6 +141,8 @@ struct WindowState {
     scene: Scene,
     interaction: SceneInteraction,
     pointer_position: Vec2,
+    terminal_selection_active: bool,
+    terminal_scroll_remainder: f64,
     textures: TextureStore,
     program_scene_resources: ProgramSceneResources,
     image_renderer: ImageRenderer,
@@ -302,6 +307,8 @@ impl WindowState {
             scene,
             interaction: SceneInteraction::new(),
             pointer_position: Vec2::default(),
+            terminal_selection_active: false,
+            terminal_scroll_remainder: 0.0,
             textures,
             program_scene_resources: ProgramSceneResources::new(max_program_texture_dimension),
             image_renderer,
@@ -390,6 +397,32 @@ impl WindowState {
             self.window
                 .set_title(&format!("Chymeral — {}", self.terminal.title()));
         }
+    }
+
+    fn terminal_selection_rectangles(&self) -> Vec<Rect> {
+        let cell_width = f64::from(self.font.resolved_cell_width());
+        let line_height = f64::from(self.font.line_height);
+        if !cell_width.is_finite()
+            || !line_height.is_finite()
+            || cell_width <= 0.0
+            || line_height <= 0.0
+        {
+            return Vec::new();
+        }
+        self.terminal
+            .selection_ranges()
+            .into_iter()
+            .filter_map(|range| {
+                let width = f64::from(range.end_column - range.start_column) * cell_width;
+                Rect::new(
+                    PADDING + f64::from(range.start_column) * cell_width,
+                    PADDING + f64::from(range.row) * line_height,
+                    width,
+                    line_height,
+                )
+                .ok()
+            })
+            .collect()
     }
 
     fn sync_diagnostics_text(&mut self) {
@@ -602,8 +635,15 @@ impl WindowState {
     }
 
     fn handle_pointer_event(&mut self, event: PointerEvent) {
+        if self.handle_terminal_selection_pointer(&event) {
+            return;
+        }
         self.enqueue_event(EngineEvent::Pointer(event.clone()));
-        match self.interaction.route_pointer(&self.scene, &event) {
+        self.route_scene_pointer_event(&event);
+    }
+
+    fn route_scene_pointer_event(&mut self, event: &PointerEvent) {
+        match self.interaction.route_pointer(&self.scene, event) {
             Ok(events) => {
                 for event in events {
                     self.enqueue_event(EngineEvent::Scene(event));
@@ -611,6 +651,93 @@ impl WindowState {
             }
             Err(error) => eprintln!("Chymeral: could not route pointer event: {error}"),
         }
+    }
+
+    fn handle_terminal_selection_pointer(&mut self, event: &PointerEvent) -> bool {
+        match event {
+            PointerEvent::Press {
+                button: PointerButton::Primary,
+                position,
+                ..
+            } => {
+                let Some((row, column)) = self.terminal_cell_at(*position, false) else {
+                    return false;
+                };
+                if self.scene_node_at(*position).is_some() {
+                    return false;
+                }
+                self.route_scene_pointer_event(event);
+                self.terminal_selection_active = self.terminal.begin_selection(row, column);
+                if self.terminal_selection_active {
+                    self.window.request_redraw();
+                }
+                self.terminal_selection_active
+            }
+            PointerEvent::Move { position, .. } if self.terminal_selection_active => {
+                if let Some((row, column)) = self.terminal_cell_at(*position, true)
+                    && self.terminal.extend_selection(row, column)
+                {
+                    self.window.request_redraw();
+                }
+                true
+            }
+            PointerEvent::Release {
+                button: PointerButton::Primary,
+                position,
+                modifiers,
+                ..
+            } if self.terminal_selection_active => {
+                if let Some((row, column)) = self.terminal_cell_at(*position, true) {
+                    self.terminal.extend_selection(row, column);
+                }
+                self.terminal_selection_active = false;
+                self.route_scene_pointer_event(&PointerEvent::Move {
+                    position: *position,
+                    modifiers: *modifiers,
+                });
+                self.reconcile_scene_interaction();
+                self.window.request_redraw();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn terminal_cell_at(&self, position: Vec2, clamp: bool) -> Option<(u16, u16)> {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return None;
+        }
+        let cell_width = f64::from(self.font.resolved_cell_width());
+        let line_height = f64::from(self.font.line_height);
+        if !cell_width.is_finite()
+            || !line_height.is_finite()
+            || cell_width <= 0.0
+            || line_height <= 0.0
+        {
+            return None;
+        }
+        let (columns, rows) = grid_size(
+            PhysicalSize::new(self.surface_config.width, self.surface_config.height),
+            &self.font,
+            self.scale_factor,
+        );
+        let width = f64::from(columns) * cell_width;
+        let height = f64::from(rows) * line_height;
+        let mut x = position.x - PADDING;
+        let mut y = position.y - PADDING;
+        if !clamp && (x < 0.0 || x > width || y < 0.0 || y >= height) {
+            return None;
+        }
+        x = x.clamp(0.0, width);
+        y = y.clamp(0.0, (height - f64::EPSILON).max(0.0));
+        let column = (x / cell_width).floor().min(f64::from(columns)) as u16;
+        let row = (y / line_height).floor().min(f64::from(rows - 1)) as u16;
+        Some((row, column))
+    }
+
+    fn scene_node_at(&self, position: Vec2) -> Option<NodeId> {
+        let point = Point::new(position.x, position.y).ok()?;
+        self.scene.hit_test(point).ok().flatten()
     }
 
     fn reconcile_scene_interaction(&mut self) {
@@ -625,12 +752,16 @@ impl WindowState {
     }
 
     fn handle_pointer_left(&mut self) {
+        if self.terminal_selection_active {
+            return;
+        }
         for event in self.interaction.pointer_left() {
             self.enqueue_event(EngineEvent::Scene(event));
         }
     }
 
     fn cancel_scene_drag(&mut self) {
+        self.terminal_selection_active = false;
         for event in self.interaction.window_focus_lost() {
             self.enqueue_event(EngineEvent::Scene(event));
         }
@@ -661,7 +792,89 @@ impl WindowState {
             self.window.request_redraw();
             return;
         }
+        if is_terminal_copy_shortcut(&event) {
+            self.copy_terminal_selection();
+            return;
+        }
+        if is_terminal_paste_shortcut(&event) {
+            self.paste_terminal_clipboard();
+            return;
+        }
+        if terminal_input(&event).is_some() && self.terminal.scroll_to_bottom() {
+            self.sync_terminal_text(false);
+            self.window.request_redraw();
+        }
         self.enqueue_event(EngineEvent::Key(event));
+    }
+
+    fn copy_terminal_selection(&mut self) {
+        let Some(text) = self.terminal.selected_text() else {
+            return;
+        };
+        let result = Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text));
+        if let Err(error) = result {
+            eprintln!("Chymeral: could not copy terminal selection to the clipboard: {error}");
+        }
+    }
+
+    fn paste_terminal_clipboard(&mut self) {
+        let text = match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("Chymeral: could not read text from the clipboard: {error}");
+                return;
+            }
+        };
+        let bracketed = self.terminal.bracketed_paste_enabled();
+        let Some(bytes) = terminal_paste_input(&text, bracketed) else {
+            if text.contains('\0') {
+                eprintln!("Chymeral: refusing clipboard text that contains a NUL byte");
+            } else if contains_line_break(&text) && !bracketed {
+                eprintln!(
+                    "Chymeral: refusing multiline paste because the terminal application did not enable bracketed paste"
+                );
+            }
+            return;
+        };
+        if self.terminal.scroll_to_bottom() {
+            self.sync_terminal_text(false);
+        }
+        self.write_input(&bytes);
+        self.window.request_redraw();
+    }
+
+    fn handle_scroll_event(&mut self, event: ScrollEvent) {
+        if self.scene_node_at(event.position).is_none() && self.scroll_terminal_view(&event) {
+            return;
+        }
+        self.enqueue_event(EngineEvent::Scroll(event));
+    }
+
+    fn scroll_terminal_view(&mut self, event: &ScrollEvent) -> bool {
+        let delta = match event.unit {
+            ScrollUnit::Line => event.delta.y,
+            ScrollUnit::Pixel => event.delta.y / f64::from(self.font.line_height),
+        };
+        if !delta.is_finite() {
+            return false;
+        }
+        self.terminal_scroll_remainder += delta;
+        let lines = if self.terminal_scroll_remainder.is_sign_positive() {
+            self.terminal_scroll_remainder.floor()
+        } else {
+            self.terminal_scroll_remainder.ceil()
+        };
+        if lines == 0.0 {
+            return false;
+        }
+        self.terminal_scroll_remainder -= lines;
+        let lines = lines.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+        if !self.terminal.scroll_view_by(lines) {
+            return false;
+        }
+        self.sync_terminal_text(false);
+        self.window.request_redraw();
+        true
     }
 
     fn run_runtime_frame(&mut self, now: Instant) -> Result<()> {
@@ -766,6 +979,21 @@ impl WindowState {
                 self.scale_factor,
             ),
         )?;
+        let terminal_selection = if self.diagnostics.is_active() {
+            Vec::new()
+        } else {
+            self.terminal_selection_rectangles()
+        };
+        self.image_renderer.prepare_terminal_selection(
+            &self.device,
+            &self.queue,
+            &terminal_selection,
+            ImageViewport::new(
+                self.surface_config.width,
+                self.surface_config.height,
+                self.scale_factor,
+            ),
+        )?;
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -818,6 +1046,7 @@ impl WindowState {
             self.background.render(&mut pass);
             self.image_renderer
                 .render_layer(&mut pass, SceneLayer::Underlay);
+            self.image_renderer.render_terminal_selection(&mut pass);
             pass.set_scissor_rect(0, 0, self.surface_config.width, self.surface_config.height);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)?;
@@ -979,12 +1208,12 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
                     let Some((delta, unit)) = engine_scroll_delta(delta, state.scale_factor) else {
                         return;
                     };
-                    state.enqueue_event(EngineEvent::Scroll(ScrollEvent {
+                    state.handle_scroll_event(ScrollEvent {
                         position: state.pointer_position,
                         delta,
                         unit,
                         modifiers,
-                    }));
+                    });
                 });
             }
             WindowEvent::Focused(focused) => {
@@ -1337,6 +1566,45 @@ fn engine_focus(focused: bool) -> FocusEvent {
     }
 }
 
+fn is_terminal_copy_shortcut(event: &EngineKeyEvent) -> bool {
+    is_terminal_clipboard_shortcut(event, "c")
+}
+
+fn is_terminal_paste_shortcut(event: &EngineKeyEvent) -> bool {
+    is_terminal_clipboard_shortcut(event, "v")
+}
+
+fn is_terminal_clipboard_shortcut(event: &EngineKeyEvent, character: &str) -> bool {
+    event.state == KeyState::Pressed
+        && !event.repeat
+        && event.modifiers.control
+        && event.modifiers.shift
+        && !event.modifiers.alt
+        && !event.modifiers.super_key
+        && matches!(
+            &event.key,
+            EngineKey::Character(value) if value.eq_ignore_ascii_case(character)
+        )
+}
+
+fn contains_line_break(text: &str) -> bool {
+    text.contains('\n') || text.contains('\r')
+}
+
+fn terminal_paste_input(text: &str, bracketed_paste: bool) -> Option<Vec<u8>> {
+    if text.is_empty() || text.contains('\0') || (contains_line_break(text) && !bracketed_paste) {
+        return None;
+    }
+    if !bracketed_paste {
+        return Some(text.as_bytes().to_vec());
+    }
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    Some(bytes)
+}
+
 fn terminal_input(event: &EngineKeyEvent) -> Option<Vec<u8>> {
     if event.state != KeyState::Pressed {
         return None;
@@ -1521,9 +1789,10 @@ mod tests {
         TerminalProgram,
         config::{Appearance, Rgb, TestingNode, TestingScene},
         engine_focus, engine_key, engine_modifiers, engine_pointer_button, engine_scroll_delta,
-        grid_size, install_testing_scene, logical_pointer_position, named_key_input, pty_size,
-        select_present_mode, select_surface_format, splash_properties, terminal_input,
-        terminal_input_with_text, testing_node_properties,
+        grid_size, install_testing_scene, is_terminal_copy_shortcut, is_terminal_paste_shortcut,
+        logical_pointer_position, named_key_input, pty_size, select_present_mode,
+        select_surface_format, splash_properties, terminal_input, terminal_input_with_text,
+        terminal_paste_input, testing_node_properties,
     };
     use chymeral::{
         resources::{Texture, TextureStore},
@@ -1566,6 +1835,48 @@ mod tests {
     #[test]
     fn sends_space_for_the_named_space_key() {
         assert_eq!(named_key_input(&EngineNamedKey::Space), Some(vec![b' ']));
+    }
+
+    #[test]
+    fn recognizes_only_the_unrepeated_terminal_clipboard_shortcuts() {
+        let copy = EngineKeyEvent {
+            key: EngineKey::Character("c".into()),
+            text: Some("c".into()),
+            state: KeyState::Pressed,
+            modifiers: EngineModifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            },
+            repeat: false,
+        };
+        let paste = EngineKeyEvent {
+            key: EngineKey::Character("V".into()),
+            text: Some("V".into()),
+            ..copy.clone()
+        };
+
+        assert!(is_terminal_copy_shortcut(&copy));
+        assert!(!is_terminal_paste_shortcut(&copy));
+        assert!(is_terminal_paste_shortcut(&paste));
+        assert!(!is_terminal_copy_shortcut(&EngineKeyEvent {
+            repeat: true,
+            ..copy
+        }));
+    }
+
+    #[test]
+    fn protects_multiline_paste_until_bracketed_paste_is_enabled() {
+        assert_eq!(
+            terminal_paste_input("plain text", false),
+            Some(b"plain text".to_vec())
+        );
+        assert_eq!(terminal_paste_input("first\nsecond", false), None);
+        assert_eq!(terminal_paste_input("first\0second", true), None);
+        assert_eq!(
+            terminal_paste_input("first\r\nsecond", true),
+            Some(b"\x1b[200~first\r\nsecond\x1b[201~".to_vec())
+        );
     }
 
     #[test]
