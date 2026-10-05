@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use chymeral::{
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
-    scene::{NodeContent, Rect, Scene, SceneLayer},
+    scene::{NodeContent, NodeId, Rect, Scene},
 };
 use wgpu::{
     AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
@@ -86,9 +86,9 @@ struct GpuImage {
 
 #[derive(Clone, Copy)]
 struct Draw {
+    node: NodeId,
     source: DrawSource,
     first_vertex: u32,
-    layer: SceneLayer,
     scissor: ScissorRect,
 }
 
@@ -201,7 +201,7 @@ impl ImageRenderer {
             .filter_map(|node_id| scene.node(*node_id))
             .filter_map(|node| match node.content() {
                 NodeContent::Solid(solid) => Some(solid.color()),
-                NodeContent::Empty | NodeContent::Image(_) => None,
+                NodeContent::Empty | NodeContent::Image(_) | NodeContent::Text(_) => None,
             })
             .collect::<HashSet<_>>();
         self.gpu_solids
@@ -214,7 +214,7 @@ impl ImageRenderer {
                 continue;
             };
             let (source, opacity) = match node.content() {
-                NodeContent::Empty => continue,
+                NodeContent::Empty | NodeContent::Text(_) => continue,
                 NodeContent::Image(image) => {
                     let Some(texture) = textures.texture(image.texture()) else {
                         continue;
@@ -251,9 +251,9 @@ impl ImageRenderer {
                 append_vertex(&mut vertices, vertex);
             }
             self.draws.push(Draw {
+                node: node_id,
                 source,
                 first_vertex,
-                layer: node.layer(),
                 scissor,
             });
         }
@@ -312,32 +312,11 @@ impl ImageRenderer {
         Ok(())
     }
 
-    pub fn render_layer<'a>(&'a self, pass: &mut RenderPass<'a>, layer: SceneLayer) {
-        if !self.draws.iter().any(|draw| draw.layer == layer) {
+    pub fn render_node<'a>(&'a self, pass: &mut RenderPass<'a>, node: NodeId) {
+        let Some(draw) = self.draws.iter().find(|draw| draw.node == node) else {
             return;
-        }
-        pass.set_pipeline(&self.pipeline);
-        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        for draw in self.draws.iter().filter(|draw| draw.layer == layer) {
-            let image = match draw.source {
-                DrawSource::Texture(texture) => self.gpu_images.get(&texture),
-                DrawSource::Solid(color) => self.gpu_solids.get(&color),
-            };
-            let Some(image) = image else {
-                continue;
-            };
-            pass.set_bind_group(0, &image.bind_group, &[]);
-            pass.set_scissor_rect(
-                draw.scissor.x,
-                draw.scissor.y,
-                draw.scissor.width,
-                draw.scissor.height,
-            );
-            pass.draw(
-                draw.first_vertex..draw.first_vertex + VERTICES_PER_IMAGE,
-                0..1,
-            );
-        }
+        };
+        self.render_draw(pass, draw);
     }
 
     pub fn render_terminal_selection<'a>(&'a self, pass: &mut RenderPass<'a>) {
@@ -383,6 +362,29 @@ impl ImageRenderer {
         )?;
         self.gpu_images.insert(texture_id, image);
         Ok(())
+    }
+
+    fn render_draw<'a>(&'a self, pass: &mut RenderPass<'a>, draw: &Draw) {
+        let image = match draw.source {
+            DrawSource::Texture(texture) => self.gpu_images.get(&texture),
+            DrawSource::Solid(color) => self.gpu_solids.get(&color),
+        };
+        let Some(image) = image else {
+            return;
+        };
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_bind_group(0, &image.bind_group, &[]);
+        pass.set_scissor_rect(
+            draw.scissor.x,
+            draw.scissor.y,
+            draw.scissor.width,
+            draw.scissor.height,
+        );
+        pass.draw(
+            draw.first_vertex..draw.first_vertex + VERTICES_PER_IMAGE,
+            0..1,
+        );
     }
 
     fn ensure_gpu_solid(&mut self, device: &Device, queue: &Queue, color: [u8; 4]) -> Result<()> {

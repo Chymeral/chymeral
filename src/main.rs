@@ -9,7 +9,7 @@ mod scene_renderer;
 mod terminal;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,11 +31,12 @@ use chymeral::{
     scene::{
         ImageNode, NodeContent, NodeId, NodeProperties, Point, Rect, Scene, SceneLayer, Transform,
     },
+    scene_text::{TextAlign, TextLayout, TextStyle, TextWeight, expand_tabs},
     transport::{ClpServer, HostAction, HostCommandResponse},
 };
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap, cosmic_text::Align,
 };
 use portable_pty::PtySize;
 use wgpu::{
@@ -147,6 +148,7 @@ struct WindowState {
     font: FontAppearance,
     foreground: Rgb,
     font_family: String,
+    text_font_families: BTreeMap<String, String>,
     background: BackgroundRenderer,
     terminal: Terminal,
     pty: Pty,
@@ -175,6 +177,8 @@ struct WindowState {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     text_buffer: Buffer,
+    scene_text_renderer: TextRenderer,
+    scene_text_buffer: Buffer,
     window: Arc<Window>,
 }
 
@@ -262,18 +266,26 @@ impl WindowState {
         };
         surface.configure(&device, &surface_config);
 
-        let (mut font_system, font_family) = configure_font_system(&appearance.font)?;
+        let (mut font_system, font_family, text_font_families) =
+            configure_font_system(&appearance.font, &appearance.scene_text_fonts)?;
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, surface_config.format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let scene_text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
         let mut text_buffer = Buffer::new(
             &mut font_system,
             physical_font_metrics(&appearance.font, scale_factor),
         );
         text_buffer.set_wrap(Wrap::None);
+        let mut scene_text_buffer = Buffer::new(
+            &mut font_system,
+            physical_font_metrics(&appearance.font, scale_factor),
+        );
+        scene_text_buffer.set_wrap(Wrap::None);
         let background =
             BackgroundRenderer::new(&device, &queue, &surface_config, &appearance.background)?;
         let mut scene = Scene::new();
@@ -311,6 +323,12 @@ impl WindowState {
         };
         let image_renderer = ImageRenderer::new(&device, &surface_config);
         let max_program_texture_dimension = device.limits().max_texture_dimension_2d;
+        let text_layout = TextLayout::new(
+            appearance.font.size,
+            appearance.font.resolved_cell_width(),
+            appearance.font.line_height,
+            text_font_families.keys().cloned(),
+        )?;
 
         let mut state = Self {
             instance,
@@ -322,6 +340,7 @@ impl WindowState {
             font: appearance.font,
             foreground: appearance.foreground.color,
             font_family,
+            text_font_families: text_font_families.clone(),
             background,
             terminal,
             pty,
@@ -339,7 +358,8 @@ impl WindowState {
             terminal_selection_active: false,
             terminal_scroll_remainder: 0.0,
             textures,
-            program_scene_resources: ProgramSceneResources::new(max_program_texture_dimension),
+            program_scene_resources: ProgramSceneResources::new(max_program_texture_dimension)
+                .with_text_layout(text_layout),
             image_renderer,
             active_splash,
             pending_resize: None,
@@ -350,6 +370,8 @@ impl WindowState {
             atlas,
             text_renderer,
             text_buffer,
+            scene_text_renderer,
+            scene_text_buffer,
             window,
         };
         state
@@ -577,6 +599,8 @@ impl WindowState {
     fn scale_factor_changed(&mut self, scale_factor: f64) {
         self.scale_factor = scale_factor;
         self.text_buffer
+            .set_metrics(physical_font_metrics(&self.font, scale_factor));
+        self.scene_text_buffer
             .set_metrics(physical_font_metrics(&self.font, scale_factor));
         self.resize(self.window.inner_size());
     }
@@ -1083,6 +1107,145 @@ impl WindowState {
         }
     }
 
+    fn prepare_scene_text(&mut self, node: NodeId) -> Result<bool> {
+        let Some((text, bounds, ancestor_clip)) = (|| {
+            let node_ref = self.scene.node(node)?;
+            let NodeContent::Text(text) = node_ref.content() else {
+                return None;
+            };
+            let bounds = self.scene.world_bounds(node).ok()?;
+            self.scene.visible_bounds(node).ok()??;
+            let ancestor_clip = self.scene.ancestor_clip_bounds(node).ok()?;
+            Some((text.clone(), bounds, ancestor_clip))
+        })() else {
+            return Ok(false);
+        };
+        if text.metrics().width == 0.0 || text.metrics().height == 0.0 {
+            return Ok(false);
+        }
+        let clip = match ancestor_clip {
+            Some(bounds) => match text_bounds(bounds, self.scale_factor) {
+                Some(clip) => clip,
+                None => return Ok(false),
+            },
+            None => TextBounds::default(),
+        };
+        let style = text.style();
+        let metrics = physical_text_metrics(&self.font, style, self.scale_factor);
+        self.scene_text_buffer.set_metrics(metrics);
+        self.scene_text_buffer.set_size(
+            Some((text.metrics().width * self.scale_factor) as f32),
+            Some((text.metrics().height * self.scale_factor) as f32),
+        );
+        let family = style
+            .font_alias
+            .as_ref()
+            .and_then(|alias| self.text_font_families.get(alias))
+            .unwrap_or(&self.font_family);
+        let color = style.color.unwrap_or([
+            self.foreground.red,
+            self.foreground.green,
+            self.foreground.blue,
+            255,
+        ]);
+        let attributes = Attrs::new()
+            .family(Family::Name(family))
+            .weight(match style.weight {
+                TextWeight::Normal => Weight::NORMAL,
+                TextWeight::Bold => Weight::BOLD,
+            });
+        let text = expand_tabs(text.text());
+        self.scene_text_buffer.set_text(
+            &text,
+            &attributes,
+            Shaping::Advanced,
+            Some(match style.align {
+                TextAlign::Start => Align::Left,
+                TextAlign::Center => Align::Center,
+                TextAlign::End => Align::Right,
+            }),
+        );
+        self.scene_text_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.scene_text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            &self.viewport,
+            [TextArea {
+                buffer: &self.scene_text_buffer,
+                left: (bounds.x() * self.scale_factor) as f32,
+                top: (bounds.y() * self.scale_factor) as f32,
+                scale: 1.0,
+                bounds: clip,
+                default_color: Color::rgba(color[0], color[1], color[2], color[3]),
+                custom_glyphs: &[],
+            }],
+            &mut self.swash_cache,
+        )?;
+        Ok(true)
+    }
+
+    fn render_scene_layer(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        layer: SceneLayer,
+    ) -> Result<()> {
+        for node in self.scene.paint_order_in_layer(layer) {
+            let Some(content) = self.scene.node(node).map(|node| node.content().clone()) else {
+                continue;
+            };
+            match content {
+                NodeContent::Empty => {}
+                NodeContent::Image(_) | NodeContent::Solid(_) => {
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("chymeral scene image pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    self.image_renderer.render_node(&mut pass, node);
+                }
+                NodeContent::Text(_) => {
+                    if !self.prepare_scene_text(node)? {
+                        continue;
+                    }
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("chymeral scene text pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    self.scene_text_renderer
+                        .render(&self.atlas, &self.viewport, &mut pass)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn redraw(&mut self) -> Result<()> {
         if self.pending_resize.is_some() {
             return Ok(());
@@ -1195,7 +1358,7 @@ impl WindowState {
             });
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("chymeral text pass"),
+                label: Some("chymeral background pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -1211,15 +1374,49 @@ impl WindowState {
                 multiview_mask: None,
             });
             self.background.render(&mut pass);
-            self.image_renderer
-                .render_layer(&mut pass, SceneLayer::Underlay);
+        }
+        self.render_scene_layer(&mut encoder, &view, SceneLayer::Underlay)?;
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("chymeral terminal selection pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
             self.image_renderer.render_terminal_selection(&mut pass);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("chymeral terminal text pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
             pass.set_scissor_rect(0, 0, self.surface_config.width, self.surface_config.height);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)?;
-            self.image_renderer
-                .render_layer(&mut pass, SceneLayer::Overlay);
         }
+        self.render_scene_layer(&mut encoder, &view, SceneLayer::Overlay)?;
 
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
@@ -1517,10 +1714,17 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
         ProgramSceneError::TextureLimitExceeded { .. }
         | ProgramSceneError::SessionTextureLimitExceeded { .. }
         | ProgramSceneError::TextureDimensionLimitExceeded { .. }
-        | ProgramSceneError::OverlapNodeLimitExceeded { .. } => "resource_limit",
+        | ProgramSceneError::OverlapNodeLimitExceeded { .. }
+        | ProgramSceneError::TextLimitExceeded { .. }
+        | ProgramSceneError::SessionTextLimitExceeded { .. }
+        | ProgramSceneError::SessionTextNodeLimitExceeded { .. } => "resource_limit",
         ProgramSceneError::Geometry(_)
         | ProgramSceneError::Image(_)
-        | ProgramSceneError::Texture(_) => "invalid_argument",
+        | ProgramSceneError::Texture(_)
+        | ProgramSceneError::Text(_) => "invalid_argument",
+        ProgramSceneError::TextNodeRequired(_)
+        | ProgramSceneError::IntrinsicTextBounds(_)
+        | ProgramSceneError::TextContentRequiresTextCommands(_) => "invalid_scene_operation",
         ProgramSceneError::Scene(_) => "invalid_scene_operation",
         ProgramSceneError::HandleExhausted => "host_capacity",
     }
@@ -1529,6 +1733,36 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
 fn physical_font_metrics(font: &FontAppearance, scale_factor: f64) -> Metrics {
     let scale_factor = scale_factor as f32;
     Metrics::new(font.size * scale_factor, font.line_height * scale_factor)
+}
+
+fn physical_text_metrics(font: &FontAppearance, style: &TextStyle, scale_factor: f64) -> Metrics {
+    let font_size = style.size.unwrap_or(font.size);
+    let size_scale = font_size / font.size;
+    let line_height = style.line_height.unwrap_or(font.line_height * size_scale);
+    let scale_factor = scale_factor as f32;
+    Metrics::new(font_size * scale_factor, line_height * scale_factor)
+}
+
+fn text_bounds(bounds: Rect, scale_factor: f64) -> Option<TextBounds> {
+    let left = bounds.x() * scale_factor;
+    let top = bounds.y() * scale_factor;
+    let right = (bounds.x() + bounds.width()) * scale_factor;
+    let bottom = (bounds.y() + bounds.height()) * scale_factor;
+    if !left.is_finite() || !top.is_finite() || !right.is_finite() || !bottom.is_finite() {
+        return None;
+    }
+    let left = left.floor().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let top = top.floor().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let right = right.ceil().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let bottom = bottom
+        .ceil()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    (right > left && bottom > top).then_some(TextBounds {
+        left,
+        top,
+        right,
+        bottom,
+    })
 }
 
 fn physical_padding(scale_factor: f64) -> u32 {
@@ -1897,60 +2131,84 @@ fn named_key_input(key: &EngineNamedKey) -> Option<Vec<u8>> {
     Some(bytes.to_vec())
 }
 
-fn configure_font_system(font: &FontAppearance) -> Result<(FontSystem, String)> {
+fn configure_font_system(
+    font: &FontAppearance,
+    scene_text_fonts: &BTreeMap<String, FontSource>,
+) -> Result<(FontSystem, String, BTreeMap<String, String>)> {
     let mut font_system = FontSystem::new();
     let family = match &font.source {
         FontSource::System(family) => family.clone(),
         FontSource::File { path, face_index } => {
-            let existing_faces = font_system.db().faces().count();
-            font_system
-                .db_mut()
-                .load_font_file(path)
-                .with_context(|| format!("could not load font file {}", path.display()))?;
-            let selected_face = font_system
-                .db()
-                .faces()
-                .skip(existing_faces)
-                .find(|face| face.index == *face_index)
-                .cloned()
-                .with_context(|| {
-                    format!(
-                        "font file {} does not contain face index {}",
-                        path.display(),
-                        face_index
-                    )
-                })?;
-            let family = selected_face
-                .families
-                .first()
-                .map(|(family, _)| family.clone())
-                .with_context(|| {
-                    format!(
-                        "font file {} does not provide a usable family for face index {}",
-                        path.display(),
-                        face_index
-                    )
-                })?;
-            let conflicting_faces = font_system
-                .db()
-                .faces()
-                .filter(|face| {
-                    face.id != selected_face.id
-                        && face
-                            .families
-                            .iter()
-                            .any(|(candidate, _)| candidate == &family)
-                })
-                .map(|face| face.id)
-                .collect::<Vec<_>>();
-            for face in conflicting_faces {
-                font_system.db_mut().remove_face(face);
-            }
-            family
+            load_font_file_family(&mut font_system, path, *face_index)?
         }
     };
+    let mut aliases = BTreeMap::new();
+    for (alias, source) in scene_text_fonts {
+        let FontSource::File { path, face_index } = source else {
+            anyhow::bail!("scene text font aliases must reference font files");
+        };
+        let alias_family = load_font_file_family(&mut font_system, path, *face_index)?;
+        if alias_family == family || aliases.values().any(|existing| existing == &alias_family) {
+            anyhow::bail!(
+                "scene text font alias {alias:?} resolves to a family already in use; aliases must use distinct font families"
+            );
+        }
+        aliases.insert(alias.clone(), alias_family);
+    }
 
-    Ok((font_system, family))
+    Ok((font_system, family, aliases))
+}
+
+fn load_font_file_family(
+    font_system: &mut FontSystem,
+    path: &std::path::Path,
+    face_index: u32,
+) -> Result<String> {
+    let existing_faces = font_system.db().faces().count();
+    font_system
+        .db_mut()
+        .load_font_file(path)
+        .with_context(|| format!("could not load font file {}", path.display()))?;
+    let selected_face = font_system
+        .db()
+        .faces()
+        .skip(existing_faces)
+        .find(|face| face.index == face_index)
+        .cloned()
+        .with_context(|| {
+            format!(
+                "font file {} does not contain face index {}",
+                path.display(),
+                face_index
+            )
+        })?;
+    let family = selected_face
+        .families
+        .first()
+        .map(|(family, _)| family.clone())
+        .with_context(|| {
+            format!(
+                "font file {} does not provide a usable family for face index {}",
+                path.display(),
+                face_index
+            )
+        })?;
+    let conflicting_faces = font_system
+        .db()
+        .faces()
+        .filter(|face| {
+            face.id != selected_face.id
+                && face
+                    .families
+                    .iter()
+                    .any(|(candidate, _)| candidate == &family)
+        })
+        .map(|face| face.id)
+        .collect::<Vec<_>>();
+    for face in conflicting_faces {
+        font_system.db_mut().remove_face(face);
+    }
+    Ok(family)
 }
 
 fn main() -> Result<()> {

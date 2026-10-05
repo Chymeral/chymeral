@@ -40,6 +40,7 @@ pub enum Capability {
     Timing,
     Overlap,
     ExternalDrop,
+    Text,
 }
 
 impl Capability {
@@ -51,6 +52,7 @@ impl Capability {
             Self::Timing => 1 << 3,
             Self::Overlap => 1 << 4,
             Self::ExternalDrop => 1 << 5,
+            Self::Text => 1 << 6,
         }
     }
 }
@@ -66,7 +68,8 @@ impl CapabilitySet {
             | Capability::Input.bit()
             | Capability::Timing.bit()
             | Capability::Overlap.bit()
-            | Capability::ExternalDrop.bit(),
+            | Capability::ExternalDrop.bit()
+            | Capability::Text.bit(),
     );
 
     pub const fn from_capabilities(capabilities: &[Capability]) -> Self {
@@ -684,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_external_drop_unavailable_to_clp_v1_3_clients() {
+    fn keeps_m14_capabilities_unavailable_to_clp_v1_3_clients() {
         let mut manager = SessionManager::default();
         let (session_id, message) = manager
             .accept(
@@ -708,6 +711,12 @@ mod tests {
                 .session_capabilities(session_id)
                 .unwrap()
                 .contains(Capability::ExternalDrop)
+        );
+        assert!(
+            !manager
+                .session_capabilities(session_id)
+                .unwrap()
+                .contains(Capability::Text)
         );
     }
 

@@ -3,7 +3,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-use crate::resources::TextureId;
+use crate::{resources::TextureId, scene_text::TextNode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId {
@@ -253,12 +253,13 @@ impl Display for ImageNodeError {
 
 impl Error for ImageNodeError {}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum NodeContent {
     #[default]
     Empty,
     Solid(SolidNode),
     Image(ImageNode),
+    Text(TextNode),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -287,8 +288,8 @@ impl Node {
         self.properties
     }
 
-    pub const fn content(&self) -> NodeContent {
-        self.content
+    pub fn content(&self) -> &NodeContent {
+        &self.content
     }
 }
 
@@ -459,6 +460,30 @@ impl Scene {
             current = current_ref.parent;
         }
         Ok(Some(visible))
+    }
+
+    pub fn ancestor_clip_bounds(&self, node: NodeId) -> Result<Option<Rect>, SceneError> {
+        let node_ref = self.require_node(node)?;
+        let mut clip: Option<Rect> = None;
+        let mut current = node_ref.parent;
+        while let Some(current_node) = current {
+            let current_ref = self.require_node(current_node)?;
+            if !current_ref.properties.visible {
+                return Ok(Some(Rect::default()));
+            }
+            if current_ref.properties.clip_children {
+                let bounds = self.world_bounds(current_node)?;
+                clip = match clip {
+                    Some(clip) => match clip.intersection(bounds) {
+                        Some(intersection) => Some(intersection),
+                        None => return Ok(Some(Rect::default())),
+                    },
+                    None => Some(bounds),
+                };
+            }
+            current = current_ref.parent;
+        }
+        Ok(clip)
     }
 
     pub fn hit_test(&self, point: Point) -> Result<Option<NodeId>, SceneError> {
@@ -785,7 +810,7 @@ mod tests {
 
         assert_eq!(
             scene.node(node).unwrap().content(),
-            NodeContent::Image(image)
+            &NodeContent::Image(image)
         );
         assert_eq!(
             ImageNode::new(texture, 1.1),
@@ -905,6 +930,7 @@ mod tests {
             scene.visible_bounds(child).unwrap(),
             Some(Rect::new(8.0, 0.0, 10.0, 10.0).unwrap())
         );
+        assert_eq!(scene.ancestor_clip_bounds(child).unwrap(), None);
     }
 
     #[test]
@@ -929,6 +955,10 @@ mod tests {
         assert_eq!(
             scene.visible_bounds(child).unwrap(),
             Some(Rect::new(8.0, 0.0, 2.0, 10.0).unwrap())
+        );
+        assert_eq!(
+            scene.ancestor_clip_bounds(child).unwrap(),
+            Some(Rect::new(0.0, 0.0, 10.0, 10.0).unwrap())
         );
         assert_eq!(
             scene.hit_test(Point::new(9.0, 5.0).unwrap()).unwrap(),

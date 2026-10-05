@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -29,6 +29,7 @@ pub struct Appearance {
     pub font: FontAppearance,
     pub foreground: Foreground,
     pub background: Background,
+    pub scene_text_fonts: BTreeMap<String, FontSource>,
 }
 
 impl Default for Appearance {
@@ -47,6 +48,7 @@ impl Default for Appearance {
                 color: Rgb::new(9, 11, 15),
                 opacity: 1.0,
             },
+            scene_text_fonts: BTreeMap::new(),
         }
     }
 }
@@ -235,11 +237,14 @@ fn parse_config(contents: &str, base_directory: &Path) -> Result<ParsedConfig> {
     let RawConfig {
         terminal,
         appearance,
+        scene_text,
         input,
         testing_tools,
     } = raw;
+    let mut terminal = terminal.into_appearance(base_directory)?;
+    terminal.scene_text_fonts = scene_text.into_fonts(base_directory)?;
     Ok(ParsedConfig {
-        appearance: terminal.into_appearance(base_directory)?,
+        appearance: terminal,
         startup_splash: appearance.into_startup_splash(base_directory)?,
         diagnostics: input.shortcuts.into_shortcuts()?,
         testing_scene: testing_tools.into_scene()?,
@@ -254,9 +259,46 @@ struct RawConfig {
     #[serde(default)]
     appearance: RawAppearance,
     #[serde(default)]
+    scene_text: RawSceneText,
+    #[serde(default)]
     input: RawInput,
     #[serde(default)]
     testing_tools: RawTestingTools,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSceneText {
+    #[serde(default)]
+    fonts: BTreeMap<String, RawSceneTextFont>,
+}
+
+impl RawSceneText {
+    fn into_fonts(self, base_directory: &Path) -> Result<BTreeMap<String, FontSource>> {
+        self.fonts
+            .into_iter()
+            .map(|(alias, font)| {
+                if alias.trim().is_empty() || alias.trim() != alias {
+                    bail!("scene_text.fonts aliases must be non-empty and unpadded");
+                }
+                Ok((
+                    alias,
+                    FontSource::File {
+                        path: resolve_path(base_directory, font.path),
+                        face_index: font.face_index,
+                    },
+                ))
+            })
+            .collect()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSceneTextFont {
+    path: PathBuf,
+    #[serde(default)]
+    face_index: u32,
 }
 
 #[derive(Default, Deserialize)]
@@ -547,6 +589,7 @@ impl RawTerminal {
             font: self.font.into_appearance(base_directory)?,
             foreground: self.foreground.into_appearance()?,
             background: self.background.into_appearance(base_directory)?,
+            scene_text_fonts: BTreeMap::new(),
         })
     }
 }
@@ -836,6 +879,37 @@ mod tests {
                 opacity: 0.65,
                 fit: ImageFit::Contain,
             }
+        );
+    }
+
+    #[test]
+    fn loads_explicit_scene_text_font_aliases() {
+        let appearance = parse(
+            r#"
+                [scene_text.fonts.ui]
+                path = "fonts/ui.otf"
+                face_index = 1
+            "#,
+            Path::new("/tmp/chymeral-config"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            appearance.scene_text_fonts.get("ui"),
+            Some(&FontSource::File {
+                path: "/tmp/chymeral-config/fonts/ui.otf".into(),
+                face_index: 1,
+            })
+        );
+        assert!(
+            parse(
+                r#"
+                [scene_text.fonts." ui"]
+                path = "fonts/ui.otf"
+            "#,
+                Path::new("/tmp/chymeral-config"),
+            )
+            .is_err()
         );
     }
 

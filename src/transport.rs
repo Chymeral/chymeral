@@ -31,10 +31,11 @@ use crate::runtime::{
 use crate::{
     program_scene::{
         ContentInput, MAX_TEXTURE_BYTES, NodeHandle, NodePropertiesInput, NodePropertiesPatch,
-        SceneCommand, SceneCommandResult, TextureHandle,
+        SceneCommand, SceneCommandResult, TextNodePropertiesInput, TextureHandle,
     },
     resources::rgba8_byte_len,
     scene::{NodeId, SceneLayer},
+    scene_text::{TextAlign, TextMetrics, TextStyle, TextWeight},
 };
 
 pub const CLP_ENDPOINT_ENV: &str = "CHYMERAL_CLP_ENDPOINT";
@@ -122,7 +123,7 @@ impl HostCommandRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HostCommandResponse {
     Success(SceneCommandResult),
     Error { code: &'static str, message: String },
@@ -1819,6 +1820,17 @@ fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilityS
                 && (!wire_command_uses_external_drop(command)
                     || capabilities.contains(Capability::ExternalDrop))
         }
+        WireSceneCommand::CreateTextRoot { .. }
+        | WireSceneCommand::CreateTextChild { .. }
+        | WireSceneCommand::SetText { .. }
+        | WireSceneCommand::SetTextStyle { .. } => {
+            capabilities.contains(Capability::Scene)
+                && capabilities.contains(Capability::Text)
+                && (!wire_command_uses_overlap(command)
+                    || capabilities.contains(Capability::Overlap))
+                && (!wire_command_uses_external_drop(command)
+                    || capabilities.contains(Capability::ExternalDrop))
+        }
         WireSceneCommand::UpdateNode { .. }
         | WireSceneCommand::Reparent { .. }
         | WireSceneCommand::RemoveNode { .. } => {
@@ -1851,6 +1863,16 @@ fn command_is_granted(command: &SceneCommand, capabilities: CapabilitySet) -> bo
                 && (!command_uses_external_drop(command)
                     || capabilities.contains(Capability::ExternalDrop))
         }
+        SceneCommand::CreateTextRoot { .. }
+        | SceneCommand::CreateTextChild { .. }
+        | SceneCommand::SetText { .. }
+        | SceneCommand::SetTextStyle { .. } => {
+            capabilities.contains(Capability::Scene)
+                && capabilities.contains(Capability::Text)
+                && (!command_uses_overlap(command) || capabilities.contains(Capability::Overlap))
+                && (!command_uses_external_drop(command)
+                    || capabilities.contains(Capability::ExternalDrop))
+        }
         SceneCommand::QueryOverlaps { .. } => {
             capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Overlap)
         }
@@ -1878,7 +1900,11 @@ fn wire_command_uses_overlap(command: &WireSceneCommand) -> bool {
         WireSceneCommand::CreateRoot { properties, .. }
         | WireSceneCommand::CreateChild { properties, .. } => properties.overlap_enabled,
         WireSceneCommand::UpdateNode { properties, .. } => properties.overlap_enabled.is_some(),
+        WireSceneCommand::CreateTextRoot { properties, .. }
+        | WireSceneCommand::CreateTextChild { properties, .. } => properties.overlap_enabled,
         WireSceneCommand::SetContent { .. }
+        | WireSceneCommand::SetText { .. }
+        | WireSceneCommand::SetTextStyle { .. }
         | WireSceneCommand::Reparent { .. }
         | WireSceneCommand::RemoveNode { .. }
         | WireSceneCommand::QueryOverlaps { .. }
@@ -1894,7 +1920,11 @@ fn wire_command_uses_external_drop(command: &WireSceneCommand) -> bool {
         WireSceneCommand::UpdateNode { properties, .. } => {
             properties.external_drop_enabled.is_some()
         }
+        WireSceneCommand::CreateTextRoot { properties, .. }
+        | WireSceneCommand::CreateTextChild { properties, .. } => properties.external_drop_enabled,
         WireSceneCommand::SetContent { .. }
+        | WireSceneCommand::SetText { .. }
+        | WireSceneCommand::SetTextStyle { .. }
         | WireSceneCommand::Reparent { .. }
         | WireSceneCommand::RemoveNode { .. }
         | WireSceneCommand::QueryOverlaps { .. }
@@ -1908,7 +1938,11 @@ fn command_uses_overlap(command: &SceneCommand) -> bool {
         SceneCommand::CreateRoot { properties, .. }
         | SceneCommand::CreateChild { properties, .. } => properties.overlap_enabled,
         SceneCommand::UpdateNode { properties, .. } => properties.overlap_enabled.is_some(),
+        SceneCommand::CreateTextRoot { properties, .. }
+        | SceneCommand::CreateTextChild { properties, .. } => properties.overlap_enabled,
         SceneCommand::SetContent { .. }
+        | SceneCommand::SetText { .. }
+        | SceneCommand::SetTextStyle { .. }
         | SceneCommand::Reparent { .. }
         | SceneCommand::RemoveNode { .. }
         | SceneCommand::QueryOverlaps { .. }
@@ -1922,7 +1956,11 @@ fn command_uses_external_drop(command: &SceneCommand) -> bool {
         SceneCommand::CreateRoot { properties, .. }
         | SceneCommand::CreateChild { properties, .. } => properties.external_drop_enabled,
         SceneCommand::UpdateNode { properties, .. } => properties.external_drop_enabled.is_some(),
+        SceneCommand::CreateTextRoot { properties, .. }
+        | SceneCommand::CreateTextChild { properties, .. } => properties.external_drop_enabled,
         SceneCommand::SetContent { .. }
+        | SceneCommand::SetText { .. }
+        | SceneCommand::SetTextStyle { .. }
         | SceneCommand::Reparent { .. }
         | SceneCommand::RemoveNode { .. }
         | SceneCommand::QueryOverlaps { .. }
@@ -2292,6 +2330,29 @@ enum WireSceneCommand {
         node: String,
         content: WireNodeContent,
     },
+    CreateTextRoot {
+        #[serde(default)]
+        layer: WireSceneLayer,
+        properties: WireTextNodeProperties,
+        text: String,
+        #[serde(default)]
+        style: WireTextStyle,
+    },
+    CreateTextChild {
+        parent: String,
+        properties: WireTextNodeProperties,
+        text: String,
+        #[serde(default)]
+        style: WireTextStyle,
+    },
+    SetText {
+        node: String,
+        text: String,
+    },
+    SetTextStyle {
+        node: String,
+        style: WireTextStyle,
+    },
     Reparent {
         node: String,
         parent: Option<String>,
@@ -2352,6 +2413,36 @@ impl WireSceneCommand {
             Self::SetContent { node, content } => Ok(SceneCommand::SetContent {
                 node: parse_node_handle(&node)?,
                 content: content.into_input()?,
+            }),
+            Self::CreateTextRoot {
+                layer,
+                properties,
+                text,
+                style,
+            } => Ok(SceneCommand::CreateTextRoot {
+                layer: layer.into_scene(),
+                properties: properties.into_input(),
+                text,
+                style: style.into_scene(),
+            }),
+            Self::CreateTextChild {
+                parent,
+                properties,
+                text,
+                style,
+            } => Ok(SceneCommand::CreateTextChild {
+                parent: parse_node_handle(&parent)?,
+                properties: properties.into_input(),
+                text,
+                style: style.into_scene(),
+            }),
+            Self::SetText { node, text } => Ok(SceneCommand::SetText {
+                node: parse_node_handle(&node)?,
+                text,
+            }),
+            Self::SetTextStyle { node, style } => Ok(SceneCommand::SetTextStyle {
+                node: parse_node_handle(&node)?,
+                style: style.into_scene(),
             }),
             Self::Reparent { node, parent } => Ok(SceneCommand::Reparent {
                 node: parse_node_handle(&node)?,
@@ -2461,6 +2552,101 @@ impl WireNodePropertiesPatch {
 }
 
 #[derive(Deserialize, Serialize)]
+struct WireTextNodeProperties {
+    x: f64,
+    y: f64,
+    #[serde(default = "default_visible")]
+    visible: bool,
+    #[serde(default)]
+    clip_children: bool,
+    #[serde(default)]
+    z_index: i32,
+    #[serde(default)]
+    overlap_enabled: bool,
+    #[serde(default)]
+    external_drop_enabled: bool,
+}
+
+impl WireTextNodeProperties {
+    fn into_input(self) -> TextNodePropertiesInput {
+        TextNodePropertiesInput {
+            x: self.x,
+            y: self.y,
+            visible: self.visible,
+            clip_children: self.clip_children,
+            z_index: self.z_index,
+            overlap_enabled: self.overlap_enabled,
+            external_drop_enabled: self.external_drop_enabled,
+        }
+    }
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct WireTextStyle {
+    #[serde(default)]
+    font: Option<String>,
+    #[serde(default)]
+    size: Option<f32>,
+    #[serde(default)]
+    line_height: Option<f32>,
+    #[serde(default)]
+    color: Option<[u8; 4]>,
+    #[serde(default)]
+    weight: WireTextWeight,
+    #[serde(default)]
+    align: WireTextAlign,
+}
+
+impl WireTextStyle {
+    fn into_scene(self) -> TextStyle {
+        TextStyle {
+            font_alias: self.font,
+            size: self.size,
+            line_height: self.line_height,
+            color: self.color,
+            weight: self.weight.into_scene(),
+            align: self.align.into_scene(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireTextWeight {
+    #[default]
+    Normal,
+    Bold,
+}
+
+impl WireTextWeight {
+    const fn into_scene(self) -> TextWeight {
+        match self {
+            Self::Normal => TextWeight::Normal,
+            Self::Bold => TextWeight::Bold,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireTextAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+impl WireTextAlign {
+    const fn into_scene(self) -> TextAlign {
+        match self {
+            Self::Start => TextAlign::Start,
+            Self::Center => TextAlign::Center,
+            Self::End => TextAlign::End,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireNodeContent {
     Empty,
@@ -2534,6 +2720,7 @@ enum WireCapability {
     Timing,
     Overlap,
     ExternalDrop,
+    Text,
 }
 
 impl WireCapability {
@@ -2545,6 +2732,7 @@ impl WireCapability {
             Self::Timing => Capability::Timing,
             Self::Overlap => Capability::Overlap,
             Self::ExternalDrop => Capability::ExternalDrop,
+            Self::Text => Capability::Text,
         }
     }
 }
@@ -2558,6 +2746,7 @@ impl From<Capability> for WireCapability {
             Capability::Timing => Self::Timing,
             Capability::Overlap => Self::Overlap,
             Capability::ExternalDrop => Self::ExternalDrop,
+            Capability::Text => Self::Text,
         }
     }
 }
@@ -3350,12 +3539,19 @@ enum WireCommandResult {
     Node {
         node: String,
     },
+    TextNode {
+        node: String,
+        metrics: WireTextMetrics,
+    },
     Texture {
         texture: String,
     },
     Overlaps {
         overlapping: bool,
         nodes: Vec<String>,
+    },
+    TextMetrics {
+        metrics: WireTextMetrics,
     },
     Acknowledged,
 }
@@ -3366,6 +3562,10 @@ impl From<SceneCommandResult> for WireCommandResult {
             SceneCommandResult::Node(node) => Self::Node {
                 node: node.to_string(),
             },
+            SceneCommandResult::TextNode { node, metrics } => Self::TextNode {
+                node: node.to_string(),
+                metrics: metrics.into(),
+            },
             SceneCommandResult::Texture(texture) => Self::Texture {
                 texture: texture.to_string(),
             },
@@ -3373,7 +3573,29 @@ impl From<SceneCommandResult> for WireCommandResult {
                 overlapping: !nodes.is_empty(),
                 nodes: nodes.into_iter().map(|node| node.to_string()).collect(),
             },
+            SceneCommandResult::TextMetrics(metrics) => Self::TextMetrics {
+                metrics: metrics.into(),
+            },
             SceneCommandResult::Acknowledged => Self::Acknowledged,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireTextMetrics {
+    columns: u32,
+    rows: u32,
+    width: f64,
+    height: f64,
+}
+
+impl From<TextMetrics> for WireTextMetrics {
+    fn from(metrics: TextMetrics) -> Self {
+        Self {
+            columns: metrics.columns,
+            rows: metrics.rows,
+            width: metrics.width,
+            height: metrics.height,
         }
     }
 }
@@ -3438,6 +3660,7 @@ fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
         Capability::Timing,
         Capability::Overlap,
         Capability::ExternalDrop,
+        Capability::Text,
     ]
     .into_iter()
     .filter(|capability| capabilities.contains(*capability))
@@ -3544,6 +3767,7 @@ mod tests {
                     "timing" => WireCapability::Timing,
                     "overlap" => WireCapability::Overlap,
                     "external_drop" => WireCapability::ExternalDrop,
+                    "text" => WireCapability::Text,
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -4564,6 +4788,115 @@ mod tests {
 
         send_client(&mut client, WireClientMessage::Close);
         let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn forwards_text_commands_and_reports_intrinsic_metrics() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene", "text"]));
+        let init = receive_host(&mut client);
+        assert_eq!(init["capabilities"], json!(["scene", "text"]));
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "text-root".to_owned(),
+                command: WireSceneCommand::CreateTextRoot {
+                    layer: WireSceneLayer::Overlay,
+                    properties: WireTextNodeProperties {
+                        x: 24.0,
+                        y: 48.0,
+                        visible: true,
+                        clip_children: false,
+                        z_index: 0,
+                        overlap_enabled: false,
+                        external_drop_enabled: false,
+                    },
+                    text: "Hello".to_owned(),
+                    style: WireTextStyle::default(),
+                },
+            },
+        );
+        let request = wait_for_host_command(&server);
+        assert_eq!(request.request_id, "text-root");
+        assert_eq!(
+            request.command,
+            SceneCommand::CreateTextRoot {
+                layer: SceneLayer::Overlay,
+                properties: TextNodePropertiesInput {
+                    x: 24.0,
+                    y: 48.0,
+                    visible: true,
+                    clip_children: false,
+                    z_index: 0,
+                    overlap_enabled: false,
+                    external_drop_enabled: false,
+                },
+                text: "Hello".to_owned(),
+                style: TextStyle::default(),
+            }
+        );
+        request.respond(HostCommandResponse::Success(SceneCommandResult::TextNode {
+            node: NodeHandle::new(7),
+            metrics: TextMetrics {
+                columns: 5,
+                rows: 1,
+                width: 48.0,
+                height: 20.0,
+                cells: 5,
+            },
+        }));
+
+        let result = receive_host(&mut client);
+        assert_eq!(result["type"], "result");
+        assert_eq!(
+            result["result"],
+            json!({
+                "kind": "text_node",
+                "node": "node-7",
+                "metrics": {
+                    "columns": 5,
+                    "rows": 1,
+                    "width": 48.0,
+                    "height": 20.0,
+                }
+            })
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn requires_the_text_capability_and_related_opt_ins_for_text_nodes() {
+        let text = WireSceneCommand::CreateTextRoot {
+            layer: WireSceneLayer::Overlay,
+            properties: WireTextNodeProperties {
+                x: 0.0,
+                y: 0.0,
+                visible: true,
+                clip_children: false,
+                z_index: 0,
+                overlap_enabled: true,
+                external_drop_enabled: true,
+            },
+            text: "x".to_owned(),
+            style: WireTextStyle::default(),
+        };
+        let scene_and_text =
+            CapabilitySet::from_capabilities(&[Capability::Scene, Capability::Text]);
+        assert!(!wire_command_is_granted(&text, scene_and_text));
+        let all = CapabilitySet::from_capabilities(&[
+            Capability::Scene,
+            Capability::Text,
+            Capability::Overlap,
+            Capability::ExternalDrop,
+        ]);
+        assert!(wire_command_is_granted(&text, all));
     }
 
     #[test]

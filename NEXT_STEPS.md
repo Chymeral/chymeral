@@ -339,7 +339,7 @@ scene-target validation passed; final desktop regression matrix pending
 
 ## M17 — Intrinsic Scene Text
 
-**Status:** Planned
+**Status:** Complete; Linux and Windows visual validation passed
 
 ### Scope
 
@@ -347,7 +347,7 @@ scene-target validation passed; final desktop regression matrix pending
   cells.
 - Use terminal font, foreground color, cell width, and line height when a text
   style does not override them.
-- Support one style per text node initially: font family, size, line height,
+- Support one style per text node initially: configured font alias, size, line height,
   color, weight, alignment, and clipping as applicable.
 - Recalculate bounds, hit testing, focus, drag, and overlap when text changes.
 - Treat explicit line breaks as new cell rows.
@@ -369,14 +369,6 @@ scene-target validation passed; final desktop regression matrix pending
 - A general layout or widget system.
 - Text input controls, IME composition, and accessibility tree work.
 
-### Pending technical decisions
-
-- Empty-text and trailing-newline bounds semantics.
-- Tab expansion and tab-stop policy for scene text.
-- Initial alignment, overflow, and clipping behavior.
-- How custom font family fallback is made deterministic across platforms.
-- Public text command/type shape for CLP v1.4 and the Rust SDK.
-
 ### Acceptance criteria
 
 - Intrinsic bounds are deterministic for ASCII, wide Unicode, combining marks,
@@ -388,11 +380,127 @@ scene-target validation passed; final desktop regression matrix pending
 
 ### Accepted decisions
 
-_None yet._
+- **Date:** 2026-10-05
+  **Decision:** A text node's local origin is the upper-left corner of the
+  first cell on its first line, rather than the visible ink bounds of its
+  first glyph.
+  **Context:** Glyph bearings, overhangs, ascenders, and descenders vary by
+  font and would make an ink-based origin unsuitable for retained-scene
+  geometry.
+  **Rationale:** Cell geometry keeps the declared position, clipping, hit
+  testing, dragging, and overlap deterministic. A leading space occupies the
+  first cell without moving the node origin.
+  **Consequences:** The renderer positions glyph ink within its cell; clients
+  position text from its cell rectangle, not from individual glyph pixels.
+  **Validation:** Geometry and visual tests must cover leading spaces,
+  ascenders, descenders, and styled fonts.
+
+- **Date:** 2026-10-05
+  **Decision:** Empty text has zero intrinsic width and height. An explicit
+  line break creates a subsequent row, including a final empty row after a
+  trailing newline; empty rows contribute line height but no width.
+  **Context:** Scene text must expose predictable bounds without invisible
+  one-cell interaction targets.
+  **Rationale:** This preserves the terminal meaning of explicit newlines
+  while ensuring that text with no occupied cells cannot accidentally capture
+  pointer or overlap interactions.
+  **Consequences:** `"hello\\n"` is two rows high and as wide as `"hello"`;
+  `"\\n"` is two rows high with zero width; `""` is `0 × 0`.
+  **Validation:** Unit tests must cover empty text, leading and trailing
+  newlines, and blank intermediate rows.
+
+- **Date:** 2026-10-05
+  **Decision:** Horizontal tabs advance to fixed stops every eight cells,
+  measured from the local origin of each text line.
+  **Context:** A tab is not a glyph with a fixed pixel width, and its geometry
+  would otherwise vary by client expectation.
+  **Rationale:** Eight-cell stops are conventional terminal behavior and make
+  intrinsic widths independent of the surrounding terminal cursor position.
+  **Consequences:** Each explicit line begins again at column zero for tab-stop
+  calculation.
+  **Validation:** Unit tests must cover tabs at column zero, between glyphs,
+  after wide characters, and on subsequent lines.
+
+- **Date:** 2026-10-05
+  **Decision:** Text starts aligned by default; center and end alignment place
+  shorter lines within the intrinsic width of the longest line. M17 has no
+  wrapping, ellipsis, or text-owned clipping.
+  **Context:** Intrinsic nodes have no client-supplied layout box, while
+  existing parent clipping already defines retained-scene visibility.
+  **Rationale:** This supports aligned multi-line labels without creating an
+  implicit layout or widget system.
+  **Consequences:** Text that extends beyond a parent is visible unless that
+  parent enables existing child clipping.
+  **Validation:** Visual and geometry tests must cover all alignments and
+  clipping by an ancestor.
+
+- **Date:** 2026-10-05
+  **Decision:** The default text face is the terminal face. Optional custom
+  faces use aliases declared by the Chymeral configuration and resolved to
+  explicit font files; clients never provide host paths or rely on installed
+  system-family fallback.
+  **Context:** System font-family resolution differs across Linux and Windows,
+  but CLP clients require reproducible scene layout.
+  **Rationale:** Configuration-owned aliases retain local control while making
+  the selected font explicit and portable when the same configuration assets
+  are supplied.
+  **Consequences:** Requesting an unknown alias is a command error. M17 will
+  define bounded text retention; exact resource limits remain an implementation
+  detail to validate against renderer behavior.
+  **Validation:** Configuration, command-rejection, and cross-platform visual
+  tests must cover defaults, valid aliases, and unknown aliases.
+
+- **Date:** 2026-10-05
+  **Decision:** The provisional CLP v1.4 capability is named `text`. It adds
+  `create_text_root`, `create_text_child`, `set_text`, and `set_text_style`.
+  Creation returns an opaque node handle plus host-computed metrics; text and
+  style updates return new metrics. The Rust SDK exposes matching typed
+  `TextNodeProperties`, `TextStyle`, `TextMetrics`, and `TextNode` values.
+  **Context:** Text needs an intrinsic rectangle, so regular scene creation
+  with client-supplied width and height cannot represent its contract.
+  **Rationale:** Separate commands make intrinsic ownership explicit while
+  preserving all existing retained-node hierarchy, layer, interaction, and
+  capability rules.
+  **Consequences:** Generic width/height patches and generic content changes
+  reject text nodes. Text nodes may still move, toggle visibility, change
+  z-index, opt into overlap, and opt into external drops when the corresponding
+  capabilities are granted.
+  **Validation:** Unit and transport tests cover command serialization,
+  capability denial, intrinsic-bound updates, and overlap reconciliation; the
+  reference SDK conformance example exercises create and update operations.
+
+- **Date:** 2026-10-05
+  **Decision:** Retained text is bounded to 1 MiB and 256 Ki cells per payload,
+  and to 16 MiB, 1 Mi cells, and 1,024 text nodes per session.
+  **Context:** Text is retained host-side and can cause CPU, memory, glyph-cache,
+  and draw-work pressure even without uploaded textures.
+  **Rationale:** Independent limits bound the most direct abuse paths without
+  coupling text accounting to image-resource quotas.
+  **Consequences:** Command rejection is deterministic before a node or text
+  update is committed; disconnect cleanup releases all retained text with its
+  owned scene nodes.
+  **Validation:** Layout and resource-path tests cover payload limits and
+  session accounting; full render stress remains part of desktop validation.
 
 ### Validation record
 
-_Not started._
+- Linux build host: `cargo fmt --check`, `cargo test --all-targets --
+  --test-threads=1` (181 tests), `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --release`, and `git diff --check` pass on 2026-10-05.
+- Automated host coverage currently includes cell measurement for ASCII, wide
+  and combining Unicode, tabs, empty and trailing-newline rows, style scaling,
+  command ownership, capability denial, intrinsic-bound updates, and overlap
+  reconciliation.
+- The separate Rust SDK passes `cargo fmt --check`, `cargo test --all-targets`,
+  and `cargo clippy --all-targets -- -D warnings`; `clp_conformance` now
+  exercises text creation plus text/style updates.
+- `clp_text_probe` passed visual validation on Windows and Linux on 2026-10-05:
+  its one panel plus two text children were visible in the scene diagnostic;
+  default terminal styling, child offsets, tab stops, the wide `界` glyph,
+  updates, bold/end styling, and session-only close behavior all worked.
+- Linux validation also configured the explicit `host_hack` alias to its
+  file-backed Hack Regular font. The probe rendered with that alias on creation
+  and after a style update, while retaining the visible wide-glyph fallback.
 
 ## M18 — Animated Scene Images
 

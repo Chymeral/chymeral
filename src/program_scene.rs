@@ -12,11 +12,15 @@ use crate::{
         ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer, SolidNode,
         Transform,
     },
+    scene_text::{TextLayout, TextLayoutError, TextMetrics, TextNode, TextStyle},
 };
 
 pub const MAX_TEXTURE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SESSION_TEXTURE_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_SESSION_OVERLAP_NODES: usize = 1024;
+pub const MAX_SESSION_TEXT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SESSION_TEXT_CELLS: usize = 1024 * 1024;
+pub const MAX_SESSION_TEXT_NODES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeHandle(u64);
@@ -79,6 +83,34 @@ impl NodePropertiesInput {
             overlap_enabled: self.overlap_enabled,
             external_drop_enabled: self.external_drop_enabled,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextNodePropertiesInput {
+    pub x: f64,
+    pub y: f64,
+    pub visible: bool,
+    pub clip_children: bool,
+    pub z_index: i32,
+    pub overlap_enabled: bool,
+    pub external_drop_enabled: bool,
+}
+
+impl TextNodePropertiesInput {
+    fn into_scene(self, metrics: TextMetrics) -> Result<NodeProperties, ProgramSceneError> {
+        NodePropertiesInput {
+            x: self.x,
+            y: self.y,
+            width: metrics.width,
+            height: metrics.height,
+            visible: self.visible,
+            clip_children: self.clip_children,
+            z_index: self.z_index,
+            overlap_enabled: self.overlap_enabled,
+            external_drop_enabled: self.external_drop_enabled,
+        }
+        .into_scene()
     }
 }
 
@@ -146,6 +178,26 @@ pub enum SceneCommand {
         node: NodeHandle,
         content: ContentInput,
     },
+    CreateTextRoot {
+        layer: SceneLayer,
+        properties: TextNodePropertiesInput,
+        text: String,
+        style: TextStyle,
+    },
+    CreateTextChild {
+        parent: NodeHandle,
+        properties: TextNodePropertiesInput,
+        text: String,
+        style: TextStyle,
+    },
+    SetText {
+        node: NodeHandle,
+        text: String,
+    },
+    SetTextStyle {
+        node: NodeHandle,
+        style: TextStyle,
+    },
     Reparent {
         node: NodeHandle,
         parent: Option<NodeHandle>,
@@ -166,11 +218,16 @@ pub enum SceneCommand {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SceneCommandResult {
     Node(NodeHandle),
+    TextNode {
+        node: NodeHandle,
+        metrics: TextMetrics,
+    },
     Texture(TextureHandle),
     Overlaps(Vec<NodeHandle>),
+    TextMetrics(TextMetrics),
     Acknowledged,
 }
 
@@ -187,6 +244,13 @@ pub enum ProgramSceneError {
     Scene(crate::scene::SceneError),
     Image(crate::scene::ImageNodeError),
     Texture(TextureError),
+    Text(TextLayoutError),
+    TextNodeRequired(NodeHandle),
+    IntrinsicTextBounds(NodeHandle),
+    TextContentRequiresTextCommands(NodeHandle),
+    TextLimitExceeded { limit: usize },
+    SessionTextLimitExceeded { limit: usize },
+    SessionTextNodeLimitExceeded { limit: usize },
     OverlapNodeLimitExceeded { limit: usize },
     HandleExhausted,
 }
@@ -216,6 +280,35 @@ impl Display for ProgramSceneError {
             Self::Scene(error) => Display::fmt(error, formatter),
             Self::Image(error) => Display::fmt(error, formatter),
             Self::Texture(error) => Display::fmt(error, formatter),
+            Self::Text(error) => Display::fmt(error, formatter),
+            Self::TextNodeRequired(handle) => write!(formatter, "{handle} does not contain text"),
+            Self::IntrinsicTextBounds(handle) => {
+                write!(
+                    formatter,
+                    "{handle} has intrinsic text bounds that cannot be set directly"
+                )
+            }
+            Self::TextContentRequiresTextCommands(handle) => {
+                write!(
+                    formatter,
+                    "{handle} contains text and must be changed with text commands"
+                )
+            }
+            Self::TextLimitExceeded { limit } => {
+                write!(formatter, "text may not exceed {limit} bytes or cells")
+            }
+            Self::SessionTextLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "a session may not retain more than {limit} text bytes or cells"
+                )
+            }
+            Self::SessionTextNodeLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "a session may not retain more than {limit} text nodes"
+                )
+            }
             Self::OverlapNodeLimitExceeded { limit } => {
                 write!(
                     formatter,
@@ -239,6 +332,7 @@ pub struct ProgramSceneResources {
     nodes: BTreeMap<NodeHandle, OwnedNode>,
     textures: BTreeMap<TextureHandle, OwnedTexture>,
     session_texture_bytes: BTreeMap<SessionId, usize>,
+    text_layout: TextLayout,
     overlap_pairs: BTreeSet<OverlapPair>,
     pending_overlap_events: Vec<SceneEvent>,
 }
@@ -254,6 +348,13 @@ struct OwnedTexture {
     session: SessionId,
     texture: crate::resources::TextureId,
     bytes: usize,
+}
+
+#[derive(Default)]
+struct TextUsage {
+    bytes: usize,
+    cells: usize,
+    nodes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -285,8 +386,15 @@ impl ProgramSceneResources {
             max_texture_dimension,
             next_node_handle: 1,
             next_texture_handle: 1,
+            text_layout: TextLayout::new(16.0, 9.6, 20.0, [])
+                .expect("default text metrics are valid"),
             ..Self::default()
         }
+    }
+
+    pub fn with_text_layout(mut self, text_layout: TextLayout) -> Self {
+        self.text_layout = text_layout;
+        self
     }
 
     pub fn execute(
@@ -331,7 +439,15 @@ impl ProgramSceneResources {
                 Ok(SceneCommandResult::Node(handle))
             }
             SceneCommand::UpdateNode { node, properties } => {
-                let node = self.node_for(session, node)?;
+                let handle = node;
+                let node = self.node_for(session, handle)?;
+                if matches!(
+                    scene.node(node).map(|node| node.content()),
+                    Some(NodeContent::Text(_))
+                ) && (properties.width.is_some() || properties.height.is_some())
+                {
+                    return Err(ProgramSceneError::IntrinsicTextBounds(handle));
+                }
                 let current = scene
                     .node(node)
                     .ok_or(ProgramSceneError::InvalidNodeHandle(node_handle_for(
@@ -353,9 +469,87 @@ impl ProgramSceneResources {
                 Ok(SceneCommandResult::Acknowledged)
             }
             SceneCommand::SetContent { node, content } => {
-                let node = self.node_for(session, node)?;
+                let handle = node;
+                let node = self.node_for(session, handle)?;
+                if matches!(
+                    scene.node(node).map(|node| node.content()),
+                    Some(NodeContent::Text(_))
+                ) {
+                    return Err(ProgramSceneError::TextContentRequiresTextCommands(handle));
+                }
                 self.set_content(session, node, content, scene)?;
                 Ok(SceneCommandResult::Acknowledged)
+            }
+            SceneCommand::CreateTextRoot {
+                layer,
+                properties,
+                text,
+                style,
+            } => {
+                self.validate_overlap_capacity(session, false, properties.overlap_enabled, scene)?;
+                let (text, metrics) = self.create_text_node(session, text, style, scene, None)?;
+                let node = scene.create_root_in_layer(properties.into_scene(metrics)?, layer);
+                scene
+                    .set_content(node, NodeContent::Text(text))
+                    .expect("a newly created text root is valid");
+                let handle = self.allocate_node(session, node)?;
+                self.reconcile_overlaps(session, scene)?;
+                Ok(SceneCommandResult::TextNode {
+                    node: handle,
+                    metrics,
+                })
+            }
+            SceneCommand::CreateTextChild {
+                parent,
+                properties,
+                text,
+                style,
+            } => {
+                self.validate_overlap_capacity(session, false, properties.overlap_enabled, scene)?;
+                let parent = self.node_for(session, parent)?;
+                let (text, metrics) = self.create_text_node(session, text, style, scene, None)?;
+                let node = scene
+                    .create_child(parent, properties.into_scene(metrics)?)
+                    .map_err(ProgramSceneError::Scene)?;
+                scene
+                    .set_content(node, NodeContent::Text(text))
+                    .expect("a newly created text child is valid");
+                let handle = self.allocate_node(session, node)?;
+                self.reconcile_overlaps(session, scene)?;
+                Ok(SceneCommandResult::TextNode {
+                    node: handle,
+                    metrics,
+                })
+            }
+            SceneCommand::SetText { node, text } => {
+                let handle = node;
+                let node = self.node_for(session, handle)?;
+                let existing = self.text_node_for(handle, node, scene)?;
+                let (text, metrics) = self.create_text_node(
+                    session,
+                    text,
+                    existing.style().clone(),
+                    scene,
+                    Some(&existing),
+                )?;
+                self.replace_text_node(node, text, metrics, scene)?;
+                self.reconcile_overlaps(session, scene)?;
+                Ok(SceneCommandResult::TextMetrics(metrics))
+            }
+            SceneCommand::SetTextStyle { node, style } => {
+                let handle = node;
+                let node = self.node_for(session, handle)?;
+                let existing = self.text_node_for(handle, node, scene)?;
+                let (text, metrics) = self.create_text_node(
+                    session,
+                    existing.text().to_owned(),
+                    style,
+                    scene,
+                    Some(&existing),
+                )?;
+                self.replace_text_node(node, text, metrics, scene)?;
+                self.reconcile_overlaps(session, scene)?;
+                Ok(SceneCommandResult::TextMetrics(metrics))
             }
             SceneCommand::Reparent { node, parent } => {
                 let node = self.node_for(session, node)?;
@@ -510,6 +704,128 @@ impl ProgramSceneResources {
 
     pub fn drain_overlap_events(&mut self) -> Vec<SceneEvent> {
         std::mem::take(&mut self.pending_overlap_events)
+    }
+
+    fn create_text_node(
+        &self,
+        session: SessionId,
+        text: String,
+        style: TextStyle,
+        scene: &Scene,
+        replaced: Option<&TextNode>,
+    ) -> Result<(TextNode, TextMetrics), ProgramSceneError> {
+        let metrics = self.measure_text(&text, &style)?;
+        let usage = self.text_usage(session, scene);
+        let previous_bytes = replaced.map(|text| text.text().len()).unwrap_or_default();
+        let previous_cells = replaced
+            .map(|text| text.metrics().cells)
+            .unwrap_or_default();
+        let previous_nodes = usize::from(replaced.is_some());
+        let bytes = usage
+            .bytes
+            .checked_sub(previous_bytes)
+            .and_then(|bytes| bytes.checked_add(text.len()))
+            .ok_or(ProgramSceneError::SessionTextLimitExceeded {
+                limit: MAX_SESSION_TEXT_BYTES,
+            })?;
+        let cells = usage
+            .cells
+            .checked_sub(previous_cells)
+            .and_then(|cells| cells.checked_add(metrics.cells))
+            .ok_or(ProgramSceneError::SessionTextLimitExceeded {
+                limit: MAX_SESSION_TEXT_CELLS,
+            })?;
+        let nodes = usage
+            .nodes
+            .checked_sub(previous_nodes)
+            .and_then(|nodes| nodes.checked_add(1))
+            .ok_or(ProgramSceneError::SessionTextNodeLimitExceeded {
+                limit: MAX_SESSION_TEXT_NODES,
+            })?;
+        if bytes > MAX_SESSION_TEXT_BYTES {
+            return Err(ProgramSceneError::SessionTextLimitExceeded {
+                limit: MAX_SESSION_TEXT_BYTES,
+            });
+        }
+        if cells > MAX_SESSION_TEXT_CELLS {
+            return Err(ProgramSceneError::SessionTextLimitExceeded {
+                limit: MAX_SESSION_TEXT_CELLS,
+            });
+        }
+        if nodes > MAX_SESSION_TEXT_NODES {
+            return Err(ProgramSceneError::SessionTextNodeLimitExceeded {
+                limit: MAX_SESSION_TEXT_NODES,
+            });
+        }
+        Ok((TextNode::new(text, style, metrics), metrics))
+    }
+
+    fn measure_text(
+        &self,
+        text: &str,
+        style: &TextStyle,
+    ) -> Result<TextMetrics, ProgramSceneError> {
+        self.text_layout
+            .measure(text, style)
+            .map_err(|error| match error {
+                TextLayoutError::TextBytesExceeded { limit }
+                | TextLayoutError::TextCellsExceeded { limit } => {
+                    ProgramSceneError::TextLimitExceeded { limit }
+                }
+                error => ProgramSceneError::Text(error),
+            })
+    }
+
+    fn text_node_for(
+        &self,
+        handle: NodeHandle,
+        node: NodeId,
+        scene: &Scene,
+    ) -> Result<TextNode, ProgramSceneError> {
+        match scene.node(node).map(|node| node.content()) {
+            Some(NodeContent::Text(text)) => Ok(text.clone()),
+            _ => Err(ProgramSceneError::TextNodeRequired(handle)),
+        }
+    }
+
+    fn replace_text_node(
+        &mut self,
+        node: NodeId,
+        text: TextNode,
+        metrics: TextMetrics,
+        scene: &mut Scene,
+    ) -> Result<(), ProgramSceneError> {
+        let mut properties = scene
+            .node(node)
+            .ok_or(ProgramSceneError::Scene(
+                crate::scene::SceneError::InvalidNode(node),
+            ))?
+            .properties();
+        properties.bounds = Rect::new(0.0, 0.0, metrics.width, metrics.height)
+            .map_err(ProgramSceneError::Geometry)?;
+        scene
+            .set_properties(node, properties)
+            .map_err(ProgramSceneError::Scene)?;
+        scene
+            .set_content(node, NodeContent::Text(text))
+            .map_err(ProgramSceneError::Scene)
+    }
+
+    fn text_usage(&self, session: SessionId, scene: &Scene) -> TextUsage {
+        self.nodes
+            .values()
+            .filter(|owned| owned.session == session)
+            .filter_map(|owned| scene.node(owned.node))
+            .filter_map(|node| match node.content() {
+                NodeContent::Text(text) => Some(text),
+                NodeContent::Empty | NodeContent::Solid(_) | NodeContent::Image(_) => None,
+            })
+            .fold(TextUsage::default(), |mut usage, text| {
+                usage.bytes += text.text().len();
+                usage.cells += text.metrics().cells;
+                usage.nodes += 1;
+                usage
+            })
     }
 
     fn validate_overlap_capacity(
@@ -812,6 +1128,261 @@ mod tests {
             overlap_enabled: false,
             external_drop_enabled: false,
         }
+    }
+
+    fn text_properties(x: f64, y: f64) -> TextNodePropertiesInput {
+        TextNodePropertiesInput {
+            x,
+            y,
+            visible: true,
+            clip_children: false,
+            z_index: 0,
+            overlap_enabled: false,
+            external_drop_enabled: false,
+        }
+    }
+
+    #[test]
+    fn creates_text_nodes_with_intrinsic_terminal_cell_bounds() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+
+        let (handle, metrics) = match resources
+            .execute(
+                session,
+                SceneCommand::CreateTextRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: text_properties(24.0, 48.0),
+                    text: "a\tb\n界".to_owned(),
+                    style: TextStyle::default(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::TextNode { node, metrics } => (node, metrics),
+            _ => unreachable!(),
+        };
+
+        assert_eq!(metrics.columns, 9);
+        assert_eq!(metrics.rows, 2);
+        assert_eq!(metrics.cells, 11);
+        assert!((metrics.width - 86.4).abs() < 0.001);
+        assert_eq!(metrics.height, 40.0);
+        let node = scene.roots()[0];
+        assert_eq!(
+            resources.node_handle_for_session(session, node),
+            Some(handle)
+        );
+        let properties = scene.node(node).unwrap().properties();
+        assert_eq!(properties.transform, Transform::new(24.0, 48.0).unwrap());
+        assert_eq!(properties.bounds.width(), metrics.width);
+        assert_eq!(properties.bounds.height(), metrics.height);
+        assert!(matches!(
+            scene.node(node).unwrap().content(),
+            NodeContent::Text(text) if text.text() == "a\tb\n界"
+        ));
+    }
+
+    #[test]
+    fn updates_text_bounds_and_preserves_the_intrinsic_contract() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let handle = match resources
+            .execute(
+                session,
+                SceneCommand::CreateTextRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: text_properties(0.0, 0.0),
+                    text: "x".to_owned(),
+                    style: TextStyle::default(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::TextNode { node, .. } => node,
+            _ => unreachable!(),
+        };
+
+        let metrics = match resources
+            .execute(
+                session,
+                SceneCommand::SetText {
+                    node: handle,
+                    text: "x\n".to_owned(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::TextMetrics(metrics) => metrics,
+            _ => unreachable!(),
+        };
+        assert_eq!(metrics.columns, 1);
+        assert_eq!(metrics.rows, 2);
+        assert!((metrics.width - 9.6).abs() < 0.001);
+        assert_eq!(metrics.height, 40.0);
+        assert_eq!(metrics.cells, 1);
+        let node = scene.roots()[0];
+        assert_eq!(scene.node(node).unwrap().properties().bounds.height(), 40.0);
+        assert_eq!(
+            resources.execute(
+                session,
+                SceneCommand::UpdateNode {
+                    node: handle,
+                    properties: NodePropertiesPatch {
+                        width: Some(999.0),
+                        ..NodePropertiesPatch::default()
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::IntrinsicTextBounds(handle))
+        );
+        assert_eq!(
+            resources.execute(
+                session,
+                SceneCommand::SetContent {
+                    node: handle,
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::TextContentRequiresTextCommands(handle))
+        );
+    }
+
+    #[test]
+    fn text_changes_reconcile_opt_in_overlap_pairs() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let mut text_properties = text_properties(0.0, 0.0);
+        text_properties.overlap_enabled = true;
+        let text = match resources
+            .execute(
+                session,
+                SceneCommand::CreateTextRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: text_properties,
+                    text: "x".to_owned(),
+                    style: TextStyle::default(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::TextNode { node, .. } => node,
+            _ => unreachable!(),
+        };
+        let target = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: NodePropertiesInput {
+                        x: 80.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                        visible: true,
+                        clip_children: false,
+                        z_index: 0,
+                        overlap_enabled: true,
+                        external_drop_enabled: false,
+                    },
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(node) => node,
+            _ => unreachable!(),
+        };
+        assert!(resources.drain_overlap_events().is_empty());
+
+        resources
+            .execute(
+                session,
+                SceneCommand::SetText {
+                    node: text,
+                    text: "a\tb".to_owned(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(matches!(
+            resources.drain_overlap_events().as_slice(),
+            [SceneEvent::OverlapEnter { .. }]
+        ));
+        assert_eq!(
+            resources
+                .execute(
+                    session,
+                    SceneCommand::QueryOverlaps { node: text },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            SceneCommandResult::Overlaps(vec![target])
+        );
+    }
+
+    #[test]
+    fn rejects_text_nodes_beyond_a_sessions_retained_node_limit() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        for _ in 0..MAX_SESSION_TEXT_NODES {
+            assert!(matches!(
+                resources.execute(
+                    session,
+                    SceneCommand::CreateTextRoot {
+                        layer: SceneLayer::Overlay,
+                        properties: text_properties(0.0, 0.0),
+                        text: String::new(),
+                        style: TextStyle::default(),
+                    },
+                    &mut scene,
+                    &mut textures,
+                ),
+                Ok(SceneCommandResult::TextNode { .. })
+            ));
+        }
+
+        assert_eq!(
+            resources.execute(
+                session,
+                SceneCommand::CreateTextRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: text_properties(0.0, 0.0),
+                    text: String::new(),
+                    style: TextStyle::default(),
+                },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::SessionTextNodeLimitExceeded {
+                limit: MAX_SESSION_TEXT_NODES,
+            })
+        );
+        assert_eq!(scene.len(), MAX_SESSION_TEXT_NODES);
     }
 
     #[test]

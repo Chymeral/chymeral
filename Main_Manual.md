@@ -1,7 +1,8 @@
 # Chymeral Main Manual
 
-This manual describes the current public behavior of Chymeral and CLP v1.3.
-It is written for terminal users, application authors, and SDK implementers.
+This manual describes the stable CLP v1.3 contract and the implemented,
+provisional CLP v1.4 `external_drop` and `text` extensions. It is written for
+terminal users, application authors, and SDK implementers.
 For the design and milestone history, see the [Technical Journal](Technical_Journal.md).
 
 ## 1. Product model
@@ -103,6 +104,11 @@ cell_width = "auto"            # "auto" or a positive number
 [terminal.foreground]
 color = "#E5E7EB"
 
+# Optional file-backed aliases for CLP intrinsic scene text:
+# [scene_text.fonts.ui]
+# path = "fonts/ui.otf"
+# face_index = 0
+
 [terminal.background]
 kind = "image"                # "color" or "image"
 path = "images/background.gif" # required for kind = "image"
@@ -128,6 +134,12 @@ For a file-backed font, set `source = "file"`, set `path`, and optionally set
 `face_index` for a font collection. Font measurements use logical pixels and
 scale with display DPI. A proportional font is accepted, but its glyph advances
 may not visually match the terminal's fixed logical cells.
+
+`[scene_text.fonts]` maps a client-visible alias to an explicit local font file.
+It is optional: scene text without a `font` style uses the terminal font. An
+alias must be non-empty and unpadded; a client cannot supply a font path or ask
+the host to resolve an installed system-family name. This keeps custom scene
+text layout reproducible when the same configuration assets are supplied.
 
 Foreground colors use `#RRGGBB`. ANSI applications retain their own colors;
 their default foreground restores to `terminal.foreground.color`. Text and the
@@ -160,8 +172,10 @@ has `id`, optional `parent`, `x`, `y`, `width`, `height`, `color`, `opacity`,
 ## 5. CLP sessions
 
 **CLP** means *Chymeral Link Protocol*. It is a versioned, language-neutral
-contract between a Chymeral window and an application process. The active
-version is **CLP v1.3**.
+contract between a Chymeral window and an application process. The stable
+contract is **CLP v1.3**. The host currently also negotiates provisional
+**CLP v1.4** `external_drop` and `text` capabilities; v1.3 clients remain
+supported and never receive those capabilities.
 
 When Chymeral starts its shell, the shell and its descendants inherit two
 private variables:
@@ -214,6 +228,8 @@ intersection with its supported set:
 | `input` | Resize, focused keyboard input, raw input subscriptions, terminal state subscriptions, and scene interaction. |
 | `timing` | Tick and frame subscriptions. |
 | `overlap` | Rectangle overlap state, queries, and transitions; also requires `scene` for commands. |
+| `external_drop` *(provisional v1.4)* | Incoming desktop-file drops targeted to opt-in scene nodes. |
+| `text` *(provisional v1.4)* | Creating and changing intrinsic scene-text nodes; also requires `scene`. |
 
 After the lifecycle handshake, a client may replace its subscription set:
 
@@ -257,16 +273,19 @@ visible
 clip_children
 z_index
 overlap_enabled
+external_drop_enabled
 ```
 
 Node content is `empty`, a premultiplied RGBA8 `solid` color, or an `image`
-that references an uploaded texture with independent opacity. The public scene
-operations are:
+that references an uploaded texture with independent opacity. Intrinsic text is
+a separate node kind because its width and height are host-computed. The public
+scene operations are:
 
 ```text
 create_root       create_child       update_node
 set_content       reparent           remove_node
 upload_texture    destroy_texture    query_overlaps
+create_text_root  create_text_child  set_text  set_text_style
 ```
 
 `upload_texture` accepts exactly `width × height × 4` RGBA8 bytes. Chymeral
@@ -278,6 +297,32 @@ up when it closes, faults, or disconnects.
 The host validates dimensions, ownership, capabilities, texture usage, and
 resource limits before applying a command. An individual texture is limited to
 64 MiB of RGBA8 data and a session to 128 MiB, in addition to GPU limits.
+
+### 6.1 Intrinsic scene text *(provisional CLP v1.4)*
+
+With `scene` and `text`, an application creates a text root or child with
+`x`, `y`, text, and one style. Its origin is the upper-left corner of the first
+cell, not the visible ink bounds. The host returns terminal-cell metrics and
+uses the resulting rectangle for drawing, clipping, hit testing, dragging, and
+opt-in overlap or external-drop targeting.
+
+Text accepts printable Unicode, explicit `\n`, and `\t`. Tabs advance to local
+eight-cell stops; wide and combining Unicode follow terminal cell-width rules.
+There is no automatic wrapping, ellipsis, rich-text spans, or text-owned clip
+box. The widest explicit line determines width, and explicit rows determine
+height. Empty text is `0 × 0`; a trailing newline adds a blank row. Text may be
+start-, center-, or end-aligned inside the widest line's intrinsic width.
+
+An omitted style inherits terminal font, size, line height, and foreground
+color. A style may choose a configuration-owned `scene_text.fonts` alias, size,
+line height, RGBA8 color, normal/bold weight, and alignment. Updating text or
+style recalculates its intrinsic rectangle; generic width or height patches and
+generic content replacement are rejected for text nodes.
+
+Chymeral bounds an individual text payload to 1 MiB and 256 Ki terminal cells.
+A session retains at most 16 MiB of text, 1 Mi terminal cells, and 1,024 text
+nodes. These limits prevent a client from exhausting host memory or rendering
+resources.
 
 ## 7. Input, interaction, and overlap
 
@@ -313,8 +358,9 @@ also call `query_overlaps` immediately after changing a node to retrieve its
 current same-session contacts in deterministic order. The queried node itself
 does not need to have overlap enabled. This supports keyboard-driven games and
 layout rules without imposing physics. Image alpha silhouettes, collision
-response, non-rectangular shapes, native gamepads, multitouch, and external
-drag-and-drop are not part of CLP v1.3.
+response, non-rectangular shapes, native gamepads, and multitouch are outside
+the current contract. Incoming external file drop is available provisionally
+through `external_drop`; outgoing desktop drag-and-drop is not implemented.
 
 ## 8. Timing and delivery pressure
 
@@ -376,8 +422,8 @@ The SDK exposes typed capabilities, session and opaque-handle types, node
 properties and patches, scene and texture commands, subscriptions,
 notifications, close reasons, and client errors. Its `clp_conformance` example
 checks lifecycle, subscriptions, timing, resources, scene mutation, overlap,
-and clean closure. Its `clp_probe` example is the interactive orange/blue drag
-test.
+intrinsic text, and clean closure. Its `clp_probe` example is the interactive
+orange/blue drag test, while `clp_text_probe` is the visual text-node probe.
 
 CLP itself remains language-neutral. Other language SDKs or direct protocol
 clients have equal architectural status when they conform to the negotiated
@@ -392,17 +438,20 @@ repository:
 ```text
 cargo run --example clp_conformance
 cargo run --example clp_probe
+cargo run --example clp_text_probe
 ```
 
 The conformance client must return successfully to the same terminal. The probe
 shows orange and blue nodes: drag orange onto blue, observe overlap transitions,
 then press `q` while they overlap. Only the probe session closes; the Chymeral
-terminal remains open.
+terminal remains open. The text probe creates a panel and text children; check
+their offset, tab width, Unicode cell geometry, and multiline alignment. Press
+`u` to update its text, `b` to update style, and `q` to close only that session.
 
 ## 11. Boundaries and next steps
 
-CLP v1.3 deliberately favors a small, reliable foundation. It has no public
-package manifest standard, no protocol IDL, no public SDKs beyond the Rust
-reference, no widget library, and no 3D scene API. Future language bindings can
-share an IDL and the conformance suite without changing the ordinary-program
-model at the center of Chymeral.
+CLP deliberately favors a small, reliable foundation. It has no public package
+manifest standard, no protocol IDL, no widget library, and no 3D scene API.
+The Rust reference SDK is not a privileged host component; future language
+bindings can share an IDL and the conformance suite without changing the
+ordinary-program model at the center of Chymeral.
