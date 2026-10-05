@@ -174,7 +174,8 @@ capability names are not final until M19, but the current planning names are
 
 ## M16 — Incoming External Drag and Drop
 
-**Status:** Planned
+**Status:** Implementation complete; Linux X11/XWayland and Windows
+scene-target validation passed; final desktop regression matrix pending
 
 ### Scope
 
@@ -194,13 +195,9 @@ capability names are not final until M19, but the current planning names are
 
 ### Pending technical decisions
 
-- CLP representation of dropped paths: URI form, path form, or a canonical
-  representation that preserves non-UTF-8 Linux filenames.
-- Terminal quoting policy: platform defaults plus a configuration override for
-  custom shells.
-- Target precedence when a scene node overlaps the terminal grid.
-- Eligibility property and final event/handle names for CLP v1.4.
-- Exact behavior for a drop over an unfocused Chymeral window.
+- The future configuration form for selecting `powershell` or a custom-shell
+  terminal quoting policy.
+- Final public names remain subject to the CLP v1.4 freeze in M19.
 
 ### Acceptance criteria
 
@@ -213,11 +210,132 @@ capability names are not final until M19, but the current planning names are
 
 ### Accepted decisions
 
-_None yet._
+- **Date:** 2026-10-03
+  **Decision:** CLP represents every external file as a canonical percent-
+  encoded `file:` URI.
+  **Context:** Linux filenames are byte sequences that need not be UTF-8,
+  while CLP messages are text-based and must remain language-neutral.
+  **Rationale:** An ASCII URI preserves the original POSIX path bytes through
+  percent encoding and represents Windows Unicode paths without exposing host
+  path types through CLP.
+  **Consequences:** CLP clients receive URIs rather than host-native path
+  strings and explicitly decode them for their platform.
+  **Validation:** Unit and cross-platform manual tests must include spaces,
+  quotes, Unicode, and non-UTF-8 POSIX filenames where the desktop permits it.
+
+- **Date:** 2026-10-03
+  **Decision:** Chymeral never inserts a dropped path containing a line break
+  or other terminal control character into the PTY. An eligible CLP scene node
+  may still receive its URI.
+  **Context:** A POSIX filename can contain characters that would become
+  terminal input boundaries.
+  **Rationale:** Dropping a file must never execute a command or inject terminal
+  control sequences.
+  **Consequences:** Terminal fallback can reject a valid but unsafe filename;
+  application clients retain the option to handle it explicitly.
+  **Validation:** Unit tests must prove no PTY write occurs for unsafe terminal
+  fallback paths.
+
+- **Date:** 2026-10-03
+  **Decision:** Terminal fallback quotes a batch of paths automatically: POSIX
+  syntax on Linux and `cmd` syntax on Windows. A future configuration option
+  may select `powershell` or a custom-shell policy.
+  **Context:** Chymeral launches conventional shells but cannot infer every
+  third-party shell's quoting grammar safely.
+  **Rationale:** Platform defaults are useful without making arbitrary shell
+  syntax a hidden host policy.
+  **Consequences:** Paths with spaces and quotes are usable by default; custom
+  shell integration remains explicit configuration work.
+  **Validation:** Unit and manual tests must cover spaces, quotes, and several
+  paths in one batch on both platforms.
+
+- **Date:** 2026-10-03
+  **Decision:** The topmost eligible opt-in scene node receives an external
+  drop. Nodes without opt-in are transparent; when no eligible node exists,
+  Chymeral falls back to terminal insertion.
+  **Context:** The terminal grid and retained scene are separate surfaces that
+  can overlap in one window.
+  **Rationale:** This follows existing hit-test ordering without allowing a
+  passive graphics node to block useful terminal behavior.
+  **Consequences:** The receiving session learns only its own target handle.
+  Multiple files form one logical drop batch.
+  **Validation:** Routing and ownership tests must cover overlapping nodes,
+  disabled nodes, and terminal fallback.
+
+- **Date:** 2026-10-03
+  **Decision:** An external drag hovering a Chymeral window does not change its
+  keyboard focus. A successful drop targets that window but does not alter a
+  focused CLP node's keyboard ownership.
+  **Context:** External drag-and-drop is deliberate operating-system input, not
+  ordinary pointer interaction.
+  **Rationale:** A hover must not unexpectedly redirect keyboard input; a drop
+  should still reach the window beneath it.
+  **Consequences:** External-drop transitions are independent of M13 pointer
+  focus routing.
+  **Validation:** Manual multi-window tests must verify hover and drop behavior
+  without unintended focus changes.
+
+- **Date:** 2026-10-03
+  **Decision:** The provisional CLP v1.4 capability is named `external_drop`.
+  A scene node opts in with `external_drop_enabled`; its owner receives
+  `external_drop_enter`, coalescible `external_drop_over`,
+  `external_drop_leave`, and `external_drop` events.
+  **Context:** External input must remain discoverable, rate-safe, and unable
+  to reveal a foreign scene handle.
+  **Rationale:** A separate negotiated capability makes the feature explicit.
+  Its events carry only the owning session's opaque node handle and a file URI
+  list on the final drop.
+  **Consequences:** The development host advertises draft CLP v1.4 behavior;
+  CLP v1.3 clients remain supported but cannot request `external_drop`. M19
+  freezes or revises these provisional names before public SDK exposure.
+  **Validation:** Unit tests cover negotiation, capability denial, scene
+  ownership, target precedence, and event serialization.
+
+- **Date:** 2026-10-04
+  **Decision:** Retain stable `winit 0.30.13`; M16 incoming file drops support
+  Windows and X11, while native Wayland reception is deferred until a stable
+  upstream API exposes it.
+  **Context:** The stable Wayland backend does not deliver file-drop events or
+  expose the surface, connection, and event queue needed to attach a safe
+  downstream `wl_data_device` handler.
+  **Rationale:** A local `winit` fork or beta dependency would make a small
+  host capability into a high-maintenance windowing dependency. Silently
+  forcing XWayland would also degrade the user's selected backend.
+  **Consequences:** Chymeral detects Wayland at startup, reports that M16 file
+  drops require X11, and does not grant `external_drop` to CLP clients on that
+  backend. Windows and X11 retain the same canonical M16 events and terminal
+  fallback.
+  **Validation:** The startup diagnostic and capability negotiation must
+  compile on Linux and Windows; manual drop validation covers Windows and X11.
+  Native Wayland reception is deferred with the implementation.
 
 ### Validation record
 
-_Not started._
+- Linux build host: `cargo fmt --check`, `cargo test --all-targets --
+  --test-threads=1`, `cargo clippy --all-targets -- -D warnings`, `cargo build
+  --release`, and `git diff --check` pass on 2026-10-04 (105 library tests,
+  63 binary tests, and one inherited-process integration test).
+- Automated M16 coverage verifies canonical URI encoding including non-UTF-8
+  POSIX paths, safe POSIX and `cmd` multi-file quoting with Unicode and quotes,
+  batch limits, whole-batch rejection for terminal control characters, target
+  precedence, ownership, cancellation routing, and backend-dependent
+  capability negotiation.
+- Final manual regression matrix: on Linux X11/XWayland, drop a multi-file
+  selection containing spaces, quotes, and Unicode; on Windows, use spaces,
+  `&`, `%`, `!`, and Unicode because quotes are not valid filename characters.
+  Exercise both the raw terminal and the SDK probe's blue node, cancel a hover
+  over that node, then repeat with two Chymeral windows and verify that a drop
+  reaches only the window under the operating-system gesture without changing
+  keyboard focus. Native Wayland reception is explicitly deferred.
+- Manual terminal fallback: a desktop-file drop inserts the quoted path without
+  executing it on Linux through X11/XWayland and on Windows on 2026-10-04.
+  The current Windows release was rebuilt from this checkout before the test.
+- Manual Windows scene target: the rebuilt `chymeral-rust-sdk` `clp_probe`
+  created its orange and blue nodes, and delivered a dropped desktop file to
+  the opt-in blue node as a `file:` URI on 2026-10-04.
+- Manual Linux X11/XWayland scene target: the same rebuilt SDK probe created
+  its nodes and received the desktop-file URI on its opt-in blue node on
+  2026-10-04. Native Wayland reception remains explicitly deferred.
 
 ## M17 — Intrinsic Scene Text
 

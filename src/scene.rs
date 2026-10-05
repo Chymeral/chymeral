@@ -181,6 +181,7 @@ pub struct NodeProperties {
     pub clip_children: bool,
     pub z_index: i32,
     pub overlap_enabled: bool,
+    pub external_drop_enabled: bool,
 }
 
 impl Default for NodeProperties {
@@ -192,6 +193,7 @@ impl Default for NodeProperties {
             clip_children: false,
             z_index: 0,
             overlap_enabled: false,
+            external_drop_enabled: false,
         }
     }
 }
@@ -761,6 +763,7 @@ mod tests {
             clip_children: false,
             z_index: 7,
             overlap_enabled: false,
+            external_drop_enabled: false,
         };
 
         scene.set_properties(node, properties).unwrap();

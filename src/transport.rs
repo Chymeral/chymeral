@@ -179,6 +179,9 @@ impl HostNotification {
             Self::Event(WireEvent::Scene {
                 event: WireSceneEvent::DragMove { .. },
             }) => Some(NotificationCoalescingClass::SceneDragMove),
+            Self::Event(WireEvent::Scene {
+                event: WireSceneEvent::ExternalDropOver { .. },
+            }) => Some(NotificationCoalescingClass::SceneExternalDropOver),
             Self::Event(WireEvent::Terminal {
                 state: WireTerminalState::OutputAvailable,
             }) => Some(NotificationCoalescingClass::TerminalOutputAvailable),
@@ -194,6 +197,7 @@ enum NotificationCoalescingClass {
     RawPointerMove,
     ScenePointerMove,
     SceneDragMove,
+    SceneExternalDropOver,
     TerminalOutputAvailable,
 }
 
@@ -1812,6 +1816,8 @@ fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilityS
                 && (!content.uses_texture() || capabilities.contains(Capability::Resources))
                 && (!wire_command_uses_overlap(command)
                     || capabilities.contains(Capability::Overlap))
+                && (!wire_command_uses_external_drop(command)
+                    || capabilities.contains(Capability::ExternalDrop))
         }
         WireSceneCommand::UpdateNode { .. }
         | WireSceneCommand::Reparent { .. }
@@ -1819,6 +1825,8 @@ fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilityS
             capabilities.contains(Capability::Scene)
                 && (!wire_command_uses_overlap(command)
                     || capabilities.contains(Capability::Overlap))
+                && (!wire_command_uses_external_drop(command)
+                    || capabilities.contains(Capability::ExternalDrop))
         }
         WireSceneCommand::QueryOverlaps { .. } => {
             capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Overlap)
@@ -1840,6 +1848,8 @@ fn command_is_granted(command: &SceneCommand, capabilities: CapabilitySet) -> bo
             capabilities.contains(Capability::Scene)
                 && (!command_uses_texture(command) || capabilities.contains(Capability::Resources))
                 && (!command_uses_overlap(command) || capabilities.contains(Capability::Overlap))
+                && (!command_uses_external_drop(command)
+                    || capabilities.contains(Capability::ExternalDrop))
         }
         SceneCommand::QueryOverlaps { .. } => {
             capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Overlap)
@@ -1877,11 +1887,41 @@ fn wire_command_uses_overlap(command: &WireSceneCommand) -> bool {
     }
 }
 
+fn wire_command_uses_external_drop(command: &WireSceneCommand) -> bool {
+    match command {
+        WireSceneCommand::CreateRoot { properties, .. }
+        | WireSceneCommand::CreateChild { properties, .. } => properties.external_drop_enabled,
+        WireSceneCommand::UpdateNode { properties, .. } => {
+            properties.external_drop_enabled.is_some()
+        }
+        WireSceneCommand::SetContent { .. }
+        | WireSceneCommand::Reparent { .. }
+        | WireSceneCommand::RemoveNode { .. }
+        | WireSceneCommand::QueryOverlaps { .. }
+        | WireSceneCommand::UploadTexture { .. }
+        | WireSceneCommand::DestroyTexture { .. } => false,
+    }
+}
+
 fn command_uses_overlap(command: &SceneCommand) -> bool {
     match command {
         SceneCommand::CreateRoot { properties, .. }
         | SceneCommand::CreateChild { properties, .. } => properties.overlap_enabled,
         SceneCommand::UpdateNode { properties, .. } => properties.overlap_enabled.is_some(),
+        SceneCommand::SetContent { .. }
+        | SceneCommand::Reparent { .. }
+        | SceneCommand::RemoveNode { .. }
+        | SceneCommand::QueryOverlaps { .. }
+        | SceneCommand::UploadTexture { .. }
+        | SceneCommand::DestroyTexture { .. } => false,
+    }
+}
+
+fn command_uses_external_drop(command: &SceneCommand) -> bool {
+    match command {
+        SceneCommand::CreateRoot { properties, .. }
+        | SceneCommand::CreateChild { properties, .. } => properties.external_drop_enabled,
+        SceneCommand::UpdateNode { properties, .. } => properties.external_drop_enabled.is_some(),
         SceneCommand::SetContent { .. }
         | SceneCommand::Reparent { .. }
         | SceneCommand::RemoveNode { .. }
@@ -2367,6 +2407,8 @@ struct WireNodeProperties {
     z_index: i32,
     #[serde(default)]
     overlap_enabled: bool,
+    #[serde(default)]
+    external_drop_enabled: bool,
 }
 
 const fn default_visible() -> bool {
@@ -2384,6 +2426,7 @@ impl WireNodeProperties {
             clip_children: self.clip_children,
             z_index: self.z_index,
             overlap_enabled: self.overlap_enabled,
+            external_drop_enabled: self.external_drop_enabled,
         }
     }
 }
@@ -2398,6 +2441,7 @@ struct WireNodePropertiesPatch {
     clip_children: Option<bool>,
     z_index: Option<i32>,
     overlap_enabled: Option<bool>,
+    external_drop_enabled: Option<bool>,
 }
 
 impl WireNodePropertiesPatch {
@@ -2411,6 +2455,7 @@ impl WireNodePropertiesPatch {
             clip_children: self.clip_children,
             z_index: self.z_index,
             overlap_enabled: self.overlap_enabled,
+            external_drop_enabled: self.external_drop_enabled,
         }
     }
 }
@@ -2488,6 +2533,7 @@ enum WireCapability {
     Input,
     Timing,
     Overlap,
+    ExternalDrop,
 }
 
 impl WireCapability {
@@ -2498,6 +2544,7 @@ impl WireCapability {
             Self::Input => Capability::Input,
             Self::Timing => Capability::Timing,
             Self::Overlap => Capability::Overlap,
+            Self::ExternalDrop => Capability::ExternalDrop,
         }
     }
 }
@@ -2510,6 +2557,7 @@ impl From<Capability> for WireCapability {
             Capability::Input => Self::Input,
             Capability::Timing => Self::Timing,
             Capability::Overlap => Self::Overlap,
+            Capability::ExternalDrop => Self::ExternalDrop,
         }
     }
 }
@@ -2754,7 +2802,10 @@ impl WireEvent {
                 state: WireTerminalState::OutputAvailable,
             } => Some(DeliveryCategory::Terminal),
             Self::Scene {
-                event: WireSceneEvent::PointerMove { .. } | WireSceneEvent::DragMove { .. },
+                event:
+                    WireSceneEvent::PointerMove { .. }
+                    | WireSceneEvent::DragMove { .. }
+                    | WireSceneEvent::ExternalDropOver { .. },
             } => Some(DeliveryCategory::Scene),
             Self::Key { .. }
             | Self::PointerPress { .. }
@@ -2875,6 +2926,28 @@ enum WireSceneEvent {
         first: String,
         second: String,
     },
+    ExternalDropEnter {
+        target: String,
+        position: WireVec2,
+    },
+    ExternalDropOver {
+        target: String,
+        position: WireVec2,
+    },
+    ExternalDropLeave {
+        target: String,
+        position: WireVec2,
+    },
+    ExternalDrop {
+        target: String,
+        position: WireVec2,
+        files: Vec<WireExternalFile>,
+    },
+}
+
+#[derive(Clone, Serialize)]
+struct WireExternalFile {
+    uri: String,
 }
 
 impl WireSceneEvent {
@@ -3041,12 +3114,42 @@ impl WireSceneEvent {
                 first: node_handle_for(*first)?,
                 second: node_handle_for(*second)?,
             }),
+            SceneEvent::ExternalDropEnter { target, position } => Some(Self::ExternalDropEnter {
+                target: node_handle_for(*target)?,
+                position: (*position).into(),
+            }),
+            SceneEvent::ExternalDropOver { target, position } => Some(Self::ExternalDropOver {
+                target: node_handle_for(*target)?,
+                position: (*position).into(),
+            }),
+            SceneEvent::ExternalDropLeave { target, position } => Some(Self::ExternalDropLeave {
+                target: node_handle_for(*target)?,
+                position: (*position).into(),
+            }),
+            SceneEvent::ExternalDrop {
+                target,
+                position,
+                files,
+            } => Some(Self::ExternalDrop {
+                target: node_handle_for(*target)?,
+                position: (*position).into(),
+                files: files
+                    .iter()
+                    .map(|file| WireExternalFile {
+                        uri: file.uri.clone(),
+                    })
+                    .collect(),
+            }),
         }
     }
 
     const fn required_capability(&self) -> Capability {
         match self {
             Self::OverlapEnter { .. } | Self::OverlapLeave { .. } => Capability::Overlap,
+            Self::ExternalDropEnter { .. }
+            | Self::ExternalDropOver { .. }
+            | Self::ExternalDropLeave { .. }
+            | Self::ExternalDrop { .. } => Capability::ExternalDrop,
             Self::PointerEnter { .. }
             | Self::PointerLeave { .. }
             | Self::PointerMove { .. }
@@ -3334,6 +3437,7 @@ fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
         Capability::Input,
         Capability::Timing,
         Capability::Overlap,
+        Capability::ExternalDrop,
     ]
     .into_iter()
     .filter(|capability| capabilities.contains(*capability))
@@ -3439,6 +3543,7 @@ mod tests {
                     "input" => WireCapability::Input,
                     "timing" => WireCapability::Timing,
                     "overlap" => WireCapability::Overlap,
+                    "external_drop" => WireCapability::ExternalDrop,
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -3891,7 +3996,13 @@ mod tests {
         send_client(&mut client, hello(&server, vec!["scene", "timing"]));
         let init = receive_host(&mut client);
         assert_eq!(init["type"], "init");
-        assert_eq!(init["protocol"], json!({ "major": 1, "minor": 3 }));
+        assert_eq!(
+            init["protocol"],
+            json!({
+                "major": crate::protocol::CLP_PROTOCOL_VERSION.major(),
+                "minor": crate::protocol::CLP_PROTOCOL_VERSION.minor(),
+            })
+        );
         assert_eq!(init["capabilities"], json!(["scene"]));
         assert_eq!(
             init["context"],
@@ -4086,6 +4197,152 @@ mod tests {
     }
 
     #[test]
+    fn delivers_external_drop_batches_only_to_the_owning_opted_in_session() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["external_drop"]));
+        let init = receive_host(&mut client);
+        assert_eq!(init["capabilities"], json!(["external_drop"]));
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+        let session_id = wait_for_session_started(&server);
+        server.activate_session(session_id, 900, 600, 1.5);
+
+        let mut scene = crate::scene::Scene::new();
+        let target = scene.create_root(crate::scene::NodeProperties::default());
+        server.broadcast_scene_event(
+            &SceneEvent::ExternalDrop {
+                target,
+                position: Vec2 { x: 12.0, y: 24.0 },
+                files: vec![
+                    crate::runtime::ExternalFile {
+                        uri: "file:///tmp/a%20file.txt".to_owned(),
+                    },
+                    crate::runtime::ExternalFile {
+                        uri: "file:///tmp/second%20file.txt".to_owned(),
+                    },
+                ],
+            },
+            |candidate_session, candidate_node| {
+                (candidate_session == session_id && candidate_node == target)
+                    .then_some(NodeHandle::new(41))
+            },
+        );
+
+        let event = receive_host(&mut client);
+        assert_eq!(
+            event["event"],
+            json!({
+                "kind": "scene",
+                "event": {
+                    "kind": "external_drop",
+                    "target": "node-41",
+                    "position": { "x": 12.0, "y": 24.0 },
+                    "files": [
+                        { "uri": "file:///tmp/a%20file.txt" },
+                        { "uri": "file:///tmp/second%20file.txt" }
+                    ]
+                }
+            })
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn routes_external_drop_cancellation_only_to_the_target_owner() {
+        let notifications = SessionNotifications::default();
+        let mut sessions = SessionManager::new(CapabilitySet::ALL);
+        let hello = ClientHello {
+            protocol_version: crate::protocol::CLP_PROTOCOL_VERSION,
+            requested_capabilities: CapabilitySet::ALL,
+        };
+        let owner = sessions
+            .accept(hello.clone(), ProgramInitContext::default())
+            .unwrap()
+            .0;
+        let other = sessions
+            .accept(hello, ProgramInitContext::default())
+            .unwrap()
+            .0;
+        let owner_queue = notifications.register(
+            owner,
+            CapabilitySet::from_capabilities(&[Capability::ExternalDrop]),
+        );
+        let other_queue = notifications.register(
+            other,
+            CapabilitySet::from_capabilities(&[Capability::ExternalDrop]),
+        );
+        assert!(notifications.activate(owner, resize_notification(1, 1, 1.0)));
+        assert!(notifications.activate(other, resize_notification(1, 1, 1.0)));
+
+        let mut scene = crate::scene::Scene::new();
+        let target = scene.create_root(crate::scene::NodeProperties::default());
+        notifications.broadcast_scene(
+            &SceneEvent::ExternalDropLeave {
+                target,
+                position: Vec2 { x: 12.0, y: 24.0 },
+            },
+            |candidate_session, candidate_node| {
+                (candidate_session == owner && candidate_node == target)
+                    .then_some(NodeHandle::new(41))
+            },
+        );
+
+        assert!(matches!(
+            next_notification(&owner_queue),
+            HostNotification::Event(WireEvent::Scene {
+                event: WireSceneEvent::ExternalDropLeave { target, position }
+            }) if target == "node-41" && position.x == 12.0 && position.y == 24.0
+        ));
+        assert!(matches!(other_queue.try_pop(), NotificationPoll::Empty));
+    }
+
+    #[test]
+    fn withholds_external_drop_when_the_host_backend_cannot_deliver_it() {
+        let server =
+            ClpServer::start(CapabilitySet::ALL.without(Capability::ExternalDrop)).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene", "external_drop"]));
+        let init = receive_host(&mut client);
+        assert_eq!(init["capabilities"], json!(["scene"]));
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+        let _ = wait_for_session_started(&server);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "unsupported-external-drop-target".to_owned(),
+                command: WireSceneCommand::CreateRoot {
+                    layer: WireSceneLayer::Overlay,
+                    properties: WireNodeProperties {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                        visible: true,
+                        clip_children: false,
+                        z_index: 0,
+                        overlap_enabled: false,
+                        external_drop_enabled: true,
+                    },
+                    content: WireNodeContent::Empty,
+                },
+            },
+        );
+        let error = receive_host(&mut client);
+        assert_eq!(error["type"], "command_error");
+        assert_eq!(error["code"], "capability_denied");
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
     fn scene_drag_events_do_not_expose_foreign_node_handles() {
         let mut scene = crate::scene::Scene::new();
         let source = scene.create_root(crate::scene::NodeProperties::default());
@@ -4261,6 +4518,52 @@ mod tests {
                 .into_iter()
                 .any(|action| matches!(action, HostAction::Command(_)))
         );
+    }
+
+    #[test]
+    fn requires_external_drop_capability_to_opt_in_a_scene_node() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "denied-external-drop-target".to_owned(),
+                command: WireSceneCommand::CreateRoot {
+                    layer: WireSceneLayer::Overlay,
+                    properties: WireNodeProperties {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                        visible: true,
+                        clip_children: false,
+                        z_index: 0,
+                        overlap_enabled: false,
+                        external_drop_enabled: true,
+                    },
+                    content: WireNodeContent::Empty,
+                },
+            },
+        );
+
+        let error = receive_host(&mut client);
+        assert_eq!(error["type"], "command_error");
+        assert_eq!(error["code"], "capability_denied");
+        assert!(
+            !server
+                .drain_host_actions()
+                .into_iter()
+                .any(|action| matches!(action, HostAction::Command(_)))
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
     }
 
     #[test]

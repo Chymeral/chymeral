@@ -18,13 +18,15 @@ use anyhow::{Context, Result};
 use arboard::Clipboard;
 use chymeral::interaction::SceneInteraction;
 use chymeral::runtime::{
-    EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent, KeyState,
-    Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton, PointerEvent, Program,
-    Runtime, RuntimeCommand, RuntimeResult, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
+    EngineEvent, ExternalFile as RuntimeExternalFile, FocusEvent, InitContext, Key as EngineKey,
+    KeyEvent as EngineKeyEvent, KeyState, Modifiers as EngineModifiers, NamedKey as EngineNamedKey,
+    PointerButton, PointerEvent, Program, Runtime, RuntimeCommand, RuntimeResult, ScrollEvent,
+    ScrollUnit, TerminalEvent, Vec2,
 };
 use chymeral::{
+    external_drop::{ExternalFile, TerminalQuoting, format_terminal_paths},
     program_scene::{ProgramSceneError, ProgramSceneResources},
-    protocol::CapabilitySet,
+    protocol::{Capability, CapabilitySet},
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
     scene::{
         ImageNode, NodeContent, NodeId, NodeProperties, Point, Rect, Scene, SceneLayer, Transform,
@@ -122,6 +124,19 @@ struct ActiveSplash {
     deadline: Instant,
 }
 
+struct PendingExternalDrop {
+    files: Vec<ExternalFile>,
+    position: Vec2,
+}
+
+struct WindowStateOptions {
+    appearance: Appearance,
+    startup_splash: Option<StartupSplash>,
+    testing_scene: Option<TestingScene>,
+    diagnostics_shortcuts: DiagnosticsShortcuts,
+    available_capabilities: CapabilitySet,
+}
+
 struct WindowState {
     instance: wgpu::Instance,
     device: wgpu::Device,
@@ -141,6 +156,11 @@ struct WindowState {
     scene: Scene,
     interaction: SceneInteraction,
     pointer_position: Vec2,
+    external_file_drop_supported: bool,
+    external_drop_active: bool,
+    external_drop_position: Vec2,
+    external_drop_target: Option<NodeId>,
+    pending_external_drop: Option<PendingExternalDrop>,
     terminal_selection_active: bool,
     terminal_scroll_remainder: f64,
     textures: TextureStore,
@@ -163,11 +183,15 @@ impl WindowState {
         window: Arc<Window>,
         event_loop: &ActiveEventLoop,
         event_proxy: EventLoopProxy<UserEvent>,
-        appearance: Appearance,
-        startup_splash: Option<StartupSplash>,
-        testing_scene: Option<TestingScene>,
-        diagnostics_shortcuts: DiagnosticsShortcuts,
+        options: WindowStateOptions,
     ) -> Result<Self> {
+        let WindowStateOptions {
+            appearance,
+            startup_splash,
+            testing_scene,
+            diagnostics_shortcuts,
+            available_capabilities,
+        } = options;
         let physical_size = window.inner_size();
         let scale_factor = window.scale_factor();
         let (columns, rows) = grid_size(physical_size, &appearance.font, scale_factor);
@@ -181,7 +205,7 @@ impl WindowState {
             },
         );
         let clp_event_proxy = event_proxy.clone();
-        let clp_server = ClpServer::start_with_wake(CapabilitySet::ALL, move || {
+        let clp_server = ClpServer::start_with_wake(available_capabilities, move || {
             let _ = clp_event_proxy.send_event(UserEvent::ClpAction);
         })?;
         let pty = Pty::spawn(
@@ -307,6 +331,11 @@ impl WindowState {
             scene,
             interaction: SceneInteraction::new(),
             pointer_position: Vec2::default(),
+            external_file_drop_supported: available_capabilities.contains(Capability::ExternalDrop),
+            external_drop_active: false,
+            external_drop_position: Vec2::default(),
+            external_drop_target: None,
+            pending_external_drop: None,
             terminal_selection_active: false,
             terminal_scroll_remainder: 0.0,
             textures,
@@ -608,6 +637,12 @@ impl WindowState {
         }
         if scene_changed {
             self.reconcile_scene_interaction();
+            let position = if self.external_drop_active {
+                self.external_drop_position
+            } else {
+                self.pointer_position
+            };
+            self.update_external_drop_target(position);
             self.window.request_redraw();
         }
     }
@@ -640,6 +675,137 @@ impl WindowState {
         }
         self.enqueue_event(EngineEvent::Pointer(event.clone()));
         self.route_scene_pointer_event(&event);
+    }
+
+    fn handle_external_file_hover(&mut self, position: Vec2) {
+        if !self.external_file_drop_supported {
+            return;
+        }
+        self.external_drop_active = true;
+        self.update_external_drop_target(position);
+    }
+
+    fn queue_external_file_drop(&mut self, path: std::path::PathBuf, position: Vec2) {
+        if !self.external_file_drop_supported {
+            return;
+        }
+        let file = match ExternalFile::from_path(path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("Chymeral: refusing external file drop: {error}");
+                return;
+            }
+        };
+        if !self.external_drop_active {
+            self.external_drop_active = true;
+        }
+        self.update_external_drop_target(position);
+        let pending = self
+            .pending_external_drop
+            .get_or_insert_with(|| PendingExternalDrop {
+                files: Vec::new(),
+                position,
+            });
+        if pending.files.len() >= chymeral::external_drop::MAX_EXTERNAL_DROP_FILES {
+            eprintln!(
+                "Chymeral: refusing external file drop batch larger than {} files",
+                chymeral::external_drop::MAX_EXTERNAL_DROP_FILES
+            );
+            return;
+        }
+        pending.files.push(file);
+        pending.position = position;
+    }
+
+    fn flush_external_file_drop(&mut self) {
+        let Some(drop) = self.pending_external_drop.take() else {
+            return;
+        };
+        let target = self.external_drop_target_at(drop.position);
+        if let Some(target) = target {
+            self.enqueue_event(EngineEvent::Scene(
+                chymeral::runtime::SceneEvent::ExternalDrop {
+                    target,
+                    position: drop.position,
+                    files: drop
+                        .files
+                        .iter()
+                        .map(|file| RuntimeExternalFile {
+                            uri: file.uri().to_owned(),
+                        })
+                        .collect(),
+                },
+            ));
+        } else {
+            match format_terminal_paths(&drop.files, TerminalQuoting::platform_default()) {
+                Ok(input) => {
+                    if self.terminal.scroll_to_bottom() {
+                        self.sync_terminal_text(false);
+                    }
+                    self.write_input(input.as_bytes());
+                    self.window.request_redraw();
+                }
+                Err(error) => {
+                    eprintln!("Chymeral: refusing terminal file-drop insertion: {error}");
+                }
+            }
+        }
+        self.end_external_drop_hover(drop.position);
+    }
+
+    fn cancel_external_file_hover(&mut self) {
+        if !self.external_file_drop_supported {
+            return;
+        }
+        if self.pending_external_drop.is_some() {
+            self.flush_external_file_drop();
+        } else {
+            self.end_external_drop_hover(self.external_drop_position);
+        }
+    }
+
+    fn update_external_drop_target(&mut self, position: Vec2) {
+        if !self.external_file_drop_supported || !self.external_drop_active {
+            return;
+        }
+        self.external_drop_position = position;
+        let next = self.external_drop_target_at(position);
+        if next == self.external_drop_target {
+            if let Some(target) = next {
+                self.enqueue_event(EngineEvent::Scene(
+                    chymeral::runtime::SceneEvent::ExternalDropOver { target, position },
+                ));
+            }
+            return;
+        }
+        if let Some(target) = self.external_drop_target {
+            self.enqueue_event(EngineEvent::Scene(
+                chymeral::runtime::SceneEvent::ExternalDropLeave { target, position },
+            ));
+        }
+        self.external_drop_target = next;
+        if let Some(target) = next {
+            self.enqueue_event(EngineEvent::Scene(
+                chymeral::runtime::SceneEvent::ExternalDropEnter { target, position },
+            ));
+        }
+    }
+
+    fn end_external_drop_hover(&mut self, position: Vec2) {
+        self.external_drop_active = false;
+        if let Some(target) = self.external_drop_target.take() {
+            self.enqueue_event(EngineEvent::Scene(
+                chymeral::runtime::SceneEvent::ExternalDropLeave { target, position },
+            ));
+        }
+    }
+
+    fn external_drop_target_at(&self, position: Vec2) -> Option<NodeId> {
+        let point = Point::new(position.x, position.y).ok()?;
+        self.program_scene_resources
+            .external_drop_target_at(&self.scene, point)
+            .ok()
+            .flatten()
     }
 
     fn route_scene_pointer_event(&mut self, event: &PointerEvent) {
@@ -758,6 +924,7 @@ impl WindowState {
         for event in self.interaction.pointer_left() {
             self.enqueue_event(EngineEvent::Scene(event));
         }
+        self.cancel_external_file_hover();
     }
 
     fn cancel_scene_drag(&mut self) {
@@ -1069,6 +1236,7 @@ struct ChymeralApp {
     startup_splash: Option<StartupSplash>,
     testing_scene: Option<TestingScene>,
     diagnostics_shortcuts: DiagnosticsShortcuts,
+    available_capabilities: CapabilitySet,
 }
 
 impl ChymeralApp {
@@ -1078,6 +1246,7 @@ impl ChymeralApp {
         startup_splash: Option<StartupSplash>,
         testing_scene: Option<TestingScene>,
         diagnostics_shortcuts: DiagnosticsShortcuts,
+        available_capabilities: CapabilitySet,
     ) -> Self {
         Self {
             state: None,
@@ -1087,6 +1256,7 @@ impl ChymeralApp {
             startup_splash,
             testing_scene,
             diagnostics_shortcuts,
+            available_capabilities,
         }
     }
 
@@ -1121,10 +1291,13 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
             window,
             event_loop,
             event_proxy,
-            self.appearance.clone(),
-            self.startup_splash.clone(),
-            self.testing_scene.clone(),
-            self.diagnostics_shortcuts.clone(),
+            WindowStateOptions {
+                appearance: self.appearance.clone(),
+                startup_splash: self.startup_splash.clone(),
+                testing_scene: self.testing_scene.clone(),
+                diagnostics_shortcuts: self.diagnostics_shortcuts.clone(),
+                available_capabilities: self.available_capabilities,
+            },
         )) {
             Ok(state) => {
                 state.window.request_redraw();
@@ -1179,6 +1352,30 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
                         position,
                         modifiers,
                     });
+                    state.update_external_drop_target(position);
+                });
+            }
+            WindowEvent::HoveredFile(_) => {
+                self.with_state(|state| {
+                    let position = external_file_drop_position(
+                        &state.window,
+                        state.scale_factor,
+                        state.pointer_position,
+                    );
+                    state.handle_external_file_hover(position);
+                });
+            }
+            WindowEvent::HoveredFileCancelled => {
+                self.with_state(WindowState::cancel_external_file_hover);
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.with_state(|state| {
+                    let position = external_file_drop_position(
+                        &state.window,
+                        state.scale_factor,
+                        state.pointer_position,
+                    );
+                    state.queue_external_file_drop(path, position);
                 });
             }
             WindowEvent::CursorLeft { .. } => {
@@ -1222,6 +1419,7 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
                     state.enqueue_event(event);
                     if !focused {
                         state.cancel_scene_drag();
+                        state.cancel_external_file_hover();
                     }
                 });
             }
@@ -1250,6 +1448,7 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
         self.with_state(|state| {
             let now = Instant::now();
             state.apply_clp_actions();
+            state.flush_external_file_drop();
             state.apply_pending_resize(now);
             if state
                 .runtime
@@ -1762,16 +1961,97 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("could not create the event loop")?;
+    let external_drop_supported = platform_supports_external_drop(&event_loop);
+    report_platform_external_drop_support(external_drop_supported);
     let mut app = ChymeralApp::new(
         event_loop.create_proxy(),
         loaded_config.appearance,
         loaded_config.startup_splash,
         loaded_config.testing_scene,
         loaded_config.diagnostics,
+        available_clp_capabilities(external_drop_supported),
     );
     event_loop
         .run_app(&mut app)
         .context("event loop terminated unexpectedly")
+}
+
+#[cfg(target_os = "linux")]
+fn platform_supports_external_drop(event_loop: &EventLoop<UserEvent>) -> bool {
+    use winit::platform::wayland::EventLoopExtWayland;
+
+    !event_loop.is_wayland()
+}
+
+#[cfg(target_os = "windows")]
+fn platform_supports_external_drop(_: &EventLoop<UserEvent>) -> bool {
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn report_platform_external_drop_support(external_drop_supported: bool) {
+    if !external_drop_supported {
+        eprintln!(
+            "Chymeral: incoming external file drops are unavailable on the active Wayland backend; use an X11 session for M16 file drops"
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn report_platform_external_drop_support(_: bool) {}
+
+fn available_clp_capabilities(external_drop_supported: bool) -> CapabilitySet {
+    if external_drop_supported {
+        CapabilitySet::ALL
+    } else {
+        CapabilitySet::ALL.without(Capability::ExternalDrop)
+    }
+}
+
+fn external_file_drop_position(window: &Window, scale_factor: f64, fallback: Vec2) -> Vec2 {
+    #[cfg(target_os = "windows")]
+    {
+        windows_external_file_drop_position(window, scale_factor).unwrap_or(fallback)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, scale_factor);
+        fallback
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_external_file_drop_position(window: &Window, scale_factor: f64) -> Option<Vec2> {
+    use windows_sys::Win32::{
+        Foundation::POINT, Graphics::Gdi::ScreenToClient, UI::WindowsAndMessaging::GetCursorPos,
+    };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let RawWindowHandle::Win32(handle) = window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+    let mut position = POINT::default();
+    if unsafe { GetCursorPos(&mut position) } == 0 {
+        return None;
+    }
+    if unsafe { ScreenToClient(handle.hwnd.get() as _, &mut position) } == 0 {
+        return None;
+    }
+    external_file_drop_position_from_physical(
+        PhysicalPosition::new(position.x, position.y),
+        scale_factor,
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn external_file_drop_position_from_physical(
+    position: PhysicalPosition<i32>,
+    scale_factor: f64,
+) -> Option<Vec2> {
+    logical_pointer_position(
+        PhysicalPosition::new(f64::from(position.x), f64::from(position.y)),
+        scale_factor,
+    )
 }
 
 #[cfg(test)]
@@ -1786,15 +2066,16 @@ mod tests {
     };
 
     use crate::{
-        TerminalProgram,
+        TerminalProgram, available_clp_capabilities,
         config::{Appearance, Rgb, TestingNode, TestingScene},
         engine_focus, engine_key, engine_modifiers, engine_pointer_button, engine_scroll_delta,
-        grid_size, install_testing_scene, is_terminal_copy_shortcut, is_terminal_paste_shortcut,
-        logical_pointer_position, named_key_input, pty_size, select_present_mode,
-        select_surface_format, splash_properties, terminal_input, terminal_input_with_text,
-        terminal_paste_input, testing_node_properties,
+        external_file_drop_position_from_physical, grid_size, install_testing_scene,
+        is_terminal_copy_shortcut, is_terminal_paste_shortcut, logical_pointer_position,
+        named_key_input, pty_size, select_present_mode, select_surface_format, splash_properties,
+        terminal_input, terminal_input_with_text, terminal_paste_input, testing_node_properties,
     };
     use chymeral::{
+        protocol::Capability,
         resources::{Texture, TextureStore},
         runtime::{
             EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent,
@@ -1812,6 +2093,13 @@ mod tests {
             grid_size(PhysicalSize::new(960, 640), &font, 1.0),
             grid_size(PhysicalSize::new(1920, 1280), &font, 2.0),
         );
+    }
+
+    #[test]
+    fn withholds_external_drop_capability_when_the_active_backend_cannot_deliver_it() {
+        assert!(available_clp_capabilities(true).contains(Capability::ExternalDrop));
+        assert!(!available_clp_capabilities(false).contains(Capability::ExternalDrop));
+        assert!(available_clp_capabilities(false).contains(Capability::Scene));
     }
 
     #[test]
@@ -2001,6 +2289,10 @@ mod tests {
     fn normalizes_pointer_and_pixel_scroll_coordinates_to_logical_space() {
         assert_eq!(
             logical_pointer_position(PhysicalPosition::new(200.0, 100.0), 2.0),
+            Some(Vec2 { x: 100.0, y: 50.0 })
+        );
+        assert_eq!(
+            external_file_drop_position_from_physical(PhysicalPosition::new(200, 100), 2.0),
             Some(Vec2 { x: 100.0, y: 50.0 })
         );
         assert_eq!(

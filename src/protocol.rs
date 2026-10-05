@@ -4,7 +4,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 3);
+pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion {
@@ -39,6 +39,7 @@ pub enum Capability {
     Input,
     Timing,
     Overlap,
+    ExternalDrop,
 }
 
 impl Capability {
@@ -49,6 +50,7 @@ impl Capability {
             Self::Input => 1 << 2,
             Self::Timing => 1 << 3,
             Self::Overlap => 1 << 4,
+            Self::ExternalDrop => 1 << 5,
         }
     }
 }
@@ -63,7 +65,8 @@ impl CapabilitySet {
             | Capability::Resources.bit()
             | Capability::Input.bit()
             | Capability::Timing.bit()
-            | Capability::Overlap.bit(),
+            | Capability::Overlap.bit()
+            | Capability::ExternalDrop.bit(),
     );
 
     pub const fn from_capabilities(capabilities: &[Capability]) -> Self {
@@ -82,6 +85,10 @@ impl CapabilitySet {
 
     pub const fn intersection(self, other: Self) -> Self {
         Self(self.0 & other.0)
+    }
+
+    pub const fn without(self, capability: Capability) -> Self {
+        Self(self.0 & !capability.bit())
     }
 }
 
@@ -397,6 +404,14 @@ impl SessionManager {
                 Capability::Input,
                 Capability::Timing,
             ]))
+        } else if hello.protocol_version.minor() < 4 {
+            capabilities.intersection(CapabilitySet::from_capabilities(&[
+                Capability::Scene,
+                Capability::Resources,
+                Capability::Input,
+                Capability::Timing,
+                Capability::Overlap,
+            ]))
         } else {
             capabilities
         };
@@ -665,6 +680,34 @@ mod tests {
                 .session_capabilities(session_id)
                 .unwrap()
                 .contains(Capability::Overlap)
+        );
+    }
+
+    #[test]
+    fn keeps_external_drop_unavailable_to_clp_v1_3_clients() {
+        let mut manager = SessionManager::default();
+        let (session_id, message) = manager
+            .accept(
+                ClientHello {
+                    protocol_version: ProtocolVersion::new(1, 3),
+                    requested_capabilities: CapabilitySet::ALL,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap();
+
+        assert!(matches!(message, HostMessage::Init(_)));
+        assert!(
+            manager
+                .session_capabilities(session_id)
+                .unwrap()
+                .contains(Capability::Overlap)
+        );
+        assert!(
+            !manager
+                .session_capabilities(session_id)
+                .unwrap()
+                .contains(Capability::ExternalDrop)
         );
     }
 

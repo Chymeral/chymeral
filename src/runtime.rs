@@ -284,6 +284,28 @@ pub enum SceneEvent {
         first: NodeId,
         second: NodeId,
     },
+    ExternalDropEnter {
+        target: NodeId,
+        position: Vec2,
+    },
+    ExternalDropOver {
+        target: NodeId,
+        position: Vec2,
+    },
+    ExternalDropLeave {
+        target: NodeId,
+        position: Vec2,
+    },
+    ExternalDrop {
+        target: NodeId,
+        position: Vec2,
+        files: Vec<ExternalFile>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalFile {
+    pub uri: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

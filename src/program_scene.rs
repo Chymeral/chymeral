@@ -64,6 +64,7 @@ pub struct NodePropertiesInput {
     pub clip_children: bool,
     pub z_index: i32,
     pub overlap_enabled: bool,
+    pub external_drop_enabled: bool,
 }
 
 impl NodePropertiesInput {
@@ -76,6 +77,7 @@ impl NodePropertiesInput {
             clip_children: self.clip_children,
             z_index: self.z_index,
             overlap_enabled: self.overlap_enabled,
+            external_drop_enabled: self.external_drop_enabled,
         })
     }
 }
@@ -90,6 +92,7 @@ pub struct NodePropertiesPatch {
     pub clip_children: Option<bool>,
     pub z_index: Option<i32>,
     pub overlap_enabled: Option<bool>,
+    pub external_drop_enabled: Option<bool>,
 }
 
 impl NodePropertiesPatch {
@@ -103,6 +106,9 @@ impl NodePropertiesPatch {
             clip_children: self.clip_children.unwrap_or(properties.clip_children),
             z_index: self.z_index.unwrap_or(properties.z_index),
             overlap_enabled: self.overlap_enabled.unwrap_or(properties.overlap_enabled),
+            external_drop_enabled: self
+                .external_drop_enabled
+                .unwrap_or(properties.external_drop_enabled),
         }
         .into_scene()
     }
@@ -477,6 +483,31 @@ impl ProgramSceneResources {
             .find_map(|owned| (owned.node == node).then_some(owned.session))
     }
 
+    pub fn external_drop_target_at(
+        &self,
+        scene: &Scene,
+        point: crate::scene::Point,
+    ) -> Result<Option<NodeId>, ProgramSceneError> {
+        for node in scene.paint_order().into_iter().rev() {
+            let Some(candidate) = scene.node(node) else {
+                continue;
+            };
+            if !candidate.properties().external_drop_enabled
+                || self.session_for_node(node).is_none()
+            {
+                continue;
+            }
+            if scene
+                .visible_bounds(node)
+                .map_err(ProgramSceneError::Scene)?
+                .is_some_and(|bounds| bounds.contains(point))
+            {
+                return Ok(Some(node));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn drain_overlap_events(&mut self) -> Vec<SceneEvent> {
         std::mem::take(&mut self.pending_overlap_events)
     }
@@ -779,7 +810,95 @@ mod tests {
             clip_children: false,
             z_index: 0,
             overlap_enabled: false,
+            external_drop_enabled: false,
         }
+    }
+
+    #[test]
+    fn finds_the_topmost_owned_opt_in_external_drop_target() {
+        let (first_session, second_session) = session_pair();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let properties_at = |z_index, external_drop_enabled| NodePropertiesInput {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+            visible: true,
+            clip_children: false,
+            z_index,
+            overlap_enabled: false,
+            external_drop_enabled,
+        };
+
+        resources
+            .execute(
+                first_session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties_at(0, true),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        resources
+            .execute(
+                second_session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties_at(2, false),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        let top = match resources
+            .execute(
+                second_session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties_at(1, true),
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+
+        let point = crate::scene::Point::new(10.0, 10.0).unwrap();
+        let target = resources
+            .external_drop_target_at(&scene, point)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resources.session_for_node(target), Some(second_session));
+
+        resources
+            .execute(
+                second_session,
+                SceneCommand::UpdateNode {
+                    node: top,
+                    properties: NodePropertiesPatch {
+                        visible: Some(false),
+                        ..NodePropertiesPatch::default()
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        let target = resources
+            .external_drop_target_at(&scene, point)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resources.session_for_node(target), Some(first_session));
     }
 
     #[test]
@@ -991,6 +1110,7 @@ mod tests {
             clip_children: false,
             z_index: 0,
             overlap_enabled: true,
+            external_drop_enabled: false,
         };
 
         let first = match resources
@@ -1089,6 +1209,7 @@ mod tests {
             clip_children: false,
             z_index: 0,
             overlap_enabled,
+            external_drop_enabled: false,
         };
 
         let source = match resources
@@ -1165,6 +1286,7 @@ mod tests {
             clip_children: false,
             z_index: 0,
             overlap_enabled,
+            external_drop_enabled: false,
         };
         let _stationary = resources
             .execute(
@@ -1243,6 +1365,7 @@ mod tests {
             clip_children: false,
             z_index: 0,
             overlap_enabled: true,
+            external_drop_enabled: false,
         };
         let first = match resources
             .execute(

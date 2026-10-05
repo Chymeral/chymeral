@@ -1,3 +1,4 @@
+pub mod external_drop;
 pub mod interaction;
 pub mod program_scene;
 pub mod protocol;
