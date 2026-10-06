@@ -29,9 +29,11 @@ use crate::runtime::{
     SceneEvent, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
 };
 use crate::{
+    animated_image::{AnimatedImageFormat, MAX_ANIMATED_IMAGE_ENCODED_BYTES},
     program_scene::{
-        ContentInput, MAX_TEXTURE_BYTES, NodeHandle, NodePropertiesInput, NodePropertiesPatch,
-        SceneCommand, SceneCommandResult, TextNodePropertiesInput, TextureHandle,
+        AnimatedImageHandle, ContentInput, MAX_TEXTURE_BYTES, NodeHandle, NodePropertiesInput,
+        NodePropertiesPatch, SceneCommand, SceneCommandResult, TextNodePropertiesInput,
+        TextureHandle,
     },
     resources::rgba8_byte_len,
     scene::{NodeId, SceneLayer},
@@ -1751,12 +1753,12 @@ fn read_scene_command(
     control: &ServerControl,
 ) -> Result<SceneCommand> {
     let upload_length = command.upload_length()?;
-    let pixels = if let Some(length) = upload_length {
-        Some(read_texture_upload(stream, frame_reader, control, length, true)?.unwrap_or_default())
+    let payload = if let Some(length) = upload_length {
+        Some(read_binary_upload(stream, frame_reader, control, length, true)?.unwrap_or_default())
     } else {
         None
     };
-    command.into_scene_command(pixels)
+    command.into_scene_command(payload)
 }
 
 fn discard_scene_command_payload(
@@ -1766,12 +1768,12 @@ fn discard_scene_command_payload(
     control: &ServerControl,
 ) -> Result<()> {
     if let Some(length) = command.upload_length()? {
-        let _ = read_texture_upload(stream, frame_reader, control, length, false)?;
+        let _ = read_binary_upload(stream, frame_reader, control, length, false)?;
     }
     Ok(())
 }
 
-fn read_texture_upload(
+fn read_binary_upload(
     stream: &mut LocalSocketStream,
     frame_reader: &mut FrameReader,
     control: &ServerControl,
@@ -1784,18 +1786,18 @@ fn read_texture_upload(
         let frame = read_client_frame(stream, frame_reader, None, control)?;
         let FrameRead::Message(WireFrame::Binary(fragment)) = frame else {
             return Err(anyhow!(
-                "RGBA8 texture uploads require consecutive binary frames"
+                "binary resource uploads require consecutive binary frames"
             ));
         };
         if fragment.is_empty() {
-            return Err(anyhow!("RGBA8 texture upload frames may not be empty"));
+            return Err(anyhow!("binary resource upload frames may not be empty"));
         }
         received = received
             .checked_add(fragment.len())
-            .context("texture upload byte count overflows this platform")?;
+            .context("binary resource upload byte count overflows this platform")?;
         if received > length {
             return Err(anyhow!(
-                "RGBA8 texture upload exceeds its declared byte length"
+                "binary resource upload exceeds its declared byte length"
             ));
         }
         if let Some(pixels) = pixels.as_mut() {
@@ -1810,11 +1812,20 @@ fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilityS
         WireSceneCommand::UploadTexture { .. } | WireSceneCommand::DestroyTexture { .. } => {
             capabilities.contains(Capability::Resources)
         }
+        WireSceneCommand::UploadAnimatedImage { .. }
+        | WireSceneCommand::DestroyAnimatedImage { .. } => {
+            capabilities.contains(Capability::Scene)
+                && capabilities.contains(Capability::Resources)
+                && capabilities.contains(Capability::AnimatedImages)
+        }
         WireSceneCommand::CreateRoot { content, .. }
         | WireSceneCommand::CreateChild { content, .. }
         | WireSceneCommand::SetContent { content, .. } => {
             capabilities.contains(Capability::Scene)
                 && (!content.uses_texture() || capabilities.contains(Capability::Resources))
+                && (!content.uses_animated_image()
+                    || (capabilities.contains(Capability::Resources)
+                        && capabilities.contains(Capability::AnimatedImages)))
                 && (!wire_command_uses_overlap(command)
                     || capabilities.contains(Capability::Overlap))
                 && (!wire_command_uses_external_drop(command)
@@ -1851,6 +1862,11 @@ fn command_is_granted(command: &SceneCommand, capabilities: CapabilitySet) -> bo
         SceneCommand::UploadTexture { .. } | SceneCommand::DestroyTexture { .. } => {
             capabilities.contains(Capability::Resources)
         }
+        SceneCommand::UploadAnimatedImage { .. } | SceneCommand::DestroyAnimatedImage { .. } => {
+            capabilities.contains(Capability::Scene)
+                && capabilities.contains(Capability::Resources)
+                && capabilities.contains(Capability::AnimatedImages)
+        }
         SceneCommand::CreateRoot { .. }
         | SceneCommand::CreateChild { .. }
         | SceneCommand::UpdateNode { .. }
@@ -1859,6 +1875,9 @@ fn command_is_granted(command: &SceneCommand, capabilities: CapabilitySet) -> bo
         | SceneCommand::RemoveNode { .. } => {
             capabilities.contains(Capability::Scene)
                 && (!command_uses_texture(command) || capabilities.contains(Capability::Resources))
+                && (!command_uses_animated_image(command)
+                    || (capabilities.contains(Capability::Resources)
+                        && capabilities.contains(Capability::AnimatedImages)))
                 && (!command_uses_overlap(command) || capabilities.contains(Capability::Overlap))
                 && (!command_uses_external_drop(command)
                     || capabilities.contains(Capability::ExternalDrop))
@@ -1895,6 +1914,22 @@ fn command_uses_texture(command: &SceneCommand) -> bool {
     )
 }
 
+fn command_uses_animated_image(command: &SceneCommand) -> bool {
+    matches!(
+        command,
+        SceneCommand::CreateRoot {
+            content: ContentInput::AnimatedImage { .. },
+            ..
+        } | SceneCommand::CreateChild {
+            content: ContentInput::AnimatedImage { .. },
+            ..
+        } | SceneCommand::SetContent {
+            content: ContentInput::AnimatedImage { .. },
+            ..
+        }
+    )
+}
+
 fn wire_command_uses_overlap(command: &WireSceneCommand) -> bool {
     match command {
         WireSceneCommand::CreateRoot { properties, .. }
@@ -1909,7 +1944,9 @@ fn wire_command_uses_overlap(command: &WireSceneCommand) -> bool {
         | WireSceneCommand::RemoveNode { .. }
         | WireSceneCommand::QueryOverlaps { .. }
         | WireSceneCommand::UploadTexture { .. }
-        | WireSceneCommand::DestroyTexture { .. } => false,
+        | WireSceneCommand::DestroyTexture { .. }
+        | WireSceneCommand::UploadAnimatedImage { .. }
+        | WireSceneCommand::DestroyAnimatedImage { .. } => false,
     }
 }
 
@@ -1929,7 +1966,9 @@ fn wire_command_uses_external_drop(command: &WireSceneCommand) -> bool {
         | WireSceneCommand::RemoveNode { .. }
         | WireSceneCommand::QueryOverlaps { .. }
         | WireSceneCommand::UploadTexture { .. }
-        | WireSceneCommand::DestroyTexture { .. } => false,
+        | WireSceneCommand::DestroyTexture { .. }
+        | WireSceneCommand::UploadAnimatedImage { .. }
+        | WireSceneCommand::DestroyAnimatedImage { .. } => false,
     }
 }
 
@@ -1947,7 +1986,9 @@ fn command_uses_overlap(command: &SceneCommand) -> bool {
         | SceneCommand::RemoveNode { .. }
         | SceneCommand::QueryOverlaps { .. }
         | SceneCommand::UploadTexture { .. }
-        | SceneCommand::DestroyTexture { .. } => false,
+        | SceneCommand::DestroyTexture { .. }
+        | SceneCommand::UploadAnimatedImage { .. }
+        | SceneCommand::DestroyAnimatedImage { .. } => false,
     }
 }
 
@@ -1965,7 +2006,9 @@ fn command_uses_external_drop(command: &SceneCommand) -> bool {
         | SceneCommand::RemoveNode { .. }
         | SceneCommand::QueryOverlaps { .. }
         | SceneCommand::UploadTexture { .. }
-        | SceneCommand::DestroyTexture { .. } => false,
+        | SceneCommand::DestroyTexture { .. }
+        | SceneCommand::UploadAnimatedImage { .. }
+        | SceneCommand::DestroyAnimatedImage { .. } => false,
     }
 }
 
@@ -2370,20 +2413,38 @@ enum WireSceneCommand {
     DestroyTexture {
         texture: String,
     },
+    UploadAnimatedImage {
+        format: WireAnimatedImageFormat,
+        byte_length: usize,
+    },
+    DestroyAnimatedImage {
+        image: String,
+    },
 }
 
 impl WireSceneCommand {
     fn upload_length(&self) -> Result<Option<usize>> {
-        let Self::UploadTexture { width, height } = self else {
-            return Ok(None);
-        };
-        let bytes = rgba8_byte_len(*width, *height).context("invalid RGBA8 texture dimensions")?;
-        if bytes > MAX_TEXTURE_BYTES {
-            return Err(anyhow!(
-                "a texture may not exceed {MAX_TEXTURE_BYTES} bytes"
-            ));
+        match self {
+            Self::UploadTexture { width, height } => {
+                let bytes =
+                    rgba8_byte_len(*width, *height).context("invalid RGBA8 texture dimensions")?;
+                if bytes > MAX_TEXTURE_BYTES {
+                    return Err(anyhow!(
+                        "a texture may not exceed {MAX_TEXTURE_BYTES} bytes"
+                    ));
+                }
+                Ok(Some(bytes))
+            }
+            Self::UploadAnimatedImage { byte_length, .. } => {
+                if *byte_length > MAX_ANIMATED_IMAGE_ENCODED_BYTES {
+                    return Err(anyhow!(
+                        "an encoded animated image may not exceed {MAX_ANIMATED_IMAGE_ENCODED_BYTES} bytes"
+                    ));
+                }
+                Ok(Some(*byte_length))
+            }
+            _ => Ok(None),
         }
-        Ok(Some(bytes))
     }
 
     fn into_scene_command(self, pixels: Option<Vec<u8>>) -> Result<SceneCommand> {
@@ -2463,6 +2524,32 @@ impl WireSceneCommand {
             Self::DestroyTexture { texture } => Ok(SceneCommand::DestroyTexture {
                 texture: parse_texture_handle(&texture)?,
             }),
+            Self::UploadAnimatedImage {
+                format,
+                byte_length: _,
+            } => Ok(SceneCommand::UploadAnimatedImage {
+                format: format.into_scene(),
+                bytes: pixels.ok_or_else(|| {
+                    anyhow!("an animated image upload requires encoded binary bytes")
+                })?,
+            }),
+            Self::DestroyAnimatedImage { image } => Ok(SceneCommand::DestroyAnimatedImage {
+                image: parse_animated_image_handle(&image)?,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireAnimatedImageFormat {
+    Gif,
+}
+
+impl WireAnimatedImageFormat {
+    const fn into_scene(self) -> AnimatedImageFormat {
+        match self {
+            Self::Gif => AnimatedImageFormat::Gif,
         }
     }
 }
@@ -2652,6 +2739,7 @@ enum WireNodeContent {
     Empty,
     Solid { color: [u8; 4] },
     Image { texture: String, opacity: f32 },
+    AnimatedImage { image: String, opacity: f32 },
 }
 
 impl WireNodeContent {
@@ -2663,11 +2751,19 @@ impl WireNodeContent {
                 texture: parse_texture_handle(&texture)?,
                 opacity,
             }),
+            Self::AnimatedImage { image, opacity } => Ok(ContentInput::AnimatedImage {
+                image: parse_animated_image_handle(&image)?,
+                opacity,
+            }),
         }
     }
 
     const fn uses_texture(&self) -> bool {
         matches!(self, Self::Image { .. })
+    }
+
+    const fn uses_animated_image(&self) -> bool {
+        matches!(self, Self::AnimatedImage { .. })
     }
 }
 
@@ -2677,6 +2773,10 @@ fn parse_node_handle(value: &str) -> Result<NodeHandle> {
 
 fn parse_texture_handle(value: &str) -> Result<TextureHandle> {
     parse_handle(value, "texture-").map(TextureHandle::new)
+}
+
+fn parse_animated_image_handle(value: &str) -> Result<AnimatedImageHandle> {
+    parse_handle(value, "animated-image-").map(AnimatedImageHandle::new)
 }
 
 fn parse_handle(value: &str, prefix: &str) -> Result<u64> {
@@ -2721,6 +2821,7 @@ enum WireCapability {
     Overlap,
     ExternalDrop,
     Text,
+    AnimatedImages,
 }
 
 impl WireCapability {
@@ -2733,6 +2834,7 @@ impl WireCapability {
             Self::Overlap => Capability::Overlap,
             Self::ExternalDrop => Capability::ExternalDrop,
             Self::Text => Capability::Text,
+            Self::AnimatedImages => Capability::AnimatedImages,
         }
     }
 }
@@ -2747,6 +2849,7 @@ impl From<Capability> for WireCapability {
             Capability::Overlap => Self::Overlap,
             Capability::ExternalDrop => Self::ExternalDrop,
             Capability::Text => Self::Text,
+            Capability::AnimatedImages => Self::AnimatedImages,
         }
     }
 }
@@ -3546,6 +3649,9 @@ enum WireCommandResult {
     Texture {
         texture: String,
     },
+    AnimatedImage {
+        image: String,
+    },
     Overlaps {
         overlapping: bool,
         nodes: Vec<String>,
@@ -3568,6 +3674,9 @@ impl From<SceneCommandResult> for WireCommandResult {
             },
             SceneCommandResult::Texture(texture) => Self::Texture {
                 texture: texture.to_string(),
+            },
+            SceneCommandResult::AnimatedImage(image) => Self::AnimatedImage {
+                image: image.to_string(),
             },
             SceneCommandResult::Overlaps(nodes) => Self::Overlaps {
                 overlapping: !nodes.is_empty(),
@@ -3661,6 +3770,7 @@ fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
         Capability::Overlap,
         Capability::ExternalDrop,
         Capability::Text,
+        Capability::AnimatedImages,
     ]
     .into_iter()
     .filter(|capability| capabilities.contains(*capability))
@@ -3768,6 +3878,7 @@ mod tests {
                     "overlap" => WireCapability::Overlap,
                     "external_drop" => WireCapability::ExternalDrop,
                     "text" => WireCapability::Text,
+                    "animated_images" => WireCapability::AnimatedImages,
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -4708,6 +4819,78 @@ mod tests {
 
         send_client(&mut client, WireClientMessage::Close);
         let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn forwards_encoded_animated_image_uploads_and_requires_its_capability() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(
+            &mut client,
+            hello(&server, vec!["scene", "resources", "animated_images"]),
+        );
+        let init = receive_host(&mut client);
+        assert_eq!(
+            init["capabilities"],
+            json!(["scene", "resources", "animated_images"])
+        );
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "animated-image-request".to_owned(),
+                command: WireSceneCommand::UploadAnimatedImage {
+                    format: WireAnimatedImageFormat::Gif,
+                    byte_length: 3,
+                },
+            },
+        );
+        write_binary_frame(&mut client, &[7, 8, 9]).unwrap();
+        let request = wait_for_host_command(&server);
+        assert_eq!(
+            request.command,
+            SceneCommand::UploadAnimatedImage {
+                format: AnimatedImageFormat::Gif,
+                bytes: vec![7, 8, 9],
+            }
+        );
+        request.respond(HostCommandResponse::Success(
+            SceneCommandResult::AnimatedImage(AnimatedImageHandle::new(7)),
+        ));
+        let result = receive_host(&mut client);
+        assert_eq!(
+            result["result"],
+            json!({ "kind": "animated_image", "image": "animated-image-7" })
+        );
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+
+        let mut denied_client = connect(&server);
+        send_client(
+            &mut denied_client,
+            hello(&server, vec!["resources", "animated_images"]),
+        );
+        let _ = receive_host(&mut denied_client);
+        send_client(&mut denied_client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut denied_client);
+        send_client(&mut denied_client, WireClientMessage::Started);
+        send_client(
+            &mut denied_client,
+            WireClientMessage::Command {
+                request_id: "denied-animated-image".to_owned(),
+                command: WireSceneCommand::UploadAnimatedImage {
+                    format: WireAnimatedImageFormat::Gif,
+                    byte_length: 1,
+                },
+            },
+        );
+        write_binary_frame(&mut denied_client, &[0]).unwrap();
+        let denied = receive_host(&mut denied_client);
+        assert_eq!(denied["type"], "command_error");
+        assert_eq!(denied["code"], "capability_denied");
     }
 
     #[test]

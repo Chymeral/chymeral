@@ -5,12 +5,15 @@ use std::{
 };
 
 use crate::{
+    animated_image::{
+        AnimatedImage, AnimatedImageError, AnimatedImageFormat, AnimatedImageId, AnimatedImageStore,
+    },
     protocol::SessionId,
     resources::{Texture, TextureError, TextureStore, rgba8_byte_len},
     runtime::SceneEvent,
     scene::{
-        ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer, SolidNode,
-        Transform,
+        AnimatedImageNode, ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer,
+        SolidNode, Transform,
     },
     scene_text::{TextLayout, TextLayoutError, TextMetrics, TextNode, TextStyle},
 };
@@ -55,6 +58,25 @@ impl TextureHandle {
 impl Display for TextureHandle {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "texture-{}", self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AnimatedImageHandle(u64);
+
+impl AnimatedImageHandle {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl Display for AnimatedImageHandle {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "animated-image-{}", self.0)
     }
 }
 
@@ -156,6 +178,10 @@ pub enum ContentInput {
         texture: TextureHandle,
         opacity: f32,
     },
+    AnimatedImage {
+        image: AnimatedImageHandle,
+        opacity: f32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -216,6 +242,13 @@ pub enum SceneCommand {
     DestroyTexture {
         texture: TextureHandle,
     },
+    UploadAnimatedImage {
+        format: AnimatedImageFormat,
+        bytes: Vec<u8>,
+    },
+    DestroyAnimatedImage {
+        image: AnimatedImageHandle,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -226,6 +259,7 @@ pub enum SceneCommandResult {
         metrics: TextMetrics,
     },
     Texture(TextureHandle),
+    AnimatedImage(AnimatedImageHandle),
     Overlaps(Vec<NodeHandle>),
     TextMetrics(TextMetrics),
     Acknowledged,
@@ -235,8 +269,10 @@ pub enum SceneCommandResult {
 pub enum ProgramSceneError {
     InvalidNodeHandle(NodeHandle),
     InvalidTextureHandle(TextureHandle),
+    InvalidAnimatedImageHandle(AnimatedImageHandle),
     HandleNotOwned,
     TextureInUse(TextureHandle),
+    AnimatedImageInUse(AnimatedImageHandle),
     TextureDimensionLimitExceeded { limit: u32 },
     TextureLimitExceeded { limit: usize },
     SessionTextureLimitExceeded { limit: usize },
@@ -244,6 +280,7 @@ pub enum ProgramSceneError {
     Scene(crate::scene::SceneError),
     Image(crate::scene::ImageNodeError),
     Texture(TextureError),
+    AnimatedImage(AnimatedImageError),
     Text(TextLayoutError),
     TextNodeRequired(NodeHandle),
     IntrinsicTextBounds(NodeHandle),
@@ -260,10 +297,14 @@ impl Display for ProgramSceneError {
         match self {
             Self::InvalidNodeHandle(handle) => write!(formatter, "{handle} is not valid"),
             Self::InvalidTextureHandle(handle) => write!(formatter, "{handle} is not valid"),
+            Self::InvalidAnimatedImageHandle(handle) => write!(formatter, "{handle} is not valid"),
             Self::HandleNotOwned => {
                 formatter.write_str("the resource handle is not owned by this session")
             }
             Self::TextureInUse(handle) => {
+                write!(formatter, "{handle} is still referenced by a scene node")
+            }
+            Self::AnimatedImageInUse(handle) => {
                 write!(formatter, "{handle} is still referenced by a scene node")
             }
             Self::TextureDimensionLimitExceeded { limit } => {
@@ -280,6 +321,7 @@ impl Display for ProgramSceneError {
             Self::Scene(error) => Display::fmt(error, formatter),
             Self::Image(error) => Display::fmt(error, formatter),
             Self::Texture(error) => Display::fmt(error, formatter),
+            Self::AnimatedImage(error) => Display::fmt(error, formatter),
             Self::Text(error) => Display::fmt(error, formatter),
             Self::TextNodeRequired(handle) => write!(formatter, "{handle} does not contain text"),
             Self::IntrinsicTextBounds(handle) => {
@@ -329,8 +371,11 @@ pub struct ProgramSceneResources {
     max_texture_dimension: u32,
     next_node_handle: u64,
     next_texture_handle: u64,
+    next_animated_image_handle: u64,
     nodes: BTreeMap<NodeHandle, OwnedNode>,
     textures: BTreeMap<TextureHandle, OwnedTexture>,
+    animated_images: BTreeMap<AnimatedImageHandle, OwnedAnimatedImage>,
+    animation_store: AnimatedImageStore,
     session_texture_bytes: BTreeMap<SessionId, usize>,
     text_layout: TextLayout,
     overlap_pairs: BTreeSet<OverlapPair>,
@@ -347,6 +392,13 @@ struct OwnedNode {
 struct OwnedTexture {
     session: SessionId,
     texture: crate::resources::TextureId,
+    bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct OwnedAnimatedImage {
+    session: SessionId,
+    image: AnimatedImageId,
     bytes: usize,
 }
 
@@ -386,6 +438,7 @@ impl ProgramSceneResources {
             max_texture_dimension,
             next_node_handle: 1,
             next_texture_handle: 1,
+            next_animated_image_handle: 1,
             text_layout: TextLayout::new(16.0, 9.6, 20.0, [])
                 .expect("default text metrics are valid"),
             ..Self::default()
@@ -395,6 +448,14 @@ impl ProgramSceneResources {
     pub fn with_text_layout(mut self, text_layout: TextLayout) -> Self {
         self.text_layout = text_layout;
         self
+    }
+
+    pub fn animated_images(&self) -> &AnimatedImageStore {
+        &self.animation_store
+    }
+
+    pub fn animated_images_mut(&mut self) -> &mut AnimatedImageStore {
+        &mut self.animation_store
     }
 
     pub fn execute(
@@ -626,6 +687,51 @@ impl ProgramSceneResources {
                 self.reduce_session_bytes(session, owned.bytes);
                 Ok(SceneCommandResult::Acknowledged)
             }
+            SceneCommand::UploadAnimatedImage { format, bytes } => {
+                let image = AnimatedImage::decode(format, bytes, self.max_texture_dimension)
+                    .map_err(ProgramSceneError::AnimatedImage)?;
+                let bytes = image.decoded_bytes();
+                let used = self
+                    .session_texture_bytes
+                    .get(&session)
+                    .copied()
+                    .unwrap_or_default();
+                if used
+                    .checked_add(bytes)
+                    .is_none_or(|total| total > MAX_SESSION_TEXTURE_BYTES)
+                {
+                    return Err(ProgramSceneError::SessionTextureLimitExceeded {
+                        limit: MAX_SESSION_TEXTURE_BYTES,
+                    });
+                }
+                let handle = self.allocate_animated_image()?;
+                let image = self.animation_store.insert(image);
+                self.animated_images.insert(
+                    handle,
+                    OwnedAnimatedImage {
+                        session,
+                        image,
+                        bytes,
+                    },
+                );
+                self.session_texture_bytes.insert(session, used + bytes);
+                Ok(SceneCommandResult::AnimatedImage(handle))
+            }
+            SceneCommand::DestroyAnimatedImage { image } => {
+                let image_id = self.animated_image_for(session, image)?;
+                if scene.references_animated_image(image_id) {
+                    return Err(ProgramSceneError::AnimatedImageInUse(image));
+                }
+                self.animation_store
+                    .remove(image_id)
+                    .ok_or(ProgramSceneError::InvalidAnimatedImageHandle(image))?;
+                let owned = self
+                    .animated_images
+                    .remove(&image)
+                    .expect("a resolved animated image handle is registered");
+                self.reduce_session_bytes(session, owned.bytes);
+                Ok(SceneCommandResult::Acknowledged)
+            }
         }
     }
 
@@ -659,6 +765,16 @@ impl ProgramSceneResources {
         for handle in texture_handles {
             if let Some(owned) = self.textures.remove(&handle) {
                 let _ = textures.remove(owned.texture);
+            }
+        }
+        let animated_image_handles = self
+            .animated_images
+            .iter()
+            .filter_map(|(handle, owned)| (owned.session == session).then_some(*handle))
+            .collect::<Vec<_>>();
+        for handle in animated_image_handles {
+            if let Some(owned) = self.animated_images.remove(&handle) {
+                let _ = self.animation_store.remove(owned.image);
             }
         }
         self.session_texture_bytes.remove(&session);
@@ -818,7 +934,10 @@ impl ProgramSceneResources {
             .filter_map(|owned| scene.node(owned.node))
             .filter_map(|node| match node.content() {
                 NodeContent::Text(text) => Some(text),
-                NodeContent::Empty | NodeContent::Solid(_) | NodeContent::Image(_) => None,
+                NodeContent::Empty
+                | NodeContent::Solid(_)
+                | NodeContent::Image(_)
+                | NodeContent::AnimatedImage(_) => None,
             })
             .fold(TextUsage::default(), |mut usage, text| {
                 usage.bytes += text.text().len();
@@ -997,6 +1116,10 @@ impl ProgramSceneResources {
                 ImageNode::new(self.texture_for(session, texture)?, opacity)
                     .map_err(ProgramSceneError::Image)?,
             ),
+            ContentInput::AnimatedImage { image, opacity } => NodeContent::AnimatedImage(
+                AnimatedImageNode::new(self.animated_image_for(session, image)?, opacity)
+                    .map_err(ProgramSceneError::Image)?,
+            ),
         })
     }
 
@@ -1028,6 +1151,21 @@ impl ProgramSceneResources {
             return Err(ProgramSceneError::HandleNotOwned);
         }
         Ok(owned.texture)
+    }
+
+    fn animated_image_for(
+        &self,
+        session: SessionId,
+        handle: AnimatedImageHandle,
+    ) -> Result<AnimatedImageId, ProgramSceneError> {
+        let owned = self
+            .animated_images
+            .get(&handle)
+            .ok_or(ProgramSceneError::InvalidAnimatedImageHandle(handle))?;
+        if owned.session != session {
+            return Err(ProgramSceneError::HandleNotOwned);
+        }
+        Ok(owned.image)
     }
 
     fn allocate_node(
@@ -1066,6 +1204,15 @@ impl ProgramSceneResources {
         Ok(handle)
     }
 
+    fn allocate_animated_image(&mut self) -> Result<AnimatedImageHandle, ProgramSceneError> {
+        let handle = AnimatedImageHandle(self.next_animated_image_handle);
+        self.next_animated_image_handle = self
+            .next_animated_image_handle
+            .checked_add(1)
+            .ok_or(ProgramSceneError::HandleExhausted)?;
+        Ok(handle)
+    }
+
     fn reduce_session_bytes(&mut self, session: SessionId, bytes: usize) {
         if let Some(used) = self.session_texture_bytes.get_mut(&session) {
             *used = used.saturating_sub(bytes);
@@ -1088,6 +1235,8 @@ fn node_handle_for(
 
 #[cfg(test)]
 mod tests {
+    use image::{Delay, Frame, Rgba, RgbaImage, codecs::gif::GifEncoder};
+
     use super::*;
     use crate::protocol::SessionManager;
 
@@ -1140,6 +1289,23 @@ mod tests {
             overlap_enabled: false,
             external_drop_enabled: false,
         }
+    }
+
+    fn animated_gif() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = GifEncoder::new(&mut bytes);
+        for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+            encoder
+                .encode_frame(Frame::from_parts(
+                    RgbaImage::from_pixel(1, 1, Rgba(color)),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(40, 1),
+                ))
+                .unwrap();
+        }
+        drop(encoder);
+        bytes
     }
 
     #[test]
@@ -1580,6 +1746,204 @@ mod tests {
             ),
             Err(ProgramSceneError::TextureInUse(texture))
         );
+    }
+
+    #[test]
+    fn owns_animated_images_and_releases_them_after_node_removal() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(64);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let image = match resources
+            .execute(
+                session,
+                SceneCommand::UploadAnimatedImage {
+                    format: AnimatedImageFormat::Gif,
+                    bytes: animated_gif(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::AnimatedImage(handle) => handle,
+            _ => unreachable!(),
+        };
+        let node = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties(),
+                    content: ContentInput::AnimatedImage {
+                        image,
+                        opacity: 1.0,
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        assert_eq!(resources.animated_images().image_count(), 1);
+        assert_eq!(
+            resources.execute(
+                session,
+                SceneCommand::DestroyAnimatedImage { image },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::AnimatedImageInUse(image))
+        );
+        resources
+            .execute(
+                session,
+                SceneCommand::RemoveNode { node },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        resources
+            .execute(
+                session,
+                SceneCommand::DestroyAnimatedImage { image },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert_eq!(resources.animated_images().image_count(), 0);
+    }
+
+    #[test]
+    fn session_cleanup_releases_animated_images_and_their_nodes() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(64);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let image = match resources
+            .execute(
+                session,
+                SceneCommand::UploadAnimatedImage {
+                    format: AnimatedImageFormat::Gif,
+                    bytes: animated_gif(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::AnimatedImage(handle) => handle,
+            _ => unreachable!(),
+        };
+        resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: properties(),
+                    content: ContentInput::AnimatedImage {
+                        image,
+                        opacity: 1.0,
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+
+        resources.cleanup_session(session, &mut scene, &mut textures);
+
+        assert_eq!(resources.animated_images().image_count(), 0);
+        assert_eq!(scene.len(), 0);
+    }
+
+    #[test]
+    fn rejected_animated_uploads_do_not_allocate_resources() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(64);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        resources
+            .session_texture_bytes
+            .insert(session, MAX_SESSION_TEXTURE_BYTES);
+
+        assert_eq!(
+            resources.execute(
+                session,
+                SceneCommand::UploadAnimatedImage {
+                    format: AnimatedImageFormat::Gif,
+                    bytes: animated_gif(),
+                },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::SessionTextureLimitExceeded {
+                limit: MAX_SESSION_TEXTURE_BYTES,
+            })
+        );
+        assert_eq!(resources.animated_images().image_count(), 0);
+        assert_eq!(scene.len(), 0);
+    }
+
+    #[test]
+    fn exhausted_animated_handles_do_not_allocate_resources() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(64);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        resources.next_animated_image_handle = u64::MAX;
+
+        assert_eq!(
+            resources.execute(
+                session,
+                SceneCommand::UploadAnimatedImage {
+                    format: AnimatedImageFormat::Gif,
+                    bytes: animated_gif(),
+                },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::HandleExhausted)
+        );
+        assert_eq!(resources.animated_images().image_count(), 0);
+        assert_eq!(scene.len(), 0);
+    }
+
+    #[test]
+    fn prevents_cross_session_animated_image_access() {
+        let (owner, other) = session_pair();
+        let mut resources = ProgramSceneResources::new(64);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let image = match resources
+            .execute(
+                owner,
+                SceneCommand::UploadAnimatedImage {
+                    format: AnimatedImageFormat::Gif,
+                    bytes: animated_gif(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::AnimatedImage(handle) => handle,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            resources.execute(
+                other,
+                SceneCommand::DestroyAnimatedImage { image },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::HandleNotOwned)
+        );
+        assert_eq!(resources.animated_images().image_count(), 1);
     }
 
     #[test]

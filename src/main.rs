@@ -9,7 +9,7 @@ mod scene_renderer;
 mod terminal;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -671,6 +671,41 @@ impl WindowState {
         }
     }
 
+    fn advance_scene_animations(&mut self, now: Instant) -> bool {
+        let viewport = logical_scene_viewport(
+            self.surface_config.width,
+            self.surface_config.height,
+            self.scale_factor,
+        );
+        let mut visible_images = HashSet::new();
+        for node in self.scene.paint_order() {
+            let Some(NodeContent::AnimatedImage(image)) =
+                self.scene.node(node).map(|node| node.content())
+            else {
+                continue;
+            };
+            if self
+                .scene
+                .visible_bounds(node)
+                .ok()
+                .flatten()
+                .zip(viewport)
+                .is_some_and(|(bounds, viewport)| bounds.intersection(viewport).is_some())
+            {
+                visible_images.insert(image.image());
+            }
+        }
+        self.program_scene_resources
+            .animated_images_mut()
+            .update_playback(now, &visible_images)
+    }
+
+    fn next_scene_animation_frame(&self) -> Option<Instant> {
+        self.program_scene_resources
+            .animated_images()
+            .next_frame_deadline()
+    }
+
     fn enqueue_event(&mut self, event: EngineEvent) {
         self.diagnostics.record_event(&event, Instant::now());
         match &event {
@@ -1199,7 +1234,7 @@ impl WindowState {
             };
             match content {
                 NodeContent::Empty => {}
-                NodeContent::Image(_) | NodeContent::Solid(_) => {
+                NodeContent::Image(_) | NodeContent::AnimatedImage(_) | NodeContent::Solid(_) => {
                     let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                         label: Some("chymeral scene image pass"),
                         color_attachments: &[Some(RenderPassColorAttachment {
@@ -1303,6 +1338,7 @@ impl WindowState {
             &self.queue,
             &self.scene,
             &self.textures,
+            self.program_scene_resources.animated_images(),
             ImageViewport::new(
                 self.surface_config.width,
                 self.surface_config.height,
@@ -1661,6 +1697,9 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
             {
                 state.window.request_redraw();
             }
+            if state.advance_scene_animations(now) && state.pending_resize.is_none() {
+                state.window.request_redraw();
+            }
             if state.advance_splash(now) && state.pending_resize.is_none() {
                 state.window.request_redraw();
             }
@@ -1669,6 +1708,7 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
             }
             let deadline = [
                 state.background.next_animation_frame(),
+                state.next_scene_animation_frame(),
                 state.next_resize_deadline(),
                 state.runtime.next_tick_deadline(),
                 state.next_splash_deadline(),
@@ -1706,11 +1746,12 @@ fn grid_size(size: PhysicalSize<u32>, font: &FontAppearance, scale_factor: f64) 
 
 fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
     match error {
-        ProgramSceneError::InvalidNodeHandle(_) | ProgramSceneError::InvalidTextureHandle(_) => {
-            "invalid_handle"
-        }
+        ProgramSceneError::InvalidNodeHandle(_)
+        | ProgramSceneError::InvalidTextureHandle(_)
+        | ProgramSceneError::InvalidAnimatedImageHandle(_) => "invalid_handle",
         ProgramSceneError::HandleNotOwned => "not_owner",
         ProgramSceneError::TextureInUse(_) => "texture_in_use",
+        ProgramSceneError::AnimatedImageInUse(_) => "animated_image_in_use",
         ProgramSceneError::TextureLimitExceeded { .. }
         | ProgramSceneError::SessionTextureLimitExceeded { .. }
         | ProgramSceneError::TextureDimensionLimitExceeded { .. }
@@ -1721,6 +1762,7 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
         ProgramSceneError::Geometry(_)
         | ProgramSceneError::Image(_)
         | ProgramSceneError::Texture(_)
+        | ProgramSceneError::AnimatedImage(_)
         | ProgramSceneError::Text(_) => "invalid_argument",
         ProgramSceneError::TextNodeRequired(_)
         | ProgramSceneError::IntrinsicTextBounds(_)
@@ -1902,6 +1944,19 @@ fn logical_pointer_position(position: PhysicalPosition<f64>, scale_factor: f64) 
         y: position.y / scale_factor,
     };
     (position.x.is_finite() && position.y.is_finite()).then_some(position)
+}
+
+fn logical_scene_viewport(width: u32, height: u32, scale_factor: f64) -> Option<Rect> {
+    if width == 0 || height == 0 || !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    Rect::new(
+        0.0,
+        0.0,
+        f64::from(width) / scale_factor,
+        f64::from(height) / scale_factor,
+    )
+    .ok()
 }
 
 fn engine_key_event(event: &WinitKeyEvent, modifiers: ModifiersState) -> EngineKeyEvent {
@@ -2329,8 +2384,9 @@ mod tests {
         engine_focus, engine_key, engine_modifiers, engine_pointer_button, engine_scroll_delta,
         external_file_drop_position_from_physical, grid_size, install_testing_scene,
         is_terminal_copy_shortcut, is_terminal_paste_shortcut, logical_pointer_position,
-        named_key_input, pty_size, select_present_mode, select_surface_format, splash_properties,
-        terminal_input, terminal_input_with_text, terminal_paste_input, testing_node_properties,
+        logical_scene_viewport, named_key_input, pty_size, select_present_mode,
+        select_surface_format, splash_properties, terminal_input, terminal_input_with_text,
+        terminal_paste_input, testing_node_properties,
     };
     use chymeral::{
         protocol::Capability,
@@ -2351,6 +2407,15 @@ mod tests {
             grid_size(PhysicalSize::new(960, 640), &font, 1.0),
             grid_size(PhysicalSize::new(1920, 1280), &font, 2.0),
         );
+    }
+
+    #[test]
+    fn derives_a_logical_scene_viewport_and_rejects_invalid_surfaces() {
+        let viewport = logical_scene_viewport(1920, 1280, 2.0).unwrap();
+        assert_eq!(viewport.width(), 960.0);
+        assert_eq!(viewport.height(), 640.0);
+        assert!(logical_scene_viewport(0, 1280, 2.0).is_none());
+        assert!(logical_scene_viewport(1920, 1280, f64::NAN).is_none());
     }
 
     #[test]

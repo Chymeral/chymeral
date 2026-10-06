@@ -7,7 +7,7 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M15 are complete.
+- M1–M17 are complete.
 - CLP v1.3 is the current public protocol contract.
 - The Rust SDK is the reference client implementation for CLP v1.3.
 - No phase below has started unless its status explicitly says otherwise.
@@ -45,7 +45,7 @@ remain provisional until they are frozen together as **CLP v1.4** in M19.
 CLP v1.3 clients must remain supported. New behavior must be behind negotiated
 capabilities rather than inferred from a host version alone. The precise v1.4
 capability names are not final until M19, but the current planning names are
-`external_drop`, `text`, and `animated_image`.
+`external_drop`, `text`, and `animated_images`.
 
 ## M15 — Terminal Interaction
 
@@ -504,7 +504,7 @@ scene-target validation passed; final desktop regression matrix pending
 
 ## M18 — Animated Scene Images
 
-**Status:** Planned
+**Status:** Complete
 
 ### Scope
 
@@ -535,12 +535,7 @@ scene-target validation passed; final desktop regression matrix pending
 
 ### Pending technical decisions
 
-- Per-resource frame, dimension, decoded-memory, and GPU-memory limits.
-- Frame-duration clamping, loop-count behavior, and zero-delay GIF behavior.
-- Playback phase policy when a resource is shared by several nodes.
-- Visibility policy: pause, retain phase, or continue playback when no visible
-  node references a resource.
-- Exact CLP binary-upload message and resource-handle names.
+_None._
 
 ### Acceptance criteria
 
@@ -553,11 +548,117 @@ scene-target validation passed; final desktop regression matrix pending
 
 ### Accepted decisions
 
-_None yet._
+- **Date:** 2026-10-05
+  **Decision:** Preserve the stable RGBA8 `TextureHandle` API. Add the
+  provisional `animated_images` capability, an `AnimatedImageHandle`, and an
+  `upload_animated_image` command whose format is initially GIF and whose
+  encoded bytes are a binary payload rather than a host path.
+  **Context:** Static RGBA8 textures are already available to CLP v1.3 clients,
+  while future APNG or WebP support needs a format-neutral animated resource.
+  **Rationale:** Separate handles preserve existing behavior and make animated
+  ownership explicit. Static and animated sources retain the same scene-image
+  geometry, opacity, clipping, stacking, and interaction behavior.
+  **Consequences:** Animated-image commands require `scene`, `resources`, and
+  `animated_images`; future encoded animated formats extend the format enum,
+  not node semantics.
+  **Validation:** Capability negotiation and binary-payload tests must reject
+  paths, unknown formats, malformed handles, and ungranted commands.
+
+- **Date:** 2026-10-05
+  **Decision:** Limit an encoded GIF upload to 16 MiB, an animation to 300
+  frames and 64 MiB of decoded pixels, and all static plus decoded animated
+  image data retained by a session to 128 MiB. Each decoded frame must also
+  satisfy the active GPU dimension and 64 MiB texture limits.
+  **Context:** Animated content can expand a small encoded input into many
+  full RGBA8 frames and otherwise bypass the M12 texture quotas.
+  **Rationale:** Reusing the established texture ceilings keeps memory and GPU
+  pressure bounded while allowing practical terminal-scale animations.
+  **Consequences:** Validation completes before ownership or GPU state is
+  committed; a rejected upload leaves the session unchanged.
+  **Validation:** Tests cover encoded-size, frame-count, dimension, decoded
+  size, session-total, overflow, and cleanup accounting.
+
+- **Date:** 2026-10-05
+  **Decision:** Use a host-owned deterministic playback clock. GIF delays are
+  clamped to 20 ms minimum and 10 s maximum; after a delayed host turn, advance
+  at most one frame and schedule from the current time rather than catching up
+  in a burst. Honor an explicit finite GIF loop count, treat zero as infinite,
+  and, when no loop extension exists, play once and retain the final frame.
+  **Context:** Zero-delay GIFs can spin indefinitely, while catch-up playback
+  would create bursts after a resize, debugger stop, or overloaded machine.
+  **Rationale:** The policy is predictable, bounds redraw work, and keeps a
+  completed animation visible instead of clearing the node.
+  **Consequences:** Client `timing` subscriptions do not control GIF playback.
+  **Validation:** A fake clock covers zero-delay, clamping, finite and infinite
+  loops, completion, and delayed host turns.
+
+- **Date:** 2026-10-05
+  **Decision:** Playback phase is global to an animated resource. All scene
+  nodes referencing it display the same current frame; attaching another node
+  never restarts it. If no visible node references the resource, playback
+  pauses and preserves its current frame and remaining phase until visibility
+  returns.
+  **Context:** A shared retained resource must not duplicate frame buffers or
+  acquire one independent clock per node.
+  **Rationale:** Global phase makes sharing deterministic, while pausing fully
+  invisible content avoids needless decode, upload, and redraw work.
+  **Consequences:** Visibility affects playback only when every reference is
+  invisible; node geometry and hit testing remain unchanged.
+  **Validation:** Tests cover shared nodes, visibility transitions, phase
+  preservation, and redraw scheduling.
+
+- **Date:** 2026-10-05
+  **Decision:** Program keyboard focus survives when its focused scene node is
+  hidden or fully clipped. It is cleared by a primary click on terminal space
+  or when the focused node is removed.
+  **Context:** A program that temporarily hides all of its nodes must still be
+  able to receive its own keyboard command to restore them.
+  **Rationale:** Focus belongs to the program's explicit interaction state, not
+  to the current paint visibility of one retained node.
+  **Consequences:** Hidden animated nodes pause without preventing the focused
+  program from showing them again. Dragging still cancels when its source is no
+  longer painted.
+  **Validation:** Interaction tests verify that hiding emits the expected hover
+  leave while retaining program focus; node removal continues to clear focus.
+
+- **Date:** 2026-10-05
+  **Decision:** Destruction follows static texture rules: an animated resource
+  cannot be explicitly destroyed while an owned scene node references it, and
+  session close removes owned nodes before releasing all decoded and GPU state.
+  **Context:** Reusing existing ownership semantics avoids dangling scene
+  content and keeps cleanup independent between sessions.
+  **Rationale:** Clients receive one predictable lifecycle for all image
+  resources.
+  **Validation:** Resource-in-use, node removal, session fault, disconnect,
+  and cross-session ownership tests are required.
+
+- **Date:** 2026-10-05
+  **Decision:** M18 delivers host protocol support, deterministic tests, and
+  an internal GIF probe. The public typed Rust SDK API remains provisional work
+  for M19 consolidation.
+  **Context:** M19 is the agreed point to freeze the combined v1.4 surface.
+  **Rationale:** This allows the host design to mature without prematurely
+  promising a public client API.
+  **Validation:** The internal probe must demonstrate autonomous playback and
+  cleanup on Linux and Windows before SDK consolidation.
 
 ### Validation record
 
-_Not started._
+- Automated: `cargo fmt --check`, `cargo check --all-targets`, focused
+  animated-image tests, `cargo test --all-targets -- --test-threads=1`, and
+  `cargo clippy --all-targets -- -D warnings` pass locally. The release binary
+  and internal probe also build successfully. Unit and transport coverage
+  verifies encoded binary framing, capability denial, bounded decode, malformed
+  and truncated GIF rejection, transparent-frame composition with GIF disposal,
+  stale resource IDs, sustained deterministic playback, shared phase,
+  visibility pause/resume, one-frame delayed advancement, GIF repetition
+  semantics, quota or handle-exhaustion rejection without allocation,
+  cross-session ownership, focus preservation across hiding, node-reference
+  destruction denial, and cleanup after node removal.
+- Manual Linux: the user confirmed the animated-image probe operates correctly
+  on 2026-10-05.
+- Manual Windows: after a native VM release build and launch, the user
+  confirmed the same probe operates correctly on 2026-10-05.
 
 ## M19 — CLP v1.4 and Rust SDK Consolidation
 

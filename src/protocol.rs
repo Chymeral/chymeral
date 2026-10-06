@@ -41,6 +41,7 @@ pub enum Capability {
     Overlap,
     ExternalDrop,
     Text,
+    AnimatedImages,
 }
 
 impl Capability {
@@ -53,6 +54,7 @@ impl Capability {
             Self::Overlap => 1 << 4,
             Self::ExternalDrop => 1 << 5,
             Self::Text => 1 << 6,
+            Self::AnimatedImages => 1 << 7,
         }
     }
 }
@@ -69,7 +71,8 @@ impl CapabilitySet {
             | Capability::Timing.bit()
             | Capability::Overlap.bit()
             | Capability::ExternalDrop.bit()
-            | Capability::Text.bit(),
+            | Capability::Text.bit()
+            | Capability::AnimatedImages.bit(),
     );
 
     pub const fn from_capabilities(capabilities: &[Capability]) -> Self {
@@ -717,6 +720,12 @@ mod tests {
                 .session_capabilities(session_id)
                 .unwrap()
                 .contains(Capability::Text)
+        );
+        assert!(
+            !manager
+                .session_capabilities(session_id)
+                .unwrap()
+                .contains(Capability::AnimatedImages)
         );
     }
 

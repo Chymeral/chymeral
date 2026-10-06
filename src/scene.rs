@@ -3,7 +3,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-use crate::{resources::TextureId, scene_text::TextNode};
+use crate::{animated_image::AnimatedImageId, resources::TextureId, scene_text::TextNode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId {
@@ -204,6 +204,12 @@ pub struct ImageNode {
     opacity: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnimatedImageNode {
+    image: AnimatedImageId,
+    opacity: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SolidNode {
     color: [u8; 4],
@@ -236,6 +242,23 @@ impl ImageNode {
     }
 }
 
+impl AnimatedImageNode {
+    pub fn new(image: AnimatedImageId, opacity: f32) -> Result<Self, ImageNodeError> {
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+            return Err(ImageNodeError::InvalidOpacity);
+        }
+        Ok(Self { image, opacity })
+    }
+
+    pub const fn image(self) -> AnimatedImageId {
+        self.image
+    }
+
+    pub const fn opacity(self) -> f32 {
+        self.opacity
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageNodeError {
     InvalidOpacity,
@@ -259,6 +282,7 @@ pub enum NodeContent {
     Empty,
     Solid(SolidNode),
     Image(ImageNode),
+    AnimatedImage(AnimatedImageNode),
     Text(TextNode),
 }
 
@@ -408,6 +432,15 @@ impl Scene {
             matches!(
                 slot.node.as_ref().map(Node::content),
                 Some(NodeContent::Image(image)) if image.texture() == texture
+            )
+        })
+    }
+
+    pub fn references_animated_image(&self, image: AnimatedImageId) -> bool {
+        self.slots.iter().any(|slot| {
+            matches!(
+                slot.node.as_ref().map(Node::content),
+                Some(NodeContent::AnimatedImage(animated)) if animated.image() == image
             )
         })
     }

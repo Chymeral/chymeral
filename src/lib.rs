@@ -1,3 +1,4 @@
+pub mod animated_image;
 pub mod external_drop;
 pub mod interaction;
 pub mod program_scene;

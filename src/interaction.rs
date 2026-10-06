@@ -363,7 +363,7 @@ impl SceneInteraction {
     fn reconcile_focus(&mut self, scene: &Scene, events: &mut Vec<SceneEvent>) {
         if self
             .focused_node
-            .is_some_and(|node| !node_is_painted(scene, node))
+            .is_some_and(|node| scene.node(node).is_none())
         {
             self.update_focus(None, events);
         }
@@ -979,6 +979,37 @@ mod tests {
                 SceneEvent::FocusLost { target: node },
             ]
         );
+    }
+
+    #[test]
+    fn preserves_program_focus_when_the_focused_node_is_hidden() {
+        let (mut scene, node) = scene_with_node();
+        let mut interaction = SceneInteraction::new();
+        let position = Vec2 { x: 4.0, y: 4.0 };
+
+        interaction
+            .route_pointer(
+                &scene,
+                &PointerEvent::Press {
+                    button: PointerButton::Primary,
+                    position,
+                    modifiers: Modifiers::default(),
+                },
+            )
+            .unwrap();
+        let mut properties = scene.node(node).unwrap().properties();
+        properties.visible = false;
+        scene.set_properties(node, properties).unwrap();
+
+        assert_eq!(
+            interaction.reconcile(&scene).unwrap(),
+            vec![SceneEvent::PointerLeave {
+                target: node,
+                position,
+                modifiers: Modifiers::default(),
+            }]
+        );
+        assert_eq!(interaction.focused_node(), Some(node));
     }
 
     #[test]

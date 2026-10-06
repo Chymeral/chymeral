@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chymeral::{
+    animated_image::{AnimatedImage, AnimatedImageId, AnimatedImageStore},
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
     scene::{NodeContent, NodeId, Rect, Scene},
 };
@@ -84,6 +85,11 @@ struct GpuImage {
     bind_group: BindGroup,
 }
 
+struct GpuAnimatedImage {
+    image: GpuImage,
+    frame_index: usize,
+}
+
 #[derive(Clone, Copy)]
 struct Draw {
     node: NodeId,
@@ -101,6 +107,7 @@ struct TerminalSelectionDraw {
 #[derive(Clone, Copy)]
 enum DrawSource {
     Texture(TextureId),
+    AnimatedImage(AnimatedImageId),
     Solid([u8; 4]),
 }
 
@@ -139,6 +146,7 @@ pub struct ImageRenderer {
     terminal_selection_vertex_capacity: u64,
     terminal_selection_draws: Vec<TerminalSelectionDraw>,
     gpu_images: HashMap<TextureId, GpuImage>,
+    gpu_animated_images: HashMap<AnimatedImageId, GpuAnimatedImage>,
     gpu_solids: HashMap<[u8; 4], GpuImage>,
     draws: Vec<Draw>,
 }
@@ -179,6 +187,7 @@ impl ImageRenderer {
             terminal_selection_vertex_capacity: IMAGE_VERTEX_STRIDE,
             terminal_selection_draws: Vec::new(),
             gpu_images: HashMap::new(),
+            gpu_animated_images: HashMap::new(),
             gpu_solids: HashMap::new(),
             draws: Vec::new(),
         }
@@ -190,10 +199,13 @@ impl ImageRenderer {
         queue: &Queue,
         scene: &Scene,
         textures: &TextureStore,
+        animated_images: &AnimatedImageStore,
         viewport: ImageViewport,
     ) -> Result<()> {
         self.gpu_images
             .retain(|texture, _| textures.texture(*texture).is_some());
+        self.gpu_animated_images
+            .retain(|image, _| animated_images.image(*image).is_some());
 
         let paint_order = scene.paint_order();
         let solid_colors = paint_order
@@ -201,7 +213,10 @@ impl ImageRenderer {
             .filter_map(|node_id| scene.node(*node_id))
             .filter_map(|node| match node.content() {
                 NodeContent::Solid(solid) => Some(solid.color()),
-                NodeContent::Empty | NodeContent::Image(_) | NodeContent::Text(_) => None,
+                NodeContent::Empty
+                | NodeContent::Image(_)
+                | NodeContent::AnimatedImage(_)
+                | NodeContent::Text(_) => None,
             })
             .collect::<HashSet<_>>();
         self.gpu_solids
@@ -221,6 +236,13 @@ impl ImageRenderer {
                     };
                     self.ensure_gpu_image(device, queue, image.texture(), texture)?;
                     (DrawSource::Texture(image.texture()), image.opacity())
+                }
+                NodeContent::AnimatedImage(image) => {
+                    let Some(animated_image) = animated_images.image(image.image()) else {
+                        continue;
+                    };
+                    self.ensure_gpu_animated_image(device, queue, image.image(), animated_image)?;
+                    (DrawSource::AnimatedImage(image.image()), image.opacity())
                 }
                 NodeContent::Solid(solid) => {
                     self.ensure_gpu_solid(device, queue, solid.color())?;
@@ -364,9 +386,46 @@ impl ImageRenderer {
         Ok(())
     }
 
+    fn ensure_gpu_animated_image(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        image_id: AnimatedImageId,
+        animated_image: &AnimatedImage,
+    ) -> Result<()> {
+        let frame_index = animated_image.current_frame_index();
+        if let Some(gpu_image) = self.gpu_animated_images.get_mut(&image_id) {
+            if gpu_image.frame_index != frame_index {
+                upload_gpu_texture(
+                    queue,
+                    &gpu_image.image._texture,
+                    animated_image.width(),
+                    animated_image.height(),
+                    animated_image.current_frame().pixels(),
+                )?;
+                gpu_image.frame_index = frame_index;
+            }
+            return Ok(());
+        }
+        let image = self.create_gpu_image(
+            device,
+            queue,
+            animated_image.width(),
+            animated_image.height(),
+            animated_image.current_frame().pixels(),
+        )?;
+        self.gpu_animated_images
+            .insert(image_id, GpuAnimatedImage { image, frame_index });
+        Ok(())
+    }
+
     fn render_draw<'a>(&'a self, pass: &mut RenderPass<'a>, draw: &Draw) {
         let image = match draw.source {
             DrawSource::Texture(texture) => self.gpu_images.get(&texture),
+            DrawSource::AnimatedImage(image) => self
+                .gpu_animated_images
+                .get(&image)
+                .map(|image| &image.image),
             DrawSource::Solid(color) => self.gpu_solids.get(&color),
         };
         let Some(image) = image else {
@@ -404,9 +463,6 @@ impl ImageRenderer {
         height: u32,
         pixels: &[u8],
     ) -> Result<GpuImage> {
-        let bytes_per_row = width
-            .checked_mul(4)
-            .context("texture row size overflows wgpu's upload layout")?;
         let gpu_texture = device.create_texture(&TextureDescriptor {
             label: Some("chymeral scene image"),
             size: Extent3d {
@@ -421,25 +477,7 @@ impl ImageRenderer {
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &gpu_texture,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            pixels,
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(height),
-            },
-            Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        upload_gpu_texture(queue, &gpu_texture, width, height, pixels)?;
         let texture_view = gpu_texture.create_view(&TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("chymeral scene image bind group"),
@@ -488,6 +526,38 @@ impl ImageRenderer {
         });
         self.terminal_selection_vertex_capacity = size;
     }
+}
+
+fn upload_gpu_texture(
+    queue: &Queue,
+    texture: &GpuTexture,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<()> {
+    let bytes_per_row = width
+        .checked_mul(4)
+        .context("texture row size overflows wgpu's upload layout")?;
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        pixels,
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
 }
 
 fn image_bind_group_layout(device: &Device) -> BindGroupLayout {
