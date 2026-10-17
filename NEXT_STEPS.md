@@ -878,6 +878,22 @@ The stable v2 command-error vocabulary is `unsupported_version`,
   **Validation:** Host dispatch maps all scene/image validation failures to the
   frozen vocabulary and the public manual records it.
 
+- **Date:** 2026-10-17
+  **Decision:** Retire the core repository's executable CLP fixture and
+  animated-image probe after M19 validation.
+  **Context:** They served as development subprojects, not product components
+  or public SDKs, and would add unrelated executable artifacts to distribution
+  work.
+  **Rationale:** The core keeps its automated unit and integration tests while
+  the Rust SDK retains its protocol-conformance program. A future
+  language-neutral fixture or IDL belongs to M21 rather than to the
+  distributable host repository.
+  **Consequences:** The SDK no longer dispatches a cross-repository job against
+  a core example. Host/SDK compatibility is recorded by the completed Linux
+  and Windows conformance validation until M21 establishes its successor.
+  **Validation:** No operational core documentation or SDK workflow references
+  the retired executable examples.
+
 ### Validation record
 
 - Automated core: `cargo fmt --check`, `cargo test --all-targets --
@@ -891,10 +907,10 @@ The stable v2 command-error vocabulary is `unsupported_version`,
   --test-threads=1`, `cargo clippy --all-targets -- -D warnings`, and
   `cargo build --release --examples` pass for the 0.2.0 client, wire
   serialization, and all examples.
-- Cross-repository fixture: the core's non-graphical `clp_fixture_server`
-  launched the SDK's release `clp_conformance` example successfully on the
-  Linux build host. It exercises the real v2.0 framing and lifecycle plus every
-  canonical operation, both image source forms, text, timing, and overlap.
+- Cross-repository fixture (retired after validation): it launched the SDK's
+  release `clp_conformance` example successfully on the Linux build host. It
+  exercised real v2.0 framing and lifecycle plus every canonical operation,
+  both image source forms, text, timing, and overlap.
 - Manual Linux: on 2026-10-17, the user confirmed the current release host and
   Rust SDK `clp_conformance` client completed successfully in a graphical
   Chymeral session. The terminal remained open and reported exit code `0`.

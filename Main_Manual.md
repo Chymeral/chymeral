@@ -479,11 +479,9 @@ fn main() -> chymeral_rust_sdk::Result<()> {
 
 The `0.2.0` development SDK exposes typed CLP v2.0 capabilities, session and
 opaque-handle types, nodes, atomic node changes, unified images, subscriptions,
-notifications, close reasons, and client errors. `clp_probe` is the interactive
-orange/blue drag test, `clp_text_probe` is the visual text-node probe, and
-`clp_conformance` exercises lifecycle, timing, images, text, scene mutation,
-and overlap against a live Chymeral endpoint, including both RGBA8 and GIF
-image uploads.
+notifications, close reasons, and client errors. `clp_conformance` exercises
+lifecycle, timing, images, text, scene mutation, and overlap against a live
+Chymeral endpoint, including both RGBA8 and GIF image uploads.
 
 CLP itself remains language-neutral. Other language SDKs or direct protocol
 clients have equal architectural status when they conform to the negotiated
@@ -497,32 +495,10 @@ repository:
 
 ```text
 cargo run --example clp_conformance
-cargo run --example clp_probe
-cargo run --example clp_text_probe
 ```
 
-The conformance client must return successfully to the same terminal. The probe
-shows orange and blue nodes: drag orange onto blue, observe overlap transitions,
-then press `q` while they overlap. Only the probe session closes; the Chymeral
-terminal remains open. The text probe creates a panel and text children; check
-their offset, tab width, Unicode cell geometry, and multiline alignment. Press
-`u` to update its text, `b` to update style, and `q` to close only that session.
-The core repository also retains an internal animated-image probe for renderer
-and GIF-lifecycle validation; it is not a public SDK example.
-
-For non-graphical host/SDK compatibility checks, the core repository provides
-the `clp_fixture_server` example. From the core checkout, it launches an SDK
-conformance client with a temporary authenticated CLP endpoint and services
-its commands without creating a window:
-
-```text
-cargo run --release --example clp_fixture_server -- \
-  cargo run --manifest-path ../chymeral-rust-sdk/Cargo.toml --release --example clp_conformance
-```
-
-This fixture proves protocol framing, lifecycle, commands, resources, text,
-and overlap behavior. Desktop GIF playback, interaction, and external file
-drop still require the Linux and Windows visual validation described above.
+The conformance client must return successfully to the same terminal without
+closing the surrounding Chymeral terminal.
 
 ## 11. Boundaries and next steps
 
