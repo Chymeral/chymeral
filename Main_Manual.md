@@ -33,10 +33,11 @@ Chymeral targets Linux and Windows. Windows requires Windows 10 version 1809 or
 newer, or Windows 11, because the terminal uses ConPTY. macOS is intentionally
 not supported.
 
-Build and run it from this repository with a current Rust toolchain:
+Building from source requires Rust `1.90` or newer. The repository pins
+`1.90.0` for reproducible development. Build and run it with:
 
 ```text
-cargo run --release
+cargo run --locked --release
 ```
 
 The executable is `chymeral` on Linux and `chymeral.exe` on Windows. The normal
@@ -44,9 +45,9 @@ development checks are:
 
 ```text
 cargo fmt --check
-cargo test --all-targets -- --test-threads=1
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --locked --all-targets -- --test-threads=1
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release --all-targets
 ```
 
 ## 3. Terminal behavior
@@ -515,14 +516,15 @@ start Chymeral, open its terminal, then run the Rust SDK examples from the SDK
 repository:
 
 ```text
-cargo run --example clp_conformance
+cargo run --locked --example clp_conformance
 ```
 
 The conformance client must return successfully to the same terminal without
 closing the surrounding Chymeral terminal.
 
 To validate alpha image contact and node passthrough interactively, run the
-same SDK executable with `cargo run --example clp_conformance -- --manual`.
+same SDK executable with
+`cargo run --locked --example clp_conformance -- --manual`.
 It shows a blue target, an orange alpha-frame image, a pink GIF tile that
 alternates between opaque and transparent, and a visible white band with
 `input_passthrough`. The terminal identifies each directed scene event and the
@@ -539,3 +541,10 @@ manifest standard, no protocol IDL, no widget library, and no 3D scene API.
 The Rust reference SDK is not a privileged host component; future language
 bindings can share an IDL and the conformance suite without changing the
 ordinary-program model at the center of Chymeral.
+
+The first stable source baseline is Chymeral `1.0.0`, which implements CLP
+v2.0. The separate Rust reference binding is also `1.0.0`; its crate version
+does not version the protocol or the terminal application. The host Rust crate
+exists to share implementation between the executable and its tests. It is not
+a supported application-development API: programs should use CLP directly or
+a language SDK.

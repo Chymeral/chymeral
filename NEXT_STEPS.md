@@ -1018,7 +1018,7 @@ The stable v2 command-error vocabulary is `unsupported_version`,
 
 ## M21 — Public Release Preparation
 
-**Status:** Planned
+**Status:** In progress
 
 ### Scope
 
@@ -1037,7 +1037,8 @@ The stable v2 command-error vocabulary is `unsupported_version`,
 
 - Distribution formats for Linux and Windows.
 - Signing policy for Windows artifacts.
-- Whether the first public release is labelled preview, beta, or stable `0.1.0`.
+- Whether the first public artifact release is labelled preview, beta, or
+  stable, despite the accepted `1.0.0` source baseline.
 - Support matrix for desktop environments and GPU drivers.
 
 ### Acceptance criteria
@@ -1049,11 +1050,30 @@ The stable v2 command-error vocabulary is `unsupported_version`,
 
 ### Accepted decisions
 
-_None yet._
+- **Version identity:** The core source baseline is Chymeral `1.0.0`, paired
+  with CLP v2.0 and `chymeral-rust-sdk` `1.0.0`. Those three version lines have
+  separate compatibility roles. This decision does not mark distribution
+  artifacts as released; M21 still owns packaging, signing, installation, and
+  clean-environment acceptance.
+- **Core distribution boundary:** Chymeral is delivered as an application, not
+  as a supported Rust host library. Its manifest uses `publish = false`; CLP
+  and language SDKs are the application-development boundaries.
+- **Toolchains:** The core's minimum supported Rust version is `1.90`, derived
+  from its locked `wgpu` graphics stack. The independent Rust SDK keeps its
+  tested Rust `1.85` minimum. Both repositories validate their minimum and
+  current stable Rust on Linux and Windows in CI.
+- **Review baseline:** Both repositories require locked dependency resolution,
+  formatting, all-target tests, warnings-denied Clippy, warnings-denied Rustdoc,
+  and a release build before a change is ready for review.
 
 ### Validation record
 
-_Not started._
+- **Source/review preparation (2026-10-17):** Both repositories gained pinned
+  toolchains, locked quality commands, changelogs, contributor guidance,
+  security-reporting policy, and Linux/Windows CI matrices for their minimum
+  supported Rust and stable Rust. The core passed its full local matrix on Rust
+  `1.90` and stable; the SDK passed its full local matrix on Rust `1.85` and
+  stable. GitHub-hosted matrix runs remain pending the next push.
 
 ## M22 — Language-Neutral SDK Ecosystem
 

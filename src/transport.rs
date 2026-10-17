@@ -2017,6 +2017,9 @@ fn empty_read_is_disconnected(stream: &LocalSocketStream) -> io::Result<bool> {
     };
 
     let LocalSocketStream::NamedPipe(pipe) = stream;
+    // SAFETY: `pipe` owns a live named-pipe handle for the duration of this
+    // call. A zero-length peek permits null optional output pointers and does
+    // not read or write a caller-provided buffer.
     let available = unsafe {
         PeekNamedPipe(
             pipe.inner().as_raw_handle(),

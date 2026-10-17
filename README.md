@@ -53,10 +53,11 @@ not become a host-loaded plugin.
 
 ## Quick start
 
-Build and launch from a Rust toolchain:
+Building from source requires Rust `1.90` or newer. The repository pins
+`1.90.0` for reproducible local development. Build and launch with:
 
 ```text
-cargo run --release
+cargo run --locked --release
 ```
 
 On Linux, Chymeral launches `CHYMERAL_SHELL`, then `$SHELL`, then `/bin/sh`.
@@ -81,15 +82,19 @@ may be relative to the configuration file.
   milestone record formerly kept in this README.
 - [Chymeral Rust SDK](https://github.com/Chymeral/chymeral-rust-sdk) — the
   separate reference Rust client and its conformance examples.
+- [Contributing guide](CONTRIBUTING.md) — setup, checks, and protocol-change
+  expectations for collaborators.
+- [Changelog](CHANGELOG.md) — released behavior and compatibility notes.
+- [Security policy](SECURITY.md) — private vulnerability-reporting guidance.
 
 ## Project state
 
-M20 completes CLP v2.0 interaction fidelity with image-alpha contact and
-generic node input passthrough, while promoting the separate Rust reference SDK
-to its stable `1.0.0` API. Linux and Windows manual acceptance has passed;
-public release preparation is the next phase. The terminal, local runtime,
-overlap support, terminal selection, clipboard integration, and Linux/Windows
-validation remain independently useful to ordinary terminal programs.
+Chymeral `1.0.0` is the first stable source baseline. It implements CLP v2.0
+and is paired with the separate `chymeral-rust-sdk` `1.0.0` reference binding.
+These version lines are independent: the application is distributed as a
+terminal program, CLP is the language-neutral contract, and the SDK is one
+client implementation. Linux and Windows manual acceptance has passed;
+distribution packaging and release assets remain the next phase.
 
 ## License
 

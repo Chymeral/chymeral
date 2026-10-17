@@ -372,8 +372,8 @@ mod tests {
                 ..Modifiers::default()
             },
         )));
-        assert!(!Shortcut::parse("E").is_ok());
-        assert!(!Shortcut::parse("Ctrl+Shift+Enter").is_ok());
+        assert!(Shortcut::parse("E").is_err());
+        assert!(Shortcut::parse("Ctrl+Shift+Enter").is_err());
     }
 
     #[test]

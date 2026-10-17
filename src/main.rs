@@ -2384,9 +2384,13 @@ fn windows_external_file_drop_position(window: &Window, scale_factor: f64) -> Op
         return None;
     };
     let mut position = POINT::default();
+    // SAFETY: `position` is a valid writable `POINT` for the duration of the
+    // call.
     if unsafe { GetCursorPos(&mut position) } == 0 {
         return None;
     }
+    // SAFETY: the Win32 handle came from this live winit window and `position`
+    // remains a valid writable `POINT`.
     if unsafe { ScreenToClient(handle.hwnd.get() as _, &mut position) } == 0 {
         return None;
     }
