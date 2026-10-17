@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt::{Display, Formatter},
+    sync::Arc,
 };
 
 const RGBA8_BYTES_PER_PIXEL: usize = 4;
@@ -40,6 +41,7 @@ pub struct Texture {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+    alpha: Arc<[u8]>,
 }
 
 impl Texture {
@@ -51,10 +53,17 @@ impl Texture {
                 actual: pixels.len(),
             });
         }
+        let alpha = pixels
+            .iter()
+            .skip(3)
+            .step_by(RGBA8_BYTES_PER_PIXEL)
+            .copied()
+            .collect();
         Ok(Self {
             width,
             height,
             pixels,
+            alpha,
         })
     }
 
@@ -68,6 +77,10 @@ impl Texture {
 
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
+    }
+
+    pub(crate) fn alpha(&self) -> Arc<[u8]> {
+        Arc::clone(&self.alpha)
     }
 }
 

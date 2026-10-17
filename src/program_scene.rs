@@ -12,8 +12,8 @@ use crate::{
     resources::{Texture, TextureError, TextureStore, rgba8_byte_len},
     runtime::SceneEvent,
     scene::{
-        AnimatedImageNode, ImageNode, NodeContent, NodeId, NodeProperties, Rect, Scene, SceneLayer,
-        SolidNode, Transform,
+        AnimatedImageNode, ImageAlphaMask, ImageContactShape, ImageNode, NodeContent, NodeId,
+        NodeProperties, Rect, Scene, SceneLayer, SolidNode, Transform,
     },
     scene_text::{TextLayout, TextLayoutError, TextMetrics, TextNode, TextStyle},
 };
@@ -110,6 +110,7 @@ pub struct NodePropertiesInput {
     pub z_index: i32,
     pub overlap_enabled: bool,
     pub external_drop_enabled: bool,
+    pub input_passthrough: bool,
 }
 
 impl NodePropertiesInput {
@@ -123,6 +124,7 @@ impl NodePropertiesInput {
             z_index: self.z_index,
             overlap_enabled: self.overlap_enabled,
             external_drop_enabled: self.external_drop_enabled,
+            input_passthrough: self.input_passthrough,
         })
     }
 }
@@ -136,6 +138,7 @@ pub struct TextNodePropertiesInput {
     pub z_index: i32,
     pub overlap_enabled: bool,
     pub external_drop_enabled: bool,
+    pub input_passthrough: bool,
 }
 
 impl TextNodePropertiesInput {
@@ -150,6 +153,7 @@ impl TextNodePropertiesInput {
             z_index: self.z_index,
             overlap_enabled: self.overlap_enabled,
             external_drop_enabled: self.external_drop_enabled,
+            input_passthrough: self.input_passthrough,
         }
         .into_scene()
     }
@@ -166,6 +170,7 @@ pub struct NodePropertiesPatch {
     pub z_index: Option<i32>,
     pub overlap_enabled: Option<bool>,
     pub external_drop_enabled: Option<bool>,
+    pub input_passthrough: Option<bool>,
 }
 
 impl NodePropertiesPatch {
@@ -182,6 +187,9 @@ impl NodePropertiesPatch {
             external_drop_enabled: self
                 .external_drop_enabled
                 .unwrap_or(properties.external_drop_enabled),
+            input_passthrough: self
+                .input_passthrough
+                .unwrap_or(properties.input_passthrough),
         }
         .into_scene()
     }
@@ -196,10 +204,12 @@ pub enum ContentInput {
     Image {
         texture: TextureHandle,
         opacity: f32,
+        contact_shape: ImageContactShape,
     },
     AnimatedImage {
         image: AnimatedImageHandle,
         opacity: f32,
+        contact_shape: ImageContactShape,
     },
 }
 
@@ -216,6 +226,7 @@ pub enum NodeInput {
         properties: NodePropertiesInput,
         image: ImageHandle,
         opacity: f32,
+        contact_shape: ImageContactShape,
     },
     Text {
         properties: TextNodePropertiesInput,
@@ -227,8 +238,14 @@ pub enum NodeInput {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NodeVisualInput {
     Empty,
-    Rectangle { color: [u8; 4] },
-    Image { image: ImageHandle, opacity: f32 },
+    Rectangle {
+        color: [u8; 4],
+    },
+    Image {
+        image: ImageHandle,
+        opacity: f32,
+        contact_shape: ImageContactShape,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -620,7 +637,7 @@ impl ProgramSceneResources {
                 node,
             } => self.create_clp_node(session, parent, layer, node, scene, textures),
             ClpSceneCommand::SetNode { node, changes } => {
-                self.set_clp_node(session, node, changes, scene)
+                self.set_clp_node(session, node, changes, scene, textures)
             }
             ClpSceneCommand::RemoveNode { node } => {
                 self.execute(session, SceneCommand::RemoveNode { node }, scene, textures)?;
@@ -746,13 +763,21 @@ impl ProgramSceneResources {
                 properties,
                 image,
                 opacity,
+                contact_shape,
             } => self.create_clp_visual_node(
                 session,
                 parent,
                 layer.unwrap_or_default(),
                 (
                     properties,
-                    self.resolve_clp_visual(session, NodeVisualInput::Image { image, opacity })?,
+                    self.resolve_clp_visual(
+                        session,
+                        NodeVisualInput::Image {
+                            image,
+                            opacity,
+                            contact_shape,
+                        },
+                    )?,
                 ),
                 scene,
                 textures,
@@ -840,6 +865,7 @@ impl ProgramSceneResources {
         handle: NodeHandle,
         changes: NodeChanges,
         scene: &mut Scene,
+        textures: &TextureStore,
     ) -> Result<ClpSceneCommandResult, ProgramSceneError> {
         let node = self.node_for(session, handle)?;
         let (is_text, current_properties, current_parent) = {
@@ -899,7 +925,7 @@ impl ProgramSceneResources {
             .visual
             .map(|visual| {
                 self.resolve_clp_visual(session, visual)
-                    .and_then(|visual| self.resolve_content(session, visual))
+                    .and_then(|visual| self.resolve_content(session, visual, textures))
             })
             .transpose()?;
         let text = if is_text && (changes.text.is_some() || changes.text_style.is_some()) {
@@ -963,7 +989,7 @@ impl ProgramSceneResources {
                 content,
             } => {
                 self.validate_overlap_capacity(session, false, properties.overlap_enabled, scene)?;
-                let content = self.resolve_content(session, content)?;
+                let content = self.resolve_content(session, content, textures)?;
                 let node = scene.create_root_in_layer(properties.into_scene()?, layer);
                 scene
                     .set_content(node, content)
@@ -979,7 +1005,7 @@ impl ProgramSceneResources {
             } => {
                 self.validate_overlap_capacity(session, false, properties.overlap_enabled, scene)?;
                 let parent = self.node_for(session, parent)?;
-                let content = self.resolve_content(session, content)?;
+                let content = self.resolve_content(session, content, textures)?;
                 let node = scene
                     .create_child(parent, properties.into_scene()?)
                     .map_err(ProgramSceneError::Scene)?;
@@ -1029,7 +1055,8 @@ impl ProgramSceneResources {
                 ) {
                     return Err(ProgramSceneError::TextContentRequiresTextCommands(handle));
                 }
-                self.set_content(session, node, content, scene)?;
+                self.set_content(session, node, content, scene, textures)?;
+                self.reconcile_overlaps(session, scene)?;
                 Ok(SceneCommandResult::Acknowledged)
             }
             SceneCommand::CreateTextRoot {
@@ -1295,6 +1322,7 @@ impl ProgramSceneResources {
                 continue;
             };
             if !candidate.properties().external_drop_enabled
+                || candidate.properties().input_passthrough
                 || self.session_for_node(node).is_none()
             {
                 continue;
@@ -1303,11 +1331,83 @@ impl ProgramSceneResources {
                 .visible_bounds(node)
                 .map_err(ProgramSceneError::Scene)?
                 .is_some_and(|bounds| bounds.contains(point))
+                && scene
+                    .node_contains_point(node, point)
+                    .map_err(ProgramSceneError::Scene)?
             {
                 return Ok(Some(node));
             }
         }
         Ok(None)
+    }
+
+    pub fn sync_animated_alpha_contacts(
+        &mut self,
+        scene: &mut Scene,
+    ) -> Result<Vec<NodeId>, ProgramSceneError> {
+        let nodes = self
+            .nodes
+            .values()
+            .map(|owned| owned.node)
+            .collect::<Vec<_>>();
+        let mut changed = Vec::new();
+        for node in nodes {
+            let Some(NodeContent::AnimatedImage(animated)) =
+                scene.node(node).map(|node| node.content())
+            else {
+                continue;
+            };
+            if !matches!(animated.contact_shape(), ImageContactShape::Alpha { .. }) {
+                continue;
+            }
+            let image = self
+                .animation_store
+                .image(animated.image())
+                .expect("an animated image cannot be removed while a scene node references it");
+            let alpha_mask =
+                ImageAlphaMask::new(image.width(), image.height(), image.current_frame().alpha())
+                    .map_err(ProgramSceneError::Image)?;
+            if animated
+                .alpha_mask()
+                .is_some_and(|current| current == &alpha_mask)
+            {
+                continue;
+            }
+            scene
+                .set_content(
+                    node,
+                    NodeContent::AnimatedImage(animated.with_alpha_mask(alpha_mask)),
+                )
+                .expect("a registered animated scene node remains valid");
+            changed.push(node);
+        }
+        Ok(changed)
+    }
+
+    pub fn reconcile_animated_alpha_contacts(
+        &mut self,
+        changed_nodes: &[NodeId],
+        scene: &Scene,
+    ) -> Result<(), ProgramSceneError> {
+        let mut sessions = BTreeMap::<SessionId, Vec<NodeId>>::new();
+        for node in changed_nodes {
+            let Some(session) = self.session_for_node(*node) else {
+                continue;
+            };
+            if scene
+                .node(*node)
+                .is_some_and(|node| node.properties().overlap_enabled)
+            {
+                let nodes = sessions.entry(session).or_default();
+                if !nodes.contains(node) {
+                    nodes.push(*node);
+                }
+            }
+        }
+        for (session, nodes) in sessions {
+            self.reconcile_overlaps_for_nodes(session, &nodes, scene)?;
+        }
+        Ok(())
     }
 
     pub fn drain_overlap_events(&mut self) -> Vec<SceneEvent> {
@@ -1474,9 +1574,6 @@ impl ProgramSceneResources {
         scene: &Scene,
     ) -> Result<Vec<NodeHandle>, ProgramSceneError> {
         let source = self.node_for(session, source)?;
-        let source_bounds = scene
-            .world_bounds(source)
-            .map_err(ProgramSceneError::Scene)?;
         let mut overlaps = Vec::new();
         for (handle, owned) in &self.nodes {
             if owned.session != session || owned.node == source {
@@ -1488,10 +1585,10 @@ impl ProgramSceneResources {
             if !candidate.properties().overlap_enabled {
                 continue;
             }
-            let candidate_bounds = scene
-                .world_bounds(owned.node)
-                .map_err(ProgramSceneError::Scene)?;
-            if source_bounds.intersects(candidate_bounds) {
+            if scene
+                .nodes_overlap(source, owned.node)
+                .map_err(ProgramSceneError::Scene)?
+            {
                 overlaps.push(*handle);
             }
         }
@@ -1529,6 +1626,78 @@ impl ProgramSceneResources {
         Ok(())
     }
 
+    fn reconcile_overlaps_for_nodes(
+        &mut self,
+        session: SessionId,
+        changed_nodes: &[NodeId],
+        scene: &Scene,
+    ) -> Result<(), ProgramSceneError> {
+        let colliders = self
+            .nodes
+            .iter()
+            .filter_map(|(handle, owned)| {
+                (owned.session == session
+                    && scene
+                        .node(owned.node)
+                        .is_some_and(|node| node.properties().overlap_enabled))
+                .then_some((*handle, owned.node))
+            })
+            .collect::<Vec<_>>();
+        let changed = colliders
+            .iter()
+            .filter_map(|(handle, node)| changed_nodes.contains(node).then_some(*handle))
+            .collect::<BTreeSet<_>>();
+        if changed.is_empty() {
+            return Ok(());
+        }
+
+        let previous = self
+            .overlap_pairs
+            .iter()
+            .filter(|pair| {
+                pair.session == session
+                    && (changed.contains(&pair.first) || changed.contains(&pair.second))
+            })
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut current = BTreeSet::new();
+        for (first_handle, first_node) in &colliders {
+            if !changed.contains(first_handle) {
+                continue;
+            }
+            for (second_handle, second_node) in &colliders {
+                if first_handle == second_handle {
+                    continue;
+                }
+                if scene
+                    .nodes_overlap(*first_node, *second_node)
+                    .map_err(ProgramSceneError::Scene)?
+                {
+                    current.insert(OverlapPair::new(session, *first_handle, *second_handle));
+                }
+            }
+        }
+
+        let entered = current
+            .difference(&previous)
+            .copied()
+            .map(|pair| self.overlap_scene_event(pair, true))
+            .collect::<Result<Vec<_>, _>>()?;
+        let left = previous
+            .difference(&current)
+            .copied()
+            .map(|pair| self.overlap_scene_event(pair, false))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.overlap_pairs.retain(|pair| {
+            pair.session != session
+                || (!changed.contains(&pair.first) && !changed.contains(&pair.second))
+        });
+        self.overlap_pairs.extend(current);
+        self.pending_overlap_events.extend(entered);
+        self.pending_overlap_events.extend(left);
+        Ok(())
+    }
+
     fn overlap_pairs_for_session(
         &self,
         session: SessionId,
@@ -1544,18 +1713,16 @@ impl ProgramSceneResources {
                         .is_some_and(|node| node.properties().overlap_enabled))
                 .then_some((*handle, owned.node))
             })
-            .map(|(handle, node)| {
-                scene
-                    .world_bounds(node)
-                    .map(|bounds| (handle, bounds))
-                    .map_err(ProgramSceneError::Scene)
-            })
+            .map(|(handle, node)| Ok((handle, node)))
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut pairs = BTreeSet::new();
-        for (index, (first_handle, first_bounds)) in nodes.iter().enumerate() {
-            for (second_handle, second_bounds) in nodes.iter().skip(index + 1) {
-                if first_bounds.intersects(*second_bounds) {
+        for (index, (first_handle, first_node)) in nodes.iter().enumerate() {
+            for (second_handle, second_node) in nodes.iter().skip(index + 1) {
+                if scene
+                    .nodes_overlap(*first_node, *second_node)
+                    .map_err(ProgramSceneError::Scene)?
+                {
                     pairs.insert(OverlapPair::new(session, *first_handle, *second_handle));
                 }
             }
@@ -1589,8 +1756,9 @@ impl ProgramSceneResources {
         node: NodeId,
         content: ContentInput,
         scene: &mut Scene,
+        textures: &TextureStore,
     ) -> Result<(), ProgramSceneError> {
-        let content = self.resolve_content(session, content)?;
+        let content = self.resolve_content(session, content, textures)?;
         scene
             .set_content(node, content)
             .map_err(ProgramSceneError::Scene)
@@ -1604,14 +1772,22 @@ impl ProgramSceneResources {
         match visual {
             NodeVisualInput::Empty => Ok(ContentInput::Empty),
             NodeVisualInput::Rectangle { color } => Ok(ContentInput::Solid { color }),
-            NodeVisualInput::Image { image, opacity } => {
-                match self.image_for(session, image)?.resource {
-                    ImageResource::Texture(texture) => Ok(ContentInput::Image { texture, opacity }),
-                    ImageResource::AnimatedImage(image) => {
-                        Ok(ContentInput::AnimatedImage { image, opacity })
-                    }
-                }
-            }
+            NodeVisualInput::Image {
+                image,
+                opacity,
+                contact_shape,
+            } => match self.image_for(session, image)?.resource {
+                ImageResource::Texture(texture) => Ok(ContentInput::Image {
+                    texture,
+                    opacity,
+                    contact_shape,
+                }),
+                ImageResource::AnimatedImage(image) => Ok(ContentInput::AnimatedImage {
+                    image,
+                    opacity,
+                    contact_shape,
+                }),
+            },
         }
     }
 
@@ -1619,18 +1795,65 @@ impl ProgramSceneResources {
         &self,
         session: SessionId,
         content: ContentInput,
+        textures: &TextureStore,
     ) -> Result<NodeContent, ProgramSceneError> {
         Ok(match content {
             ContentInput::Empty => NodeContent::Empty,
             ContentInput::Solid { color } => NodeContent::Solid(SolidNode::new(color)),
-            ContentInput::Image { texture, opacity } => NodeContent::Image(
-                ImageNode::new(self.texture_for(session, texture)?, opacity)
+            ContentInput::Image {
+                texture,
+                opacity,
+                contact_shape,
+            } => {
+                let texture_id = self.texture_for(session, texture)?;
+                let alpha_mask = if matches!(contact_shape, ImageContactShape::Alpha { .. }) {
+                    let texture = textures
+                        .texture(texture_id)
+                        .ok_or(ProgramSceneError::InvalidTextureHandle(texture))?;
+                    Some(
+                        ImageAlphaMask::new(texture.width(), texture.height(), texture.alpha())
+                            .map_err(ProgramSceneError::Image)?,
+                    )
+                } else {
+                    None
+                };
+                NodeContent::Image(
+                    ImageNode::with_contact_shape(texture_id, opacity, contact_shape, alpha_mask)
+                        .map_err(ProgramSceneError::Image)?,
+                )
+            }
+            ContentInput::AnimatedImage {
+                image,
+                opacity,
+                contact_shape,
+            } => {
+                let image_id = self.animated_image_for(session, image)?;
+                let alpha_mask = if matches!(contact_shape, ImageContactShape::Alpha { .. }) {
+                    let image = self
+                        .animation_store
+                        .image(image_id)
+                        .ok_or(ProgramSceneError::InvalidAnimatedImageHandle(image))?;
+                    Some(
+                        ImageAlphaMask::new(
+                            image.width(),
+                            image.height(),
+                            image.current_frame().alpha(),
+                        )
+                        .map_err(ProgramSceneError::Image)?,
+                    )
+                } else {
+                    None
+                };
+                NodeContent::AnimatedImage(
+                    AnimatedImageNode::with_contact_shape(
+                        image_id,
+                        opacity,
+                        contact_shape,
+                        alpha_mask,
+                    )
                     .map_err(ProgramSceneError::Image)?,
-            ),
-            ContentInput::AnimatedImage { image, opacity } => NodeContent::AnimatedImage(
-                AnimatedImageNode::new(self.animated_image_for(session, image)?, opacity)
-                    .map_err(ProgramSceneError::Image)?,
-            ),
+                )
+            }
         })
     }
 
@@ -1771,6 +1994,11 @@ fn node_handle_for(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashSet,
+        time::{Duration, Instant},
+    };
+
     use image::{Delay, Frame, Rgba, RgbaImage, codecs::gif::GifEncoder};
 
     use super::*;
@@ -1812,6 +2040,7 @@ mod tests {
             z_index: 0,
             overlap_enabled: false,
             external_drop_enabled: false,
+            input_passthrough: false,
         }
     }
 
@@ -1824,6 +2053,7 @@ mod tests {
             z_index: 0,
             overlap_enabled: false,
             external_drop_enabled: false,
+            input_passthrough: false,
         }
     }
 
@@ -1831,6 +2061,23 @@ mod tests {
         let mut bytes = Vec::new();
         let mut encoder = GifEncoder::new(&mut bytes);
         for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+            encoder
+                .encode_frame(Frame::from_parts(
+                    RgbaImage::from_pixel(1, 1, Rgba(color)),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(40, 1),
+                ))
+                .unwrap();
+        }
+        drop(encoder);
+        bytes
+    }
+
+    fn transparent_then_opaque_gif() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = GifEncoder::new(&mut bytes);
+        for color in [[0, 0, 0, 0], [0, 0, 0, 255]] {
             encoder
                 .encode_frame(Frame::from_parts(
                     RgbaImage::from_pixel(1, 1, Rgba(color)),
@@ -2004,6 +2251,7 @@ mod tests {
                         z_index: 0,
                         overlap_enabled: true,
                         external_drop_enabled: false,
+                        input_passthrough: false,
                     },
                     content: ContentInput::Empty,
                 },
@@ -2103,6 +2351,7 @@ mod tests {
             z_index,
             overlap_enabled: false,
             external_drop_enabled,
+            input_passthrough: false,
         };
 
         resources
@@ -2175,6 +2424,309 @@ mod tests {
     }
 
     #[test]
+    fn alpha_contact_controls_overlap_and_external_drop_targeting() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let upload = |resources: &mut ProgramSceneResources,
+                      scene: &mut Scene,
+                      textures: &mut TextureStore,
+                      pixels| {
+            match resources
+                .execute(
+                    session,
+                    SceneCommand::UploadTexture {
+                        width: 2,
+                        height: 1,
+                        pixels,
+                    },
+                    scene,
+                    textures,
+                )
+                .unwrap()
+            {
+                SceneCommandResult::Texture(handle) => handle,
+                _ => unreachable!(),
+            }
+        };
+        let left_pixel = upload(
+            &mut resources,
+            &mut scene,
+            &mut textures,
+            vec![0, 0, 0, 255, 0, 0, 0, 0],
+        );
+        let right_pixel = upload(
+            &mut resources,
+            &mut scene,
+            &mut textures,
+            vec![0, 0, 0, 0, 0, 0, 0, 255],
+        );
+        let mut collider_properties = properties();
+        collider_properties.x = 0.0;
+        collider_properties.y = 0.0;
+        collider_properties.width = 2.0;
+        collider_properties.height = 1.0;
+        collider_properties.overlap_enabled = true;
+        let first = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: collider_properties,
+                    content: ContentInput::Image {
+                        texture: left_pixel,
+                        opacity: 1.0,
+                        contact_shape: ImageContactShape::alpha(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        let second = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: collider_properties,
+                    content: ContentInput::Image {
+                        texture: right_pixel,
+                        opacity: 1.0,
+                        contact_shape: ImageContactShape::alpha(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        assert!(resources.drain_overlap_events().is_empty());
+        assert_eq!(
+            resources
+                .execute(
+                    session,
+                    SceneCommand::QueryOverlaps { node: first },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            SceneCommandResult::Overlaps(vec![])
+        );
+
+        resources
+            .execute(
+                session,
+                SceneCommand::SetContent {
+                    node: second,
+                    content: ContentInput::Image {
+                        texture: left_pixel,
+                        opacity: 1.0,
+                        contact_shape: ImageContactShape::alpha(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(matches!(
+            resources.drain_overlap_events().as_slice(),
+            [SceneEvent::OverlapEnter { .. }]
+        ));
+
+        let mut back_properties = properties();
+        back_properties.x = 0.0;
+        back_properties.y = 10.0;
+        back_properties.width = 2.0;
+        back_properties.height = 1.0;
+        back_properties.external_drop_enabled = true;
+        let back = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: back_properties,
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        let mut front_properties = back_properties;
+        front_properties.z_index = 1;
+        let front = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties: front_properties,
+                    content: ContentInput::Image {
+                        texture: left_pixel,
+                        opacity: 1.0,
+                        contact_shape: ImageContactShape::alpha(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        let back_node = resources.node_for(session, back).unwrap();
+        let front_node = resources.node_for(session, front).unwrap();
+        assert_eq!(
+            resources
+                .external_drop_target_at(&scene, crate::scene::Point::new(1.5, 10.5).unwrap())
+                .unwrap(),
+            Some(back_node)
+        );
+        assert_eq!(
+            resources
+                .external_drop_target_at(&scene, crate::scene::Point::new(0.5, 10.5).unwrap())
+                .unwrap(),
+            Some(front_node)
+        );
+
+        resources
+            .execute(
+                session,
+                SceneCommand::UpdateNode {
+                    node: front,
+                    properties: NodePropertiesPatch {
+                        input_passthrough: Some(true),
+                        ..NodePropertiesPatch::default()
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert_eq!(
+            resources
+                .external_drop_target_at(&scene, crate::scene::Point::new(0.5, 10.5).unwrap())
+                .unwrap(),
+            Some(back_node)
+        );
+    }
+
+    #[test]
+    fn animated_alpha_contact_reconciles_when_the_current_gif_frame_changes() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(64);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let image = match resources
+            .execute(
+                session,
+                SceneCommand::UploadAnimatedImage {
+                    format: AnimatedImageFormat::Gif,
+                    bytes: transparent_then_opaque_gif(),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::AnimatedImage(handle) => handle,
+            _ => unreachable!(),
+        };
+        let mut properties = properties();
+        properties.x = 0.0;
+        properties.y = 0.0;
+        properties.width = 1.0;
+        properties.height = 1.0;
+        properties.overlap_enabled = true;
+        let collider = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties,
+                    content: ContentInput::Empty,
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        let animated = match resources
+            .execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer: SceneLayer::Overlay,
+                    properties,
+                    content: ContentInput::AnimatedImage {
+                        image,
+                        opacity: 1.0,
+                        contact_shape: ImageContactShape::alpha(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            SceneCommandResult::Node(handle) => handle,
+            _ => unreachable!(),
+        };
+        assert!(resources.drain_overlap_events().is_empty());
+
+        let animated_node = resources.node_for(session, animated).unwrap();
+        let image_id = match scene.node(animated_node).unwrap().content() {
+            NodeContent::AnimatedImage(image) => image.image(),
+            _ => unreachable!(),
+        };
+        let now = Instant::now();
+        let visible = HashSet::from([image_id]);
+        assert!(
+            !resources
+                .animated_images_mut()
+                .update_playback(now, &visible)
+        );
+        assert!(
+            resources
+                .animated_images_mut()
+                .update_playback(now + Duration::from_secs(1), &visible)
+        );
+        let changed = resources.sync_animated_alpha_contacts(&mut scene).unwrap();
+        assert_eq!(changed, vec![animated_node]);
+        resources
+            .reconcile_animated_alpha_contacts(&changed, &scene)
+            .unwrap();
+        assert!(matches!(
+            resources.drain_overlap_events().as_slice(),
+            [SceneEvent::OverlapEnter { .. }]
+        ));
+        assert_eq!(
+            resources
+                .execute(
+                    session,
+                    SceneCommand::QueryOverlaps { node: animated },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            SceneCommandResult::Overlaps(vec![collider])
+        );
+    }
+
+    #[test]
     fn owns_nodes_textures_and_cleans_up_a_closed_session() {
         let session = session();
         let mut resources = ProgramSceneResources::new(u32::MAX);
@@ -2205,6 +2757,7 @@ mod tests {
                     content: ContentInput::Image {
                         texture,
                         opacity: 1.0,
+                        contact_shape: ImageContactShape::Bounds,
                     },
                 },
                 &mut scene,
@@ -2267,6 +2820,7 @@ mod tests {
                     content: ContentInput::Image {
                         texture,
                         opacity: 1.0,
+                        contact_shape: ImageContactShape::Bounds,
                     },
                 },
                 &mut scene,
@@ -2314,6 +2868,7 @@ mod tests {
                     content: ContentInput::AnimatedImage {
                         image,
                         opacity: 1.0,
+                        contact_shape: ImageContactShape::Bounds,
                     },
                 },
                 &mut scene,
@@ -2383,6 +2938,7 @@ mod tests {
                     content: ContentInput::AnimatedImage {
                         image,
                         opacity: 1.0,
+                        contact_shape: ImageContactShape::Bounds,
                     },
                 },
                 &mut scene,
@@ -2556,6 +3112,7 @@ mod tests {
                     content: ContentInput::Image {
                         texture: TextureHandle::new(1),
                         opacity: 1.0,
+                        contact_shape: ImageContactShape::Bounds,
                     },
                 },
                 &mut scene,
@@ -2582,6 +3139,7 @@ mod tests {
             z_index: 0,
             overlap_enabled: true,
             external_drop_enabled: false,
+            input_passthrough: false,
         };
 
         let first = match resources
@@ -2681,6 +3239,7 @@ mod tests {
             z_index: 0,
             overlap_enabled,
             external_drop_enabled: false,
+            input_passthrough: false,
         };
 
         let source = match resources
@@ -2758,6 +3317,7 @@ mod tests {
             z_index: 0,
             overlap_enabled,
             external_drop_enabled: false,
+            input_passthrough: false,
         };
         let _stationary = resources
             .execute(
@@ -2837,6 +3397,7 @@ mod tests {
             z_index: 0,
             overlap_enabled: true,
             external_drop_enabled: false,
+            input_passthrough: false,
         };
         let first = match resources
             .execute(
@@ -2975,6 +3536,7 @@ mod tests {
                         visual: Some(NodeVisualInput::Image {
                             image,
                             opacity: 0.5,
+                            contact_shape: ImageContactShape::Bounds,
                         }),
                         ..NodeChanges::default()
                     },
@@ -3038,6 +3600,7 @@ mod tests {
                 z_index: 0,
                 overlap_enabled: true,
                 external_drop_enabled: false,
+                input_passthrough: false,
             },
         };
         let create = |resources: &mut ProgramSceneResources,

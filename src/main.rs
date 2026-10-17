@@ -695,9 +695,45 @@ impl WindowState {
                 visible_images.insert(image.image());
             }
         }
-        self.program_scene_resources
+        let advanced = self
+            .program_scene_resources
             .animated_images_mut()
-            .update_playback(now, &visible_images)
+            .update_playback(now, &visible_images);
+        if !advanced {
+            return false;
+        }
+
+        let changed_nodes = match self
+            .program_scene_resources
+            .sync_animated_alpha_contacts(&mut self.scene)
+        {
+            Ok(changed_nodes) => changed_nodes,
+            Err(error) => {
+                eprintln!("Chymeral: could not update animated alpha contact: {error}");
+                return true;
+            }
+        };
+        if changed_nodes.is_empty() {
+            return true;
+        }
+        if let Err(error) = self
+            .program_scene_resources
+            .reconcile_animated_alpha_contacts(&changed_nodes, &self.scene)
+        {
+            eprintln!("Chymeral: could not reconcile animated alpha contact: {error}");
+            return true;
+        }
+        for event in self.program_scene_resources.drain_overlap_events() {
+            self.enqueue_event(EngineEvent::Scene(event));
+        }
+        self.reconcile_scene_interaction();
+        let position = if self.external_drop_active {
+            self.external_drop_position
+        } else {
+            self.pointer_position
+        };
+        self.update_external_drop_target(position);
+        true
     }
 
     fn next_scene_animation_frame(&self) -> Option<Instant> {

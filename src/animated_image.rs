@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fmt::{Display, Formatter},
     io::Cursor,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -84,12 +85,17 @@ impl Error for AnimatedImageError {}
 #[derive(Clone, Debug)]
 pub struct AnimatedImageFrame {
     pixels: Vec<u8>,
+    alpha: Arc<[u8]>,
     duration: Duration,
 }
 
 impl AnimatedImageFrame {
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
+    }
+
+    pub(crate) fn alpha(&self) -> Arc<[u8]> {
+        Arc::clone(&self.alpha)
     }
 
     pub const fn duration(&self) -> Duration {
@@ -187,7 +193,12 @@ impl AnimatedImage {
                     limit: MAX_ANIMATED_IMAGE_BYTES,
                 });
             }
-            frames.push(AnimatedImageFrame { pixels, duration });
+            let alpha = pixels.iter().skip(3).step_by(4).copied().collect();
+            frames.push(AnimatedImageFrame {
+                pixels,
+                alpha,
+                duration,
+            });
         }
 
         if frames.is_empty() {

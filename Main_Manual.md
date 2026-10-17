@@ -225,7 +225,7 @@ intersection with its supported set:
 | `images` | Uploading and removing session-owned RGBA8 or GIF images. |
 | `input` | Resize, focused keyboard input, raw input subscriptions, terminal state subscriptions, and scene interaction. |
 | `timing` | Tick and frame subscriptions. |
-| `overlap` | Rectangle overlap state, queries, and transitions; also requires `scene` for commands. |
+| `overlap` | Opt-in scene contact state, queries, and transitions; also requires `scene` for commands. |
 | `external_drop` | Incoming desktop-file drops targeted to opt-in scene nodes. |
 | `text` | Creating and changing intrinsic scene-text nodes; also requires `scene`. |
 
@@ -275,6 +275,7 @@ clip_children
 z_index
 overlap_enabled
 external_drop_enabled
+input_passthrough
 ```
 
 Nodes use one of four kinds: `empty`, `rectangle`, `image`, or `text`.
@@ -304,6 +305,22 @@ Omit a field to preserve it. A parent change uses either
 and `image`; text nodes may change text or style but cannot become visual, and
 visual nodes cannot become text. Create a replacement node for a cross-family
 change.
+
+`image` contact defaults to the complete node rectangle. An image may instead
+select alpha contact with `{ "kind": "alpha", "threshold": N }` in its
+`contact_shape`, where `N` is an inclusive value from `1` through `255`.
+`{ "kind": "bounds" }` is the default. Alpha contact samples uploaded RGBA8
+source alpha or the current decoded GIF frame; alpha zero does not contact.
+The chosen shape applies consistently to pointer targeting, drag/drop targets,
+incoming external-file-drop targets, direct overlap queries, and overlap
+transitions.
+
+`input_passthrough` defaults to `false` for every node family. When true, a
+node still paints but is skipped for pointer-derived and external-drop target
+selection. Its children remain independently targetable, and the property does
+not alter visibility, paint order, focus already owned by the program, or
+overlap participation. It is intended for decorative or layered content above
+an interactive node.
 
 `upload_image` sends metadata followed by consecutive binary CLP frames. Its
 source is either `{ "kind": "rgba8", "width": W, "height": H }`, requiring
@@ -362,6 +379,8 @@ handle.
 
 An animated resource uses the same explicit rectangle, clipping, stacking,
 hit-testing, drag, overlap, and external-drop behavior as a static image node.
+When it uses alpha contact, Chymeral refreshes its interactive silhouette from
+the current decoded GIF frame and reconciles affected overlap transitions.
 It does not infer a rectangle from GIF dimensions and no client filesystem path
 is accepted. `remove_image` rejects an image that is still referenced by an
 owned node; removing those nodes or closing the session makes it releasable.
@@ -404,19 +423,20 @@ The application owns the response: it may move the dragged node, reject a drop,
 or ignore the event.
 
 Overlap is intentionally geometric rather than physical. Nodes with
-`overlap_enabled = true` use their world-space rectangles. Pointer location,
-visibility, content, clipping, and `z_index` do not affect overlap; invisible
-nodes can therefore serve as colliders. Touching only an edge is not an
-overlap. There is no cross-session collision state.
+`overlap_enabled = true` use their world-space rectangles by default; an image
+that explicitly selects alpha contact contributes only its source-alpha
+silhouette. Pointer location, visibility, clipping, and `z_index` do not alter
+overlap participation, so invisible nodes can serve as colliders. Touching
+only an edge is not an overlap. There is no cross-session collision state.
 
 `OverlapEnter` and `OverlapLeave` occur on a state transition. A program can
 call `is_overlapping` for the direct boolean state or `get_overlaps` for its
 current same-session contacts in deterministic order. The queried node itself
 does not need to have overlap enabled. This supports keyboard-driven games and
-layout rules without imposing physics. Image alpha silhouettes, collision
-response, non-rectangular shapes, native gamepads, and multitouch are outside
-the current contract. Incoming external file drop uses the `external_drop`
-capability; outgoing desktop drag-and-drop is not implemented.
+layout rules without imposing physics. Alpha image silhouettes are supported;
+collision response, arbitrary vector shapes, native gamepads, and multitouch
+remain outside the current contract. Incoming external file drop uses the
+`external_drop` capability; outgoing desktop drag-and-drop is not implemented.
 
 ## 8. Timing and delivery pressure
 
@@ -477,11 +497,12 @@ fn main() -> chymeral_rust_sdk::Result<()> {
 }
 ```
 
-The `0.2.0` development SDK exposes typed CLP v2.0 capabilities, session and
+The stable `1.0.0` SDK exposes typed CLP v2.0 capabilities, session and
 opaque-handle types, nodes, atomic node changes, unified images, subscriptions,
-notifications, close reasons, and client errors. `clp_conformance` exercises
-lifecycle, timing, images, text, scene mutation, and overlap against a live
-Chymeral endpoint, including both RGBA8 and GIF image uploads.
+notifications, close reasons, client errors, alpha image contact, and generic
+node input passthrough. `clp_conformance` exercises lifecycle, timing, images,
+text, scene mutation, and overlap against a live Chymeral endpoint, including
+both RGBA8 and GIF image uploads.
 
 CLP itself remains language-neutral. Other language SDKs or direct protocol
 clients have equal architectural status when they conform to the negotiated
@@ -499,6 +520,17 @@ cargo run --example clp_conformance
 
 The conformance client must return successfully to the same terminal without
 closing the surrounding Chymeral terminal.
+
+To validate alpha image contact and node passthrough interactively, run the
+same SDK executable with `cargo run --example clp_conformance -- --manual`.
+It shows a blue target, an orange alpha-frame image, a pink GIF tile that
+alternates between opaque and transparent, and a visible white band with
+`input_passthrough`. The terminal identifies each directed scene event and the
+GIF's overlap transitions: the orange rim must target the image; its transparent
+center and the white band must target the blue node; the pink tile must target
+only while visible. Where `external_drop` is granted, dropping a desktop file
+on those regions follows the same routing. Click a scene node and press `q` to
+close only the client session.
 
 ## 11. Boundaries and next steps
 

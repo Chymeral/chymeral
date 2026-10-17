@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt::{Display, Formatter},
+    sync::Arc,
 };
 
 use crate::{animated_image::AnimatedImageId, resources::TextureId, scene_text::TextNode};
@@ -182,6 +183,7 @@ pub struct NodeProperties {
     pub z_index: i32,
     pub overlap_enabled: bool,
     pub external_drop_enabled: bool,
+    pub input_passthrough: bool,
 }
 
 impl Default for NodeProperties {
@@ -194,20 +196,160 @@ impl Default for NodeProperties {
             z_index: 0,
             overlap_enabled: false,
             external_drop_enabled: false,
+            input_passthrough: false,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageContactShape {
+    #[default]
+    Bounds,
+    Alpha {
+        threshold: u8,
+    },
+}
+
+impl ImageContactShape {
+    pub const fn alpha() -> Self {
+        Self::Alpha { threshold: 1 }
+    }
+
+    const fn threshold(self) -> Option<u8> {
+        match self {
+            Self::Bounds => None,
+            Self::Alpha { threshold } => Some(threshold),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImageAlphaMask {
+    width: u32,
+    height: u32,
+    alpha: Arc<[u8]>,
+}
+
+impl ImageAlphaMask {
+    pub(crate) fn new(width: u32, height: u32, alpha: Arc<[u8]>) -> Result<Self, ImageNodeError> {
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or(ImageNodeError::InvalidAlphaMask)?;
+        if expected == 0 || alpha.len() != expected {
+            return Err(ImageNodeError::InvalidAlphaMask);
+        }
+        Ok(Self {
+            width,
+            height,
+            alpha,
+        })
+    }
+
+    fn contains(&self, bounds: Rect, point: Point, threshold: u8) -> bool {
+        if !bounds.contains(point) {
+            return false;
+        }
+        let x = ((point.x() - bounds.x()) * f64::from(self.width) / bounds.width()).floor();
+        let y = ((point.y() - bounds.y()) * f64::from(self.height) / bounds.height()).floor();
+        let x = x.clamp(0.0, f64::from(self.width.saturating_sub(1))) as usize;
+        let y = y.clamp(0.0, f64::from(self.height.saturating_sub(1))) as usize;
+        self.alpha[y * self.width as usize + x] >= threshold
+    }
+
+    fn intersects_rect(&self, bounds: Rect, area: Rect, threshold: u8) -> bool {
+        let Some(area) = bounds.intersection(area) else {
+            return false;
+        };
+        let Some((start_x, end_x, start_y, end_y)) = self.pixel_range(bounds, area) else {
+            return false;
+        };
+        for y in start_y..end_y {
+            let row = y * self.width as usize;
+            if self.alpha[row + start_x..row + end_x]
+                .iter()
+                .any(|alpha| *alpha >= threshold)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn pixel_range(&self, bounds: Rect, area: Rect) -> Option<(usize, usize, usize, usize)> {
+        let area = bounds.intersection(area)?;
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let start_x = ((area.x() - bounds.x()) * f64::from(self.width) / bounds.width())
+            .floor()
+            .clamp(0.0, self.width as f64) as usize;
+        let end_x = ((area.right() - bounds.x()) * f64::from(self.width) / bounds.width())
+            .ceil()
+            .clamp(0.0, self.width as f64) as usize;
+        let start_y = ((area.y() - bounds.y()) * f64::from(self.height) / bounds.height())
+            .floor()
+            .clamp(0.0, self.height as f64) as usize;
+        let end_y = ((area.bottom() - bounds.y()) * f64::from(self.height) / bounds.height())
+            .ceil()
+            .clamp(0.0, self.height as f64) as usize;
+        (start_x < end_x && end_x <= width && start_y < end_y && end_y <= height)
+            .then_some((start_x, end_x, start_y, end_y))
+    }
+
+    fn pixel_count_in(&self, bounds: Rect, area: Rect) -> usize {
+        self.pixel_range(bounds, area)
+            .map(|(start_x, end_x, start_y, end_y)| {
+                (end_x - start_x).saturating_mul(end_y - start_y)
+            })
+            .unwrap_or_default()
+    }
+
+    fn opaque_pixels_in(
+        &self,
+        bounds: Rect,
+        area: Rect,
+        threshold: u8,
+    ) -> impl Iterator<Item = Rect> + '_ {
+        let range = self.pixel_range(bounds, area);
+        let width = self.width as usize;
+        range
+            .into_iter()
+            .flat_map(move |(start_x, end_x, start_y, end_y)| {
+                (start_y..end_y).flat_map(move |y| {
+                    (start_x..end_x)
+                        .filter(move |x| self.alpha[y * width + *x] >= threshold)
+                        .map(move |x| {
+                            Rect::new(
+                                bounds.x() + x as f64 * bounds.width() / f64::from(self.width),
+                                bounds.y() + y as f64 * bounds.height() / f64::from(self.height),
+                                bounds.width() / f64::from(self.width),
+                                bounds.height() / f64::from(self.height),
+                            )
+                            .expect("image alpha cells retain finite non-negative geometry")
+                        })
+                })
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ImageNode {
     texture: TextureId,
     opacity: f32,
+    contact_shape: ImageContactShape,
+    alpha_mask: Option<ImageAlphaMask>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AnimatedImageNode {
     image: AnimatedImageId,
     opacity: f32,
+    contact_shape: ImageContactShape,
+    alpha_mask: Option<ImageAlphaMask>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,41 +369,145 @@ impl SolidNode {
 
 impl ImageNode {
     pub fn new(texture: TextureId, opacity: f32) -> Result<Self, ImageNodeError> {
+        Self::with_contact_shape(texture, opacity, ImageContactShape::Bounds, None)
+    }
+
+    pub(crate) fn with_contact_shape(
+        texture: TextureId,
+        opacity: f32,
+        contact_shape: ImageContactShape,
+        alpha_mask: Option<ImageAlphaMask>,
+    ) -> Result<Self, ImageNodeError> {
         if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
             return Err(ImageNodeError::InvalidOpacity);
         }
-        Ok(Self { texture, opacity })
+        validate_contact_shape(contact_shape, alpha_mask.as_ref())?;
+        Ok(Self {
+            texture,
+            opacity,
+            contact_shape,
+            alpha_mask,
+        })
     }
 
-    pub const fn texture(self) -> TextureId {
+    pub const fn texture(&self) -> TextureId {
         self.texture
     }
 
-    pub const fn opacity(self) -> f32 {
+    pub const fn opacity(&self) -> f32 {
         self.opacity
+    }
+
+    pub const fn contact_shape(&self) -> ImageContactShape {
+        self.contact_shape
+    }
+
+    fn contains(&self, bounds: Rect, point: Point) -> bool {
+        match (self.contact_shape.threshold(), self.alpha_mask.as_ref()) {
+            (Some(threshold), Some(alpha_mask)) => alpha_mask.contains(bounds, point, threshold),
+            (Some(_), None) => false,
+            (None, _) => bounds.contains(point),
+        }
+    }
+
+    fn intersects_rect(&self, bounds: Rect, area: Rect) -> bool {
+        match (self.contact_shape.threshold(), self.alpha_mask.as_ref()) {
+            (Some(threshold), Some(alpha_mask)) => {
+                alpha_mask.intersects_rect(bounds, area, threshold)
+            }
+            (Some(_), None) => false,
+            (None, _) => bounds.intersects(area),
+        }
     }
 }
 
 impl AnimatedImageNode {
     pub fn new(image: AnimatedImageId, opacity: f32) -> Result<Self, ImageNodeError> {
+        Self::with_contact_shape(image, opacity, ImageContactShape::Bounds, None)
+    }
+
+    pub(crate) fn with_contact_shape(
+        image: AnimatedImageId,
+        opacity: f32,
+        contact_shape: ImageContactShape,
+        alpha_mask: Option<ImageAlphaMask>,
+    ) -> Result<Self, ImageNodeError> {
         if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
             return Err(ImageNodeError::InvalidOpacity);
         }
-        Ok(Self { image, opacity })
+        validate_contact_shape(contact_shape, alpha_mask.as_ref())?;
+        Ok(Self {
+            image,
+            opacity,
+            contact_shape,
+            alpha_mask,
+        })
     }
 
-    pub const fn image(self) -> AnimatedImageId {
+    pub const fn image(&self) -> AnimatedImageId {
         self.image
     }
 
-    pub const fn opacity(self) -> f32 {
+    pub const fn opacity(&self) -> f32 {
         self.opacity
+    }
+
+    pub const fn contact_shape(&self) -> ImageContactShape {
+        self.contact_shape
+    }
+
+    pub(crate) fn with_alpha_mask(&self, alpha_mask: ImageAlphaMask) -> Self {
+        Self {
+            image: self.image,
+            opacity: self.opacity,
+            contact_shape: self.contact_shape,
+            alpha_mask: Some(alpha_mask),
+        }
+    }
+
+    pub(crate) fn alpha_mask(&self) -> Option<&ImageAlphaMask> {
+        self.alpha_mask.as_ref()
+    }
+
+    fn contains(&self, bounds: Rect, point: Point) -> bool {
+        match (self.contact_shape.threshold(), self.alpha_mask.as_ref()) {
+            (Some(threshold), Some(alpha_mask)) => alpha_mask.contains(bounds, point, threshold),
+            (Some(_), None) => false,
+            (None, _) => bounds.contains(point),
+        }
+    }
+
+    fn intersects_rect(&self, bounds: Rect, area: Rect) -> bool {
+        match (self.contact_shape.threshold(), self.alpha_mask.as_ref()) {
+            (Some(threshold), Some(alpha_mask)) => {
+                alpha_mask.intersects_rect(bounds, area, threshold)
+            }
+            (Some(_), None) => false,
+            (None, _) => bounds.intersects(area),
+        }
+    }
+}
+
+fn validate_contact_shape(
+    contact_shape: ImageContactShape,
+    alpha_mask: Option<&ImageAlphaMask>,
+) -> Result<(), ImageNodeError> {
+    match contact_shape {
+        ImageContactShape::Bounds => Ok(()),
+        ImageContactShape::Alpha { threshold: 0 } => Err(ImageNodeError::InvalidAlphaThreshold),
+        ImageContactShape::Alpha { .. } if alpha_mask.is_none() => {
+            Err(ImageNodeError::MissingAlphaMask)
+        }
+        ImageContactShape::Alpha { .. } => Ok(()),
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageNodeError {
     InvalidOpacity,
+    InvalidAlphaThreshold,
+    MissingAlphaMask,
+    InvalidAlphaMask,
 }
 
 impl Display for ImageNodeError {
@@ -269,6 +515,15 @@ impl Display for ImageNodeError {
         match self {
             Self::InvalidOpacity => {
                 formatter.write_str("image opacity must be between 0.0 and 1.0")
+            }
+            Self::InvalidAlphaThreshold => {
+                formatter.write_str("image alpha contact threshold must be between 1 and 255")
+            }
+            Self::MissingAlphaMask => {
+                formatter.write_str("image alpha contact requires source alpha data")
+            }
+            Self::InvalidAlphaMask => {
+                formatter.write_str("image alpha data does not match its source dimensions")
             }
         }
     }
@@ -284,6 +539,68 @@ pub enum NodeContent {
     Image(ImageNode),
     AnimatedImage(AnimatedImageNode),
     Text(TextNode),
+}
+
+impl NodeContent {
+    fn contains(&self, bounds: Rect, point: Point) -> bool {
+        match self {
+            Self::Image(image) => image.contains(bounds, point),
+            Self::AnimatedImage(image) => image.contains(bounds, point),
+            Self::Empty | Self::Solid(_) | Self::Text(_) => bounds.contains(point),
+        }
+    }
+
+    fn intersects_rect(&self, bounds: Rect, area: Rect) -> bool {
+        match self {
+            Self::Image(image) => image.intersects_rect(bounds, area),
+            Self::AnimatedImage(image) => image.intersects_rect(bounds, area),
+            Self::Empty | Self::Solid(_) | Self::Text(_) => bounds.intersects(area),
+        }
+    }
+
+    fn alpha_mask_pixel_count_in(&self, bounds: Rect, area: Rect) -> Option<usize> {
+        match self {
+            Self::Image(ImageNode {
+                contact_shape: ImageContactShape::Alpha { .. },
+                alpha_mask: Some(mask),
+                ..
+            })
+            | Self::AnimatedImage(AnimatedImageNode {
+                contact_shape: ImageContactShape::Alpha { .. },
+                alpha_mask: Some(mask),
+                ..
+            }) => Some(mask.pixel_count_in(bounds, area)),
+            Self::Empty
+            | Self::Solid(_)
+            | Self::Image(_)
+            | Self::AnimatedImage(_)
+            | Self::Text(_) => None,
+        }
+    }
+
+    fn opaque_pixels_in(
+        &self,
+        bounds: Rect,
+        area: Rect,
+    ) -> Option<impl Iterator<Item = Rect> + '_> {
+        match self {
+            Self::Image(ImageNode {
+                contact_shape: ImageContactShape::Alpha { threshold },
+                alpha_mask: Some(mask),
+                ..
+            })
+            | Self::AnimatedImage(AnimatedImageNode {
+                contact_shape: ImageContactShape::Alpha { threshold },
+                alpha_mask: Some(mask),
+                ..
+            }) => Some(mask.opaque_pixels_in(bounds, area, *threshold)),
+            Self::Empty
+            | Self::Solid(_)
+            | Self::Image(_)
+            | Self::AnimatedImage(_)
+            | Self::Text(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -519,11 +836,65 @@ impl Scene {
         Ok(clip)
     }
 
+    pub fn node_contains_point(&self, node: NodeId, point: Point) -> Result<bool, SceneError> {
+        let node_ref = self.require_node(node)?;
+        Ok(node_ref.content.contains(self.world_bounds(node)?, point))
+    }
+
+    pub fn nodes_overlap(&self, first: NodeId, second: NodeId) -> Result<bool, SceneError> {
+        let first_node = self.require_node(first)?;
+        let second_node = self.require_node(second)?;
+        let first_bounds = self.world_bounds(first)?;
+        let second_bounds = self.world_bounds(second)?;
+        let Some(intersection) = first_bounds.intersection(second_bounds) else {
+            return Ok(false);
+        };
+
+        let first_pixel_count = first_node
+            .content
+            .alpha_mask_pixel_count_in(first_bounds, intersection);
+        let second_pixel_count = second_node
+            .content
+            .alpha_mask_pixel_count_in(second_bounds, intersection);
+        let overlaps = match (first_pixel_count, second_pixel_count) {
+            (None, None) => true,
+            (Some(_), None) => first_node
+                .content
+                .opaque_pixels_in(first_bounds, intersection)
+                .is_some_and(|mut pixels| {
+                    pixels.any(|pixel| second_node.content.intersects_rect(second_bounds, pixel))
+                }),
+            (None, Some(_)) => second_node
+                .content
+                .opaque_pixels_in(second_bounds, intersection)
+                .is_some_and(|mut pixels| {
+                    pixels.any(|pixel| first_node.content.intersects_rect(first_bounds, pixel))
+                }),
+            (Some(first_count), Some(second_count)) if first_count <= second_count => first_node
+                .content
+                .opaque_pixels_in(first_bounds, intersection)
+                .is_some_and(|mut pixels| {
+                    pixels.any(|pixel| second_node.content.intersects_rect(second_bounds, pixel))
+                }),
+            (Some(_), Some(_)) => second_node
+                .content
+                .opaque_pixels_in(second_bounds, intersection)
+                .is_some_and(|mut pixels| {
+                    pixels.any(|pixel| first_node.content.intersects_rect(first_bounds, pixel))
+                }),
+        };
+        Ok(overlaps)
+    }
+
     pub fn hit_test(&self, point: Point) -> Result<Option<NodeId>, SceneError> {
         for node in self.paint_order().into_iter().rev() {
+            if self.require_node(node)?.properties.input_passthrough {
+                continue;
+            }
             if self
                 .visible_bounds(node)?
                 .is_some_and(|bounds| bounds.contains(point))
+                && self.node_contains_point(node, point)?
             {
                 return Ok(Some(node));
             }
@@ -541,9 +912,13 @@ impl Scene {
             if self.is_descendant_of(node, excluded) {
                 continue;
             }
+            if self.require_node(node)?.properties.input_passthrough {
+                continue;
+            }
             if self
                 .visible_bounds(node)?
                 .is_some_and(|bounds| bounds.contains(point))
+                && self.node_contains_point(node, point)?
             {
                 return Ok(Some(node));
             }
@@ -835,6 +1210,7 @@ mod tests {
             z_index: 7,
             overlap_enabled: false,
             external_drop_enabled: false,
+            input_passthrough: false,
         };
 
         scene.set_properties(node, properties).unwrap();
@@ -852,7 +1228,9 @@ mod tests {
             textures.insert(crate::resources::Texture::from_rgba8(1, 1, vec![0, 0, 0, 0]).unwrap());
         let image = ImageNode::new(texture, 0.5).unwrap();
 
-        scene.set_content(node, NodeContent::Image(image)).unwrap();
+        scene
+            .set_content(node, NodeContent::Image(image.clone()))
+            .unwrap();
 
         assert_eq!(
             scene.node(node).unwrap().content(),
@@ -920,6 +1298,147 @@ mod tests {
             scene.hit_test(Point::new(100.0, 100.0).unwrap()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn image_alpha_contact_and_passthrough_share_pointer_targeting() {
+        let mut scene = Scene::new();
+        let bounds = Rect::new(0.0, 0.0, 4.0, 4.0).unwrap();
+        let back = scene.create_root(NodeProperties {
+            bounds,
+            ..NodeProperties::default()
+        });
+        let mut textures = crate::resources::TextureStore::new();
+        let texture = textures.insert(
+            crate::resources::Texture::from_rgba8(
+                2,
+                2,
+                vec![0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 0],
+            )
+            .unwrap(),
+        );
+        let mask = ImageAlphaMask::new(2, 2, textures.texture(texture).unwrap().alpha()).unwrap();
+        let front = scene.create_root(NodeProperties {
+            bounds,
+            z_index: 1,
+            ..NodeProperties::default()
+        });
+        scene
+            .set_content(
+                front,
+                NodeContent::Image(
+                    ImageNode::with_contact_shape(
+                        texture,
+                        1.0,
+                        ImageContactShape::alpha(),
+                        Some(mask),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            scene.hit_test(Point::new(0.5, 0.5).unwrap()).unwrap(),
+            Some(back)
+        );
+        assert_eq!(
+            scene.hit_test(Point::new(2.5, 0.5).unwrap()).unwrap(),
+            Some(front)
+        );
+
+        let mut properties = scene.node(front).unwrap().properties();
+        properties.input_passthrough = true;
+        scene.set_properties(front, properties).unwrap();
+        assert_eq!(
+            scene.hit_test(Point::new(2.5, 0.5).unwrap()).unwrap(),
+            Some(back)
+        );
+
+        let child = scene
+            .create_child(
+                front,
+                NodeProperties {
+                    bounds: Rect::new(0.0, 0.0, 2.0, 2.0).unwrap(),
+                    ..NodeProperties::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            scene.hit_test(Point::new(0.5, 0.5).unwrap()).unwrap(),
+            Some(child)
+        );
+    }
+
+    #[test]
+    fn image_alpha_contact_controls_overlap_without_changing_bounds() {
+        let mut scene = Scene::new();
+        let bounds = Rect::new(0.0, 0.0, 2.0, 2.0).unwrap();
+        let mut textures = crate::resources::TextureStore::new();
+        let first_texture = textures.insert(
+            crate::resources::Texture::from_rgba8(
+                2,
+                2,
+                vec![0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .unwrap(),
+        );
+        let second_texture = textures.insert(
+            crate::resources::Texture::from_rgba8(
+                2,
+                2,
+                vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255],
+            )
+            .unwrap(),
+        );
+        let first = scene.create_root(NodeProperties {
+            bounds,
+            ..NodeProperties::default()
+        });
+        let second = scene.create_root(NodeProperties {
+            bounds,
+            ..NodeProperties::default()
+        });
+        let first_mask =
+            ImageAlphaMask::new(2, 2, textures.texture(first_texture).unwrap().alpha()).unwrap();
+        let second_mask =
+            ImageAlphaMask::new(2, 2, textures.texture(second_texture).unwrap().alpha()).unwrap();
+        scene
+            .set_content(
+                first,
+                NodeContent::Image(
+                    ImageNode::with_contact_shape(
+                        first_texture,
+                        1.0,
+                        ImageContactShape::alpha(),
+                        Some(first_mask),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        scene
+            .set_content(
+                second,
+                NodeContent::Image(
+                    ImageNode::with_contact_shape(
+                        second_texture,
+                        1.0,
+                        ImageContactShape::alpha(),
+                        Some(second_mask),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+
+        assert!(
+            scene
+                .world_bounds(first)
+                .unwrap()
+                .intersects(scene.world_bounds(second).unwrap())
+        );
+        assert!(!scene.nodes_overlap(first, second).unwrap());
     }
 
     #[test]

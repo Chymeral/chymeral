@@ -7,9 +7,10 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M19 are complete; M20 is the next planned phase.
-- CLP v2.0 is the current public protocol contract.
-- `chymeral-rust-sdk` 0.2.0 is the reference Rust implementation for CLP v2.0.
+- M1–M20 are complete; M21 is the next planned phase.
+- CLP v2.0 is frozen and accepted for its first public release preparation.
+- `chymeral-rust-sdk` `1.0.0` is the accepted stable reference API; its release
+  tag and any later package publication belong to M21.
 - No phase below has started unless its status explicitly says otherwise.
 
 ## How to maintain this record
@@ -886,11 +887,11 @@ The stable v2 command-error vocabulary is `unsupported_version`,
   work.
   **Rationale:** The core keeps its automated unit and integration tests while
   the Rust SDK retains its protocol-conformance program. A future
-  language-neutral fixture or IDL belongs to M21 rather than to the
+  language-neutral fixture or IDL belongs to M22 rather than to the
   distributable host repository.
   **Consequences:** The SDK no longer dispatches a cross-repository job against
   a core example. Host/SDK compatibility is recorded by the completed Linux
-  and Windows conformance validation until M21 establishes its successor.
+  and Windows conformance validation until M22 establishes its successor.
   **Validation:** No operational core documentation or SDK workflow references
   the retired executable examples.
 
@@ -920,10 +921,102 @@ The stable v2 command-error vocabulary is `unsupported_version`,
   the v2 implementation; a clean native rebuild produced the validated host.
 - M16–M18 drag, text, animated-image, and external-drop behavior retain their
   prior Linux and Windows manual validation records. The SDK workflow provides
-  a Rust 1.85/stable Linux/Windows quality matrix plus a manually dispatched
-  cross-repository conformance job that takes a pinned core commit SHA.
+  a Rust 1.85/stable Linux/Windows quality matrix.
 
-## M20 — Public Release Preparation
+## M20 — Interaction Fidelity and Stable Rust SDK
+
+**Status:** Complete
+
+### Scope
+
+- Add an optional alpha-derived contact shape to image nodes for pointer
+  routing, external-drop targeting, overlap queries, and overlap transitions.
+- Add generic node-level input passthrough so a visible node can paint above a
+  control without intercepting its pointer-derived interaction.
+- Preserve current rectangle-based contact and interactive behavior as the
+  defaults for all existing v2.0 nodes.
+- Validate static RGBA8 and animated GIF alpha contact on Linux and Windows.
+- Promote `chymeral-rust-sdk` from the pre-release `0.2.0` API to its first
+  stable `1.0.0` API after protocol, conformance, and desktop validation pass.
+
+### Exclusions
+
+- Arbitrary vector, polygon, physics, or 3D collision shapes.
+- Alpha-derived shapes for rectangle, empty, or text nodes.
+- Input passthrough that automatically suppresses a node's descendants.
+- Package distribution and installer work; that follows in M21.
+
+### Frozen technical decisions
+
+- Alpha contact is an opt-in image-node property. It samples the source alpha
+  of RGBA8 images or the current decoded GIF frame after a rectangle broad
+  phase; it does not read pixels back from the GPU.
+- The alpha threshold defaults to `1`: alpha `0` passes through and every
+  visible alpha value participates. Clients may choose a threshold from
+  `1` through `255`.
+- Alpha contact affects pointer hover, press/release, click, drag/drop targets,
+  external-drop targets, `is_overlapping`, `get_overlaps`, and overlap
+  enter/leave transitions.
+- `input_passthrough` is an opt-in property of every node family. It excludes
+  only that node from pointer-derived targeting; its descendants retain their
+  own independent interaction behavior and overlap participation is unchanged.
+- These additions remain part of **CLP v2.0**. They are completed before the
+  first public v2.0 release, so no `2.1` protocol revision or compatibility
+  period is introduced.
+- The Rust SDK's first public stable release is `1.0.0` after M20 acceptance.
+
+### Acceptance criteria
+
+- Default nodes preserve current rectangular interaction and overlap behavior.
+- Alpha images route events and external drops through fully transparent pixels
+  to the next eligible scene node or terminal surface.
+- Alpha overlap produces deterministic query and transition results for static
+  RGBA8 images and changing GIF frames, without unbounded per-frame work.
+- `input_passthrough` works for every node family, preserves paint order, and
+  leaves eligible descendants interactive.
+- Core tests cover geometry, clipping, layering, GIF frame changes, ownership,
+  cleanup, and interaction routing; Linux and Windows manual validation pass.
+- The Rust SDK exposes the finalized features, passes its quality matrix and
+  conformance program, and is ready to be tagged as `1.0.0`.
+
+### Accepted decisions
+
+- **Date:** 2026-10-17
+  **Decision:** Complete alpha-derived image contact and generic node input
+  passthrough before distribution work, without changing the CLP v2.0 version.
+  **Context:** These capabilities belong to the already-agreed retained 2D
+  scene model and were deferred during earlier feature milestones. No public
+  v2.0 SDK or protocol release exists yet.
+  **Rationale:** Alpha contact makes transparent sprites and images spatially
+  truthful; passthrough permits decorative or layered presentation without
+  duplicating the behavior of the interactive node beneath it.
+  **Consequences:** M21 receives a finalized v2.0 contract and the Rust SDK can
+  make its first stable `1.0.0` commitment after M20 validation.
+  **Validation:** Automated conformance plus manual Linux and Windows scene
+  tests must cover both features together and independently.
+
+### Validation record
+
+- **Automated core validation (Linux, 2026-10-17):** `cargo fmt --check`,
+  `cargo test --all-targets -- --test-threads=1`,
+  `cargo clippy --all-targets -- -D warnings`, and `cargo build --release`
+  passed. Coverage includes static alpha hit testing and overlap, passthrough
+  routing, alpha-aware external-drop targeting, wire conversion, and GIF frame
+  contact reconciliation.
+- **Automated SDK validation (Linux, 2026-10-17):** `cargo fmt --check`,
+  `cargo test --all-targets -- --test-threads=1`,
+  `cargo clippy --all-targets -- -D warnings`, and
+  `cargo build --release --example clp_conformance` passed for
+  `chymeral-rust-sdk` `1.0.0`.
+- **Manual Linux acceptance (2026-10-17):** The user confirmed the M20 scene
+  on the Fedora host: static alpha-frame versus transparent-center routing,
+  visible passthrough routing, and GIF alpha-frame changes all worked. Native
+  Wayland correctly withheld the pre-existing incoming external-drop capability.
+- **Manual Windows acceptance (2026-10-17):** The user confirmed the same M20
+  scene in the graphical VM after native core and SDK builds. Static alpha,
+  passthrough, animated alpha contact, and session-only closure all worked.
+
+## M21 — Public Release Preparation
 
 **Status:** Planned
 
@@ -962,7 +1055,7 @@ _None yet._
 
 _Not started._
 
-## M21 — Language-Neutral SDK Ecosystem
+## M22 — Language-Neutral SDK Ecosystem
 
 **Status:** Deferred
 
@@ -974,4 +1067,4 @@ _Not started._
 
 ### Prerequisite
 
-M19 must be complete and the v2.0 protocol contract must be stable.
+M20 must be complete and the v2.0 protocol contract must be stable.

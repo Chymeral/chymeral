@@ -36,7 +36,7 @@ use crate::{
         NodeVisualInput, TextNodePropertiesInput,
     },
     resources::rgba8_byte_len,
-    scene::{NodeId, SceneLayer},
+    scene::{ImageContactShape, NodeId, SceneLayer},
     scene_text::{TextAlign, TextMetrics, TextStyle, TextWeight},
 };
 
@@ -2312,6 +2312,8 @@ struct WireNodeProperties {
     overlap_enabled: bool,
     #[serde(default)]
     external_drop_enabled: bool,
+    #[serde(default)]
+    input_passthrough: bool,
 }
 
 const fn default_visible() -> bool {
@@ -2330,6 +2332,7 @@ impl WireNodeProperties {
             z_index: self.z_index,
             overlap_enabled: self.overlap_enabled,
             external_drop_enabled: self.external_drop_enabled,
+            input_passthrough: self.input_passthrough,
         }
     }
 }
@@ -2345,6 +2348,7 @@ struct WireNodePropertiesPatch {
     z_index: Option<i32>,
     overlap_enabled: Option<bool>,
     external_drop_enabled: Option<bool>,
+    input_passthrough: Option<bool>,
 }
 
 impl WireNodePropertiesPatch {
@@ -2359,6 +2363,7 @@ impl WireNodePropertiesPatch {
             z_index: self.z_index,
             overlap_enabled: self.overlap_enabled,
             external_drop_enabled: self.external_drop_enabled,
+            input_passthrough: self.input_passthrough,
         }
     }
 }
@@ -2377,6 +2382,8 @@ struct WireTextNodeProperties {
     overlap_enabled: bool,
     #[serde(default)]
     external_drop_enabled: bool,
+    #[serde(default)]
+    input_passthrough: bool,
 }
 
 impl WireTextNodeProperties {
@@ -2389,6 +2396,7 @@ impl WireTextNodeProperties {
             z_index: self.z_index,
             overlap_enabled: self.overlap_enabled,
             external_drop_enabled: self.external_drop_enabled,
+            input_passthrough: self.input_passthrough,
         }
     }
 }
@@ -2458,6 +2466,25 @@ impl WireTextAlign {
     }
 }
 
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireImageContactShape {
+    #[default]
+    Bounds,
+    Alpha {
+        threshold: u8,
+    },
+}
+
+impl WireImageContactShape {
+    const fn into_scene(self) -> ImageContactShape {
+        match self {
+            Self::Bounds => ImageContactShape::Bounds,
+            Self::Alpha { threshold } => ImageContactShape::Alpha { threshold },
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireNodeInput {
@@ -2472,6 +2499,8 @@ enum WireNodeInput {
         properties: WireNodeProperties,
         image: String,
         opacity: f32,
+        #[serde(default)]
+        contact_shape: WireImageContactShape,
     },
     Text {
         properties: WireTextNodeProperties,
@@ -2495,10 +2524,12 @@ impl WireNodeInput {
                 properties,
                 image,
                 opacity,
+                contact_shape,
             } => Ok(NodeInput::Image {
                 properties: properties.into_input(),
                 image: parse_image_handle(&image)?,
                 opacity,
+                contact_shape: contact_shape.into_scene(),
             }),
             Self::Text {
                 properties,
@@ -2543,8 +2574,15 @@ impl WireNodeInput {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireNodeVisual {
     Empty,
-    Rectangle { color: [u8; 4] },
-    Image { image: String, opacity: f32 },
+    Rectangle {
+        color: [u8; 4],
+    },
+    Image {
+        image: String,
+        opacity: f32,
+        #[serde(default)]
+        contact_shape: WireImageContactShape,
+    },
 }
 
 impl WireNodeVisual {
@@ -2552,9 +2590,14 @@ impl WireNodeVisual {
         match self {
             Self::Empty => Ok(NodeVisualInput::Empty),
             Self::Rectangle { color } => Ok(NodeVisualInput::Rectangle { color }),
-            Self::Image { image, opacity } => Ok(NodeVisualInput::Image {
+            Self::Image {
+                image,
+                opacity,
+                contact_shape,
+            } => Ok(NodeVisualInput::Image {
                 image: parse_image_handle(&image)?,
                 opacity,
+                contact_shape: contact_shape.into_scene(),
             }),
         }
     }
@@ -4513,6 +4556,7 @@ mod tests {
                             z_index: 0,
                             overlap_enabled: false,
                             external_drop_enabled: true,
+                            input_passthrough: false,
                         },
                     },
                 }),
@@ -4800,6 +4844,7 @@ mod tests {
                             z_index: 0,
                             overlap_enabled: false,
                             external_drop_enabled: true,
+                            input_passthrough: false,
                         },
                     },
                 }),
@@ -4847,6 +4892,7 @@ mod tests {
                             z_index: 0,
                             overlap_enabled: false,
                             external_drop_enabled: false,
+                            input_passthrough: false,
                         },
                         text: "Hello".to_owned(),
                         style: WireTextStyle::default(),
@@ -4870,6 +4916,7 @@ mod tests {
                         z_index: 0,
                         overlap_enabled: false,
                         external_drop_enabled: false,
+                        input_passthrough: false,
                     },
                     text: "Hello".to_owned(),
                     style: TextStyle::default(),
@@ -4934,6 +4981,7 @@ mod tests {
                             z_index: None,
                             overlap_enabled: None,
                             external_drop_enabled: None,
+                            input_passthrough: Some(true),
                         }),
                         ..WireNodeChanges::default()
                     },
@@ -4950,6 +4998,7 @@ mod tests {
                     properties: Some(NodePropertiesPatch {
                         x: Some(48.0),
                         y: Some(72.0),
+                        input_passthrough: Some(true),
                         ..NodePropertiesPatch::default()
                     }),
                     ..NodeChanges::default()
@@ -4961,6 +5010,82 @@ mod tests {
         ));
         let result = receive_host(&mut client);
         assert_eq!(result["result"], json!({ "kind": "node_updated" }));
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn forwards_alpha_image_contact_and_input_passthrough() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene", "images"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "alpha-image".to_owned(),
+                command: Box::new(WireSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(WireSceneLayer::Overlay),
+                    node: WireNodeInput::Image {
+                        properties: WireNodeProperties {
+                            x: 1.0,
+                            y: 2.0,
+                            width: 30.0,
+                            height: 40.0,
+                            visible: true,
+                            clip_children: false,
+                            z_index: 0,
+                            overlap_enabled: false,
+                            external_drop_enabled: false,
+                            input_passthrough: true,
+                        },
+                        image: "image-7".to_owned(),
+                        opacity: 1.0,
+                        contact_shape: WireImageContactShape::Alpha { threshold: 1 },
+                    },
+                }),
+            },
+        );
+        let request = wait_for_host_command(&server);
+        assert_eq!(
+            request.command,
+            ClpSceneCommand::CreateNode {
+                parent: None,
+                layer: Some(SceneLayer::Overlay),
+                node: NodeInput::Image {
+                    properties: NodePropertiesInput {
+                        x: 1.0,
+                        y: 2.0,
+                        width: 30.0,
+                        height: 40.0,
+                        visible: true,
+                        clip_children: false,
+                        z_index: 0,
+                        overlap_enabled: false,
+                        external_drop_enabled: false,
+                        input_passthrough: true,
+                    },
+                    image: ImageHandle::new(7),
+                    opacity: 1.0,
+                    contact_shape: ImageContactShape::alpha(),
+                },
+            }
+        );
+        request.respond(HostCommandResponse::Success(ClpSceneCommandResult::Node {
+            node: NodeHandle::new(4),
+            text_metrics: None,
+        }));
+        let result = receive_host(&mut client);
+        assert_eq!(
+            result["result"],
+            json!({ "kind": "node", "node": "node-4" })
+        );
 
         send_client(&mut client, WireClientMessage::Close);
         let _ = receive_host(&mut client);
@@ -4980,6 +5105,7 @@ mod tests {
                     z_index: 0,
                     overlap_enabled: true,
                     external_drop_enabled: true,
+                    input_passthrough: false,
                 },
                 text: "x".to_owned(),
                 style: WireTextStyle::default(),

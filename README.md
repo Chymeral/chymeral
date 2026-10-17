@@ -41,7 +41,8 @@ not become a host-loaded plugin.
   appearance, image or animated GIF background, and optional startup splash.
 - Retained 2D scene graph with roots, children, clipping, deterministic
   stacking, rectangles, unified RGBA8/GIF images, and intrinsic text nodes.
-- Hit testing, hover, focus, drag-and-drop, and rectangular overlap detection.
+- Alpha-aware image hit testing, hover, focus, drag-and-drop, passthrough
+  overlays, and opt-in scene overlap detection.
 - CLP v2.0 over Unix-domain sockets on Linux and named pipes on Windows, with
   per-window random tokens, capability negotiation, session ownership, and
   bounded image and text resource use.
@@ -77,14 +78,16 @@ may be relative to the configuration file.
 - [Main Manual](Main_Manual.md) — installation, configuration, terminal
   behavior, CLP concepts, event model, scene model, and testing guidance.
 - [Technical Journal](Technical_Journal.md) — the architectural record and the
-  completed M1–M15 milestones formerly kept in this README.
+  milestone record formerly kept in this README.
 - [Chymeral Rust SDK](https://github.com/Chymeral/chymeral-rust-sdk) — the
   separate reference Rust client and its conformance examples.
 
 ## Project state
 
-M19 consolidates external file drops, intrinsic scene text, static RGBA8
-images, and animated GIF images into CLP v2.0. The terminal, local runtime,
+M20 completes CLP v2.0 interaction fidelity with image-alpha contact and
+generic node input passthrough, while promoting the separate Rust reference SDK
+to its stable `1.0.0` API. Linux and Windows manual acceptance has passed;
+public release preparation is the next phase. The terminal, local runtime,
 overlap support, terminal selection, clipboard integration, and Linux/Windows
 validation remain independently useful to ordinary terminal programs.
 

@@ -43,13 +43,20 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 | M13.2 | Optional rectangular overlap queries and transitions. | Overlap is geometric, same-session, and deliberately not a physics engine. |
 | M14 | Standalone Rust SDK, conformance client, visual probe, cross-platform CI, and public SDK repository. | The first SDK is a reference client, not a Rust privilege or a host dependency. |
 | M15 | Terminal pointer selection, scrollback viewport, system clipboard, and bracketed paste. | Terminal cells remain the selection model; selection is primary-screen only, and multiline paste is safe by default. |
+| M16 | Incoming desktop-file drag and drop for terminal insertion and opt-in scene targets. | Desktop transfer remains local, capability-gated, and never executes terminal input implicitly. |
+| M17 | Intrinsic terminal-cell scene text. | Text is a retained node with host-computed bounds, not a widget or a second layout system. |
+| M18 | Retained GIF scene images. | The host owns decode, playback, quotas, and one shared phase per image resource. |
+| M19 | Breaking CLP v2.0 consolidation and the reference Rust SDK API. | One canonical wire vocabulary and unified RGBA8/GIF image handle precede public SDK stability. |
+| M20 | Alpha-derived image contact and generic input passthrough. | Visual layering can be spatially truthful without turning Chymeral into a physics or widget engine. |
 
 ## CLP evolution
 
 CLP began as an internal lifecycle contract and became an actual local transport
 without exposing host memory, Rust types, graphics backend types, or a global
-socket. The active protocol is **v1.3**. It has five opt-in capabilities:
-`scene`, `resources`, `input`, `timing`, and `overlap`.
+socket. The active protocol is **v2.0**. It has seven opt-in capabilities:
+`scene`, `images`, `input`, `timing`, `overlap`, `external_drop`, and `text`.
+M19 deliberately removed the v1.x and provisional v1.4 wire vocabularies
+before public SDK stability; the host provides no compatibility aliases.
 
 The negotiated lifecycle is deliberately strict:
 
@@ -57,7 +64,7 @@ The negotiated lifecycle is deliberately strict:
 hello → init → init_complete → start → started → running
 ```
 
-Node and texture identifiers are opaque and session-scoped. Command validation
+Node and image identifiers are opaque and session-scoped. Command validation
 checks ownership, capability, geometry, resource use, and lifecycle before any
 window-state change. On closure, fault, or disconnection, the owning session's
 nodes and textures are removed without affecting other sessions.
@@ -82,26 +89,42 @@ Hit testing, focus, hover, drag, and overlap are separate concepts:
 - Focus identifies the program session that receives keyboard input in the
   focused Chymeral window.
 - Drag describes pointer-derived source and target transitions.
-- Overlap compares opt-in world-space rectangles regardless of pointer,
-  visibility, clipping, paint order, or image content.
+- Overlap compares opt-in world-space rectangles by default; an image that
+  explicitly selects alpha contact contributes its source-alpha silhouette.
+  Pointer location, visibility, clipping, and paint order do not alter overlap
+  participation.
 
 That policy gives applications composable primitives rather than prebuilt game
 physics or controls. A keyboard-driven game can move a node, query overlap, and
 restore its last valid position. A desktop application can use the same
 primitive for placement rules. Neither requires mouse input.
 
+M20 adds `ImageContactShape::Alpha { threshold }` for static RGBA8 images and
+the current decoded GIF frame. Threshold one is the default alpha mode: alpha
+zero passes through, and clients can require up to `255`. The same contact
+shape is applied to pointer routing, drag/drop targets, incoming external file
+drops, direct overlap queries, and overlap transitions. GIF frame changes
+refresh the retained contact mask and reconcile only affected alpha colliders.
+
+`input_passthrough` is a separate property available to every node family. It
+excludes only that node from pointer-derived and external-drop target selection;
+children remain independently interactive, while painting, overlap, and
+program-owned focus remain unchanged. This keeps a decorative image or text
+layer from duplicating the interaction behavior of a node beneath it.
+
 ## Validation record
 
-The M1–M15 implementation has been exercised on Linux and Windows. The core
+The M1–M19 implementation has been exercised on Linux and Windows. The core
 validation suite covers formatting, unit and integration tests, warnings-denied
 Clippy, and release builds. The Rust SDK has a separate GitHub Actions matrix
 for Rust 1.85 and stable on both platforms, including formatting, tests,
 Clippy, and release builds of its examples.
 
 The reference conformance program validates lifecycle, timing subscriptions,
-RGBA8 upload/destruction, scene mutation, same-session overlap, and clean
-session closure. The visual probe validates drag routing and overlap transitions
-while proving that closing a CLP program does not close its terminal.
+RGBA8/GIF upload and destruction, scene mutation, same-session overlap, and
+clean session closure. The retired visual probes validated drag routing and
+overlap transitions while proving that closing a CLP program does not close its
+terminal.
 
 M15 adds a cell-based selection over primary-screen scrollback and visible
 terminal output, preserving wide characters, combining marks, and soft-wrap
@@ -111,6 +134,14 @@ DECSET 2004 so Chymeral can send standard bracketed-paste delimiters. Linux and
 Windows manual checks confirmed selection, clipboard transfer, scrollback,
 single-line paste, both bracketed-paste states, and alternate-screen behavior.
 
+M20 automated coverage verifies static alpha hit testing, alpha overlap, input
+passthrough with interactive descendants, alpha-aware external-drop targeting,
+transport serialization, and GIF-frame overlap reconciliation. The separate
+Rust SDK exposes the same CLP v2.0 surface as version `1.0.0`. Manual Linux
+and Windows acceptance confirmed static alpha, passthrough, and animated-alpha
+interaction. Native Wayland correctly continues to withhold the separate,
+incoming external-file-drop capability.
+
 ## Intentional boundaries
 
 The following are deferred, not accidental omissions:
@@ -118,7 +149,7 @@ The following are deferred, not accidental omissions:
 - SDKs for languages other than Rust and a shared protocol IDL.
 - Package manifests, application discovery, or a central program registry.
 - A widget toolkit, host-loaded extensions, physics, or native gamepad policy.
-- Alpha-silhouette or arbitrary-shape collision, multitouch, and external
+- Arbitrary vector/polygon collision, multitouch, and outgoing external
   drag-and-drop.
 - 3D scene authoring. `wgpu` is the renderer backend, not a commitment to turn
   Chymeral into a general-purpose 3D engine.
