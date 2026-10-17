@@ -620,8 +620,8 @@ impl WindowState {
         for action in actions {
             match action {
                 HostAction::Command(request) => {
-                    let (session_id, _, command, response_sender) = request.into_parts();
-                    let response = match self.program_scene_resources.execute(
+                    let (session_id, _, command, response_sender) = (*request).into_parts();
+                    let response = match self.program_scene_resources.execute_clp(
                         session_id,
                         command,
                         &mut self.scene,
@@ -1747,11 +1747,13 @@ fn grid_size(size: PhysicalSize<u32>, font: &FontAppearance, scale_factor: f64) 
 fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
     match error {
         ProgramSceneError::InvalidNodeHandle(_)
+        | ProgramSceneError::InvalidImageHandle(_)
         | ProgramSceneError::InvalidTextureHandle(_)
         | ProgramSceneError::InvalidAnimatedImageHandle(_) => "invalid_handle",
         ProgramSceneError::HandleNotOwned => "not_owner",
-        ProgramSceneError::TextureInUse(_) => "texture_in_use",
-        ProgramSceneError::AnimatedImageInUse(_) => "animated_image_in_use",
+        ProgramSceneError::ImageInUse(_)
+        | ProgramSceneError::TextureInUse(_)
+        | ProgramSceneError::AnimatedImageInUse(_) => "image_in_use",
         ProgramSceneError::TextureLimitExceeded { .. }
         | ProgramSceneError::SessionTextureLimitExceeded { .. }
         | ProgramSceneError::TextureDimensionLimitExceeded { .. }
@@ -1766,8 +1768,10 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
         | ProgramSceneError::Text(_) => "invalid_argument",
         ProgramSceneError::TextNodeRequired(_)
         | ProgramSceneError::IntrinsicTextBounds(_)
-        | ProgramSceneError::TextContentRequiresTextCommands(_) => "invalid_scene_operation",
-        ProgramSceneError::Scene(_) => "invalid_scene_operation",
+        | ProgramSceneError::TextContentRequiresTextCommands(_)
+        | ProgramSceneError::NodeKindMismatch(_)
+        | ProgramSceneError::InvalidNodeChange(_) => "invalid_node_change",
+        ProgramSceneError::Scene(_) => "invalid_node_change",
         ProgramSceneError::HandleExhausted => "host_capacity",
     }
 }

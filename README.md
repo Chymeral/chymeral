@@ -40,13 +40,11 @@ not become a host-loaded plugin.
 - PTY terminal with ANSI/VT rendering, configurable font and visual
   appearance, image or animated GIF background, and optional startup splash.
 - Retained 2D scene graph with roots, children, clipping, deterministic
-  stacking, solid fills, uploaded RGBA8 textures, host-scheduled animated GIF
-  resources, and intrinsic text nodes.
+  stacking, rectangles, unified RGBA8/GIF images, and intrinsic text nodes.
 - Hit testing, hover, focus, drag-and-drop, and rectangular overlap detection.
-- Stable CLP v1.3 plus provisional CLP v1.4 `external_drop`, `text`, and
-  `animated_images` capabilities over Unix-domain sockets on Linux and named
-  pipes on Windows, with per-window random tokens, capability negotiation,
-  session ownership, and bounded resource use.
+- CLP v2.0 over Unix-domain sockets on Linux and named pipes on Windows, with
+  per-window random tokens, capability negotiation, session ownership, and
+  bounded image and text resource use.
 - Program delivery for events, resize, tick, frame, lifecycle, closing, and
   overload recovery notifications.
 - A separate reference client library: the
@@ -85,12 +83,10 @@ may be relative to the configuration file.
 
 ## Project state
 
-M16–M18 add provisional CLP v1.4 external file drops, intrinsic scene text,
-and host-scheduled animated scene images. Their capability names and semantics
-are implemented but remain subject to the v1.4 freeze planned for M19. Stable
-CLP v1.3, the terminal, local runtime, overlap support, terminal selection,
-clipboard integration, and Linux/Windows validation remain available
-independently.
+M19 consolidates external file drops, intrinsic scene text, static RGBA8
+images, and animated GIF images into CLP v2.0. The terminal, local runtime,
+overlap support, terminal selection, clipboard integration, and Linux/Windows
+validation remain independently useful to ordinary terminal programs.
 
 ## License
 

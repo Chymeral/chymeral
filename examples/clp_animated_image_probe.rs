@@ -27,9 +27,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         &mut stream,
         &json!({
             "type": "hello",
-            "protocol": { "major": 1, "minor": 4 },
+            "protocol": { "major": 2, "minor": 0 },
             "token": token,
-            "capabilities": ["scene", "resources", "input", "animated_images"]
+            "capabilities": ["scene", "images", "input"]
         }),
     )?;
     expect_type(&read_json(&mut stream)?, "init")?;
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let left = client.create_animated_node(&image, 72.0, 104.0)?;
     let right = client.create_animated_node(&image, 356.0, 104.0)?;
 
-    println!("CLP v1.4 animated-image probe connected.");
+    println!("CLP v2.0 animated-image probe connected.");
     println!("Both GIF nodes share one resource and must remain in phase.");
     println!("Press h to hide/show both nodes, then q to remove them and close this session.");
 
@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if is_pressed_key(&message, "q") {
             client.remove_node(&left)?;
             client.remove_node(&right)?;
-            client.destroy_animated_image(&image)?;
+            client.remove_image(&image)?;
             client.close()?;
             println!("Animated image, nodes, and only this CLP session closed cleanly.");
             break;
@@ -104,16 +104,18 @@ impl RawClient {
     fn upload_gif(&mut self, bytes: &[u8]) -> Result<String, Box<dyn Error>> {
         let result = self.command(
             json!({
-                "op": "upload_animated_image",
-                "format": "gif",
-                "byte_length": bytes.len(),
+                "op": "upload_image",
+                "source": {
+                    "kind": "gif",
+                    "byte_length": bytes.len(),
+                },
             }),
             Some(bytes),
         )?;
         result["image"]
             .as_str()
             .map(ToOwned::to_owned)
-            .ok_or_else(|| "animated-image result did not include an image handle".into())
+            .ok_or_else(|| "image result did not include an image handle".into())
     }
 
     fn create_animated_node(
@@ -124,21 +126,21 @@ impl RawClient {
     ) -> Result<String, Box<dyn Error>> {
         let result = self.command(
             json!({
-                "op": "create_root",
+                "op": "create_node",
                 "layer": "overlay",
-                "properties": {
-                    "x": x,
-                    "y": y,
-                    "width": 220.0,
-                    "height": 180.0,
-                    "visible": true,
-                    "clip_children": false,
-                    "z_index": 0,
-                    "overlap_enabled": false,
-                    "external_drop_enabled": false,
-                },
-                "content": {
-                    "kind": "animated_image",
+                "node": {
+                    "kind": "image",
+                    "properties": {
+                        "x": x,
+                        "y": y,
+                        "width": 220.0,
+                        "height": 180.0,
+                        "visible": true,
+                        "clip_children": false,
+                        "z_index": 0,
+                        "overlap_enabled": false,
+                        "external_drop_enabled": false,
+                    },
                     "image": image,
                     "opacity": 1.0,
                 },
@@ -154,9 +156,11 @@ impl RawClient {
     fn set_visible(&mut self, node: &str, visible: bool) -> Result<(), Box<dyn Error>> {
         self.command(
             json!({
-                "op": "update_node",
+                "op": "set_node",
                 "node": node,
-                "properties": { "visible": visible },
+                "changes": {
+                    "properties": { "visible": visible },
+                },
             }),
             None,
         )?;
@@ -168,11 +172,8 @@ impl RawClient {
         Ok(())
     }
 
-    fn destroy_animated_image(&mut self, image: &str) -> Result<(), Box<dyn Error>> {
-        self.command(
-            json!({ "op": "destroy_animated_image", "image": image }),
-            None,
-        )?;
+    fn remove_image(&mut self, image: &str) -> Result<(), Box<dyn Error>> {
+        self.command(json!({ "op": "remove_image", "image": image }), None)?;
         Ok(())
     }
 

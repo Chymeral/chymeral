@@ -8,7 +8,7 @@ use std::{
 };
 
 use chymeral::{
-    program_scene::SceneCommandResult,
+    program_scene::ClpSceneCommandResult,
     protocol::CapabilitySet,
     runtime::{
         EngineEvent, FocusEvent, Key, KeyEvent, KeyState, Modifiers, PointerEvent, TerminalEvent,
@@ -69,13 +69,13 @@ fn inherited_process_completes_the_raw_clp_lifecycle() -> Result<(), Box<dyn Err
         "the continuous notification burst was not coalesced: {metrics:?}"
     );
     ready_command.respond(HostCommandResponse::Success(
-        SceneCommandResult::Acknowledged,
+        ClpSceneCommandResult::Acknowledged,
     ));
 
     let stress_complete = wait_for_host_command(&server)?;
     assert_eq!(stress_complete.request_id, "stress_complete");
     stress_complete.respond(HostCommandResponse::Success(
-        SceneCommandResult::Acknowledged,
+        ClpSceneCommandResult::Acknowledged,
     ));
 
     server.send_keyboard_event(
@@ -125,14 +125,14 @@ fn run_inherited_client() -> Result<(), Box<dyn Error>> {
         &mut stream,
         &json!({
             "type": "hello",
-            "protocol": { "major": 1, "minor": 2 },
+            "protocol": { "major": 2, "minor": 0 },
             "token": token,
             "capabilities": ["scene", "input", "timing"]
         }),
     )?;
     let init = read_json(&mut stream)?;
     assert_eq!(init["type"], "init");
-    assert_eq!(init["protocol"], json!({ "major": 1, "minor": 2 }));
+    assert_eq!(init["protocol"], json!({ "major": 2, "minor": 0 }));
     assert_eq!(init["capabilities"], json!(["scene", "input", "timing"]));
 
     write_json(&mut stream, &json!({ "type": "init_complete" }))?;
@@ -169,14 +169,16 @@ fn run_inherited_client() -> Result<(), Box<dyn Error>> {
             "type": "command",
             "request_id": "ready",
             "command": {
-                "op": "create_root",
-                "properties": {
-                    "x": 0.0,
-                    "y": 0.0,
-                    "width": 1.0,
-                    "height": 1.0
-                },
-                "content": { "kind": "empty" }
+                "op": "create_node",
+                "node": {
+                    "kind": "empty",
+                    "properties": {
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 1.0,
+                        "height": 1.0
+                    }
+                }
             }
         }),
     )?;
@@ -218,14 +220,16 @@ fn run_inherited_client() -> Result<(), Box<dyn Error>> {
             "type": "command",
             "request_id": "stress_complete",
             "command": {
-                "op": "create_root",
-                "properties": {
-                    "x": 1.0,
-                    "y": 1.0,
-                    "width": 1.0,
-                    "height": 1.0
-                },
-                "content": { "kind": "empty" }
+                "op": "create_node",
+                "node": {
+                    "kind": "empty",
+                    "properties": {
+                        "x": 1.0,
+                        "y": 1.0,
+                        "width": 1.0,
+                        "height": 1.0
+                    }
+                }
             }
         }),
     )?;
@@ -317,7 +321,7 @@ fn wait_for_host_command(
                 .drain_host_actions()
                 .into_iter()
                 .find_map(|action| match action {
-                    HostAction::Command(request) => Some(request),
+                    HostAction::Command(request) => Some(*request),
                     HostAction::Cleanup { .. } | HostAction::SessionStarted { .. } => None,
                 })
         {

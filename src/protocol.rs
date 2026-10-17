@@ -4,7 +4,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
+pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion {
@@ -35,26 +35,24 @@ impl Display for ProtocolVersion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Capability {
     Scene,
-    Resources,
+    Images,
     Input,
     Timing,
     Overlap,
     ExternalDrop,
     Text,
-    AnimatedImages,
 }
 
 impl Capability {
     const fn bit(self) -> u8 {
         match self {
             Self::Scene => 1 << 0,
-            Self::Resources => 1 << 1,
+            Self::Images => 1 << 1,
             Self::Input => 1 << 2,
             Self::Timing => 1 << 3,
             Self::Overlap => 1 << 4,
             Self::ExternalDrop => 1 << 5,
             Self::Text => 1 << 6,
-            Self::AnimatedImages => 1 << 7,
         }
     }
 }
@@ -66,13 +64,12 @@ impl CapabilitySet {
     pub const NONE: Self = Self(0);
     pub const ALL: Self = Self(
         Capability::Scene.bit()
-            | Capability::Resources.bit()
+            | Capability::Images.bit()
             | Capability::Input.bit()
             | Capability::Timing.bit()
             | Capability::Overlap.bit()
             | Capability::ExternalDrop.bit()
-            | Capability::Text.bit()
-            | Capability::AnimatedImages.bit(),
+            | Capability::Text.bit(),
     );
 
     pub const fn from_capabilities(capabilities: &[Capability]) -> Self {
@@ -403,24 +400,6 @@ impl SessionManager {
         let capabilities = hello
             .requested_capabilities
             .intersection(self.available_capabilities);
-        let capabilities = if hello.protocol_version.minor() < 3 {
-            capabilities.intersection(CapabilitySet::from_capabilities(&[
-                Capability::Scene,
-                Capability::Resources,
-                Capability::Input,
-                Capability::Timing,
-            ]))
-        } else if hello.protocol_version.minor() < 4 {
-            capabilities.intersection(CapabilitySet::from_capabilities(&[
-                Capability::Scene,
-                Capability::Resources,
-                Capability::Input,
-                Capability::Timing,
-                Capability::Overlap,
-            ]))
-        } else {
-            capabilities
-        };
         self.sessions.insert(
             session_id,
             Session {
@@ -654,14 +633,37 @@ mod tests {
     }
 
     #[test]
-    fn negotiates_the_previous_minor_without_granting_new_capabilities() {
+    fn rejects_legacy_major_versions_without_creating_a_session() {
         let mut manager = SessionManager::default();
         let version = ProtocolVersion::new(1, 2);
-        let (session_id, message) = manager
+        let error = manager
             .accept(
                 ClientHello {
                     protocol_version: version,
                     requested_capabilities: CapabilitySet::ALL,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ProtocolError::UnsupportedVersion { received: version }
+        );
+        assert_eq!(manager.session_count(), 0);
+    }
+
+    #[test]
+    fn negotiates_v2_capability_intersection() {
+        let mut manager = SessionManager::default();
+        let (session_id, message) = manager
+            .accept(
+                ClientHello {
+                    protocol_version: CLP_PROTOCOL_VERSION,
+                    requested_capabilities: CapabilitySet::from_capabilities(&[
+                        Capability::Scene,
+                        Capability::Images,
+                    ]),
                 },
                 ProgramInitContext::default(),
             )
@@ -670,62 +672,14 @@ mod tests {
         assert_eq!(
             message,
             HostMessage::Init(ProgramInit {
-                protocol_version: version,
+                protocol_version: CLP_PROTOCOL_VERSION,
                 session_id,
                 granted_capabilities: CapabilitySet::from_capabilities(&[
                     Capability::Scene,
-                    Capability::Resources,
-                    Capability::Input,
-                    Capability::Timing,
+                    Capability::Images,
                 ]),
                 context: ProgramInitContext::default(),
             })
-        );
-        assert!(
-            !manager
-                .session_capabilities(session_id)
-                .unwrap()
-                .contains(Capability::Overlap)
-        );
-    }
-
-    #[test]
-    fn keeps_m14_capabilities_unavailable_to_clp_v1_3_clients() {
-        let mut manager = SessionManager::default();
-        let (session_id, message) = manager
-            .accept(
-                ClientHello {
-                    protocol_version: ProtocolVersion::new(1, 3),
-                    requested_capabilities: CapabilitySet::ALL,
-                },
-                ProgramInitContext::default(),
-            )
-            .unwrap();
-
-        assert!(matches!(message, HostMessage::Init(_)));
-        assert!(
-            manager
-                .session_capabilities(session_id)
-                .unwrap()
-                .contains(Capability::Overlap)
-        );
-        assert!(
-            !manager
-                .session_capabilities(session_id)
-                .unwrap()
-                .contains(Capability::ExternalDrop)
-        );
-        assert!(
-            !manager
-                .session_capabilities(session_id)
-                .unwrap()
-                .contains(Capability::Text)
-        );
-        assert!(
-            !manager
-                .session_capabilities(session_id)
-                .unwrap()
-                .contains(Capability::AnimatedImages)
         );
     }
 
@@ -736,7 +690,7 @@ mod tests {
         let error = manager
             .accept(
                 ClientHello {
-                    protocol_version: ProtocolVersion::new(2, 0),
+                    protocol_version: ProtocolVersion::new(3, 0),
                     requested_capabilities: CapabilitySet::ALL,
                 },
                 ProgramInitContext::default(),
@@ -746,7 +700,7 @@ mod tests {
         assert_eq!(
             error,
             ProtocolError::UnsupportedVersion {
-                received: ProtocolVersion::new(2, 0),
+                received: ProtocolVersion::new(3, 0),
             }
         );
         assert_eq!(manager.session_count(), 0);

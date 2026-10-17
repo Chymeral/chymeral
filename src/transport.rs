@@ -29,11 +29,11 @@ use crate::runtime::{
     SceneEvent, ScrollEvent, ScrollUnit, TerminalEvent, Vec2,
 };
 use crate::{
-    animated_image::{AnimatedImageFormat, MAX_ANIMATED_IMAGE_ENCODED_BYTES},
+    animated_image::MAX_ANIMATED_IMAGE_ENCODED_BYTES,
     program_scene::{
-        AnimatedImageHandle, ContentInput, MAX_TEXTURE_BYTES, NodeHandle, NodePropertiesInput,
-        NodePropertiesPatch, SceneCommand, SceneCommandResult, TextNodePropertiesInput,
-        TextureHandle,
+        ClpSceneCommand, ClpSceneCommandResult, ImageHandle, ImageUpload, MAX_TEXTURE_BYTES,
+        NodeChanges, NodeHandle, NodeInput, NodeParent, NodePropertiesInput, NodePropertiesPatch,
+        NodeVisualInput, TextNodePropertiesInput,
     },
     resources::rgba8_byte_len,
     scene::{NodeId, SceneLayer},
@@ -91,7 +91,7 @@ pub struct ClpServer {
 }
 
 pub enum HostAction {
-    Command(HostCommandRequest),
+    Command(Box<HostCommandRequest>),
     Cleanup { session_id: SessionId },
     SessionStarted { session_id: SessionId },
 }
@@ -99,7 +99,7 @@ pub enum HostAction {
 pub struct HostCommandRequest {
     pub session_id: SessionId,
     pub request_id: String,
-    pub command: SceneCommand,
+    pub command: ClpSceneCommand,
     response: SyncSender<HostCommandResponse>,
 }
 
@@ -113,7 +113,7 @@ impl HostCommandRequest {
     ) -> (
         SessionId,
         String,
-        SceneCommand,
+        ClpSceneCommand,
         SyncSender<HostCommandResponse>,
     ) {
         (
@@ -127,7 +127,7 @@ impl HostCommandRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostCommandResponse {
-    Success(SceneCommandResult),
+    Success(ClpSceneCommandResult),
     Error { code: &'static str, message: String },
 }
 
@@ -739,7 +739,7 @@ impl ClpServer {
 
 impl HostActionBroker {
     fn submit(&self, request: HostCommandRequest) -> Result<()> {
-        match self.sender.try_send(HostAction::Command(request)) {
+        match self.sender.try_send(HostAction::Command(Box::new(request))) {
             Ok(()) => {
                 (self.wake)();
                 Ok(())
@@ -1383,7 +1383,7 @@ fn run_running_session(
                 ));
                 continue;
             }
-            let command = match read_scene_command(command, stream, frame_reader, control) {
+            let command = match read_scene_command(*command, stream, frame_reader, control) {
                 Ok(command) => command,
                 Err(error) => {
                     let _ = writer.queue(&WireHostMessage::Error {
@@ -1393,18 +1393,6 @@ fn run_running_session(
                     continue;
                 }
             };
-            if !command_is_granted(&command, granted_capabilities) {
-                let _ = writer.queue(&command_response_message(
-                    &request_id,
-                    HostCommandResponse::Error {
-                        code: "capability_denied",
-                        message:
-                            "the command requires a capability that this session was not granted"
-                                .to_owned(),
-                    },
-                ));
-                continue;
-            }
             let response =
                 dispatch_host_command(broker, control, session_id, request_id.clone(), command);
             match response {
@@ -1723,7 +1711,7 @@ fn dispatch_host_command(
     control: &ServerControl,
     session_id: SessionId,
     request_id: String,
-    command: SceneCommand,
+    command: ClpSceneCommand,
 ) -> Result<HostCommandResponse> {
     let (response_sender, response_receiver) = mpsc::sync_channel(1);
     broker.submit(HostCommandRequest {
@@ -1751,14 +1739,14 @@ fn read_scene_command(
     stream: &mut LocalSocketStream,
     frame_reader: &mut FrameReader,
     control: &ServerControl,
-) -> Result<SceneCommand> {
+) -> Result<ClpSceneCommand> {
     let upload_length = command.upload_length()?;
     let payload = if let Some(length) = upload_length {
         Some(read_binary_upload(stream, frame_reader, control, length, true)?.unwrap_or_default())
     } else {
         None
     };
-    command.into_scene_command(payload)
+    command.into_clp_scene_command(payload)
 }
 
 fn discard_scene_command_payload(
@@ -1809,206 +1797,28 @@ fn read_binary_upload(
 
 fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilitySet) -> bool {
     match command {
-        WireSceneCommand::UploadTexture { .. } | WireSceneCommand::DestroyTexture { .. } => {
-            capabilities.contains(Capability::Resources)
+        WireSceneCommand::UploadImage { .. } | WireSceneCommand::RemoveImage { .. } => {
+            capabilities.contains(Capability::Images)
         }
-        WireSceneCommand::UploadAnimatedImage { .. }
-        | WireSceneCommand::DestroyAnimatedImage { .. } => {
-            capabilities.contains(Capability::Scene)
-                && capabilities.contains(Capability::Resources)
-                && capabilities.contains(Capability::AnimatedImages)
-        }
-        WireSceneCommand::CreateRoot { content, .. }
-        | WireSceneCommand::CreateChild { content, .. }
-        | WireSceneCommand::SetContent { content, .. } => {
-            capabilities.contains(Capability::Scene)
-                && (!content.uses_texture() || capabilities.contains(Capability::Resources))
-                && (!content.uses_animated_image()
-                    || (capabilities.contains(Capability::Resources)
-                        && capabilities.contains(Capability::AnimatedImages)))
-                && (!wire_command_uses_overlap(command)
-                    || capabilities.contains(Capability::Overlap))
-                && (!wire_command_uses_external_drop(command)
-                    || capabilities.contains(Capability::ExternalDrop))
-        }
-        WireSceneCommand::CreateTextRoot { .. }
-        | WireSceneCommand::CreateTextChild { .. }
-        | WireSceneCommand::SetText { .. }
-        | WireSceneCommand::SetTextStyle { .. } => {
-            capabilities.contains(Capability::Scene)
-                && capabilities.contains(Capability::Text)
-                && (!wire_command_uses_overlap(command)
-                    || capabilities.contains(Capability::Overlap))
-                && (!wire_command_uses_external_drop(command)
-                    || capabilities.contains(Capability::ExternalDrop))
-        }
-        WireSceneCommand::UpdateNode { .. }
-        | WireSceneCommand::Reparent { .. }
-        | WireSceneCommand::RemoveNode { .. } => {
-            capabilities.contains(Capability::Scene)
-                && (!wire_command_uses_overlap(command)
-                    || capabilities.contains(Capability::Overlap))
-                && (!wire_command_uses_external_drop(command)
-                    || capabilities.contains(Capability::ExternalDrop))
-        }
-        WireSceneCommand::QueryOverlaps { .. } => {
+        WireSceneCommand::IsOverlapping { .. } | WireSceneCommand::GetOverlaps { .. } => {
             capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Overlap)
         }
-    }
-}
-
-fn command_is_granted(command: &SceneCommand, capabilities: CapabilitySet) -> bool {
-    match command {
-        SceneCommand::UploadTexture { .. } | SceneCommand::DestroyTexture { .. } => {
-            capabilities.contains(Capability::Resources)
-        }
-        SceneCommand::UploadAnimatedImage { .. } | SceneCommand::DestroyAnimatedImage { .. } => {
+        WireSceneCommand::RemoveNode { .. } => capabilities.contains(Capability::Scene),
+        WireSceneCommand::CreateNode { node, .. } => {
             capabilities.contains(Capability::Scene)
-                && capabilities.contains(Capability::Resources)
-                && capabilities.contains(Capability::AnimatedImages)
+                && (!node.uses_image() || capabilities.contains(Capability::Images))
+                && (!node.uses_text() || capabilities.contains(Capability::Text))
+                && (!node.uses_overlap() || capabilities.contains(Capability::Overlap))
+                && (!node.uses_external_drop() || capabilities.contains(Capability::ExternalDrop))
         }
-        SceneCommand::CreateRoot { .. }
-        | SceneCommand::CreateChild { .. }
-        | SceneCommand::UpdateNode { .. }
-        | SceneCommand::SetContent { .. }
-        | SceneCommand::Reparent { .. }
-        | SceneCommand::RemoveNode { .. } => {
+        WireSceneCommand::SetNode { changes, .. } => {
             capabilities.contains(Capability::Scene)
-                && (!command_uses_texture(command) || capabilities.contains(Capability::Resources))
-                && (!command_uses_animated_image(command)
-                    || (capabilities.contains(Capability::Resources)
-                        && capabilities.contains(Capability::AnimatedImages)))
-                && (!command_uses_overlap(command) || capabilities.contains(Capability::Overlap))
-                && (!command_uses_external_drop(command)
+                && (!changes.uses_image() || capabilities.contains(Capability::Images))
+                && (!changes.uses_text() || capabilities.contains(Capability::Text))
+                && (!changes.uses_overlap() || capabilities.contains(Capability::Overlap))
+                && (!changes.uses_external_drop()
                     || capabilities.contains(Capability::ExternalDrop))
         }
-        SceneCommand::CreateTextRoot { .. }
-        | SceneCommand::CreateTextChild { .. }
-        | SceneCommand::SetText { .. }
-        | SceneCommand::SetTextStyle { .. } => {
-            capabilities.contains(Capability::Scene)
-                && capabilities.contains(Capability::Text)
-                && (!command_uses_overlap(command) || capabilities.contains(Capability::Overlap))
-                && (!command_uses_external_drop(command)
-                    || capabilities.contains(Capability::ExternalDrop))
-        }
-        SceneCommand::QueryOverlaps { .. } => {
-            capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Overlap)
-        }
-    }
-}
-
-fn command_uses_texture(command: &SceneCommand) -> bool {
-    matches!(
-        command,
-        SceneCommand::CreateRoot {
-            content: ContentInput::Image { .. },
-            ..
-        } | SceneCommand::CreateChild {
-            content: ContentInput::Image { .. },
-            ..
-        } | SceneCommand::SetContent {
-            content: ContentInput::Image { .. },
-            ..
-        }
-    )
-}
-
-fn command_uses_animated_image(command: &SceneCommand) -> bool {
-    matches!(
-        command,
-        SceneCommand::CreateRoot {
-            content: ContentInput::AnimatedImage { .. },
-            ..
-        } | SceneCommand::CreateChild {
-            content: ContentInput::AnimatedImage { .. },
-            ..
-        } | SceneCommand::SetContent {
-            content: ContentInput::AnimatedImage { .. },
-            ..
-        }
-    )
-}
-
-fn wire_command_uses_overlap(command: &WireSceneCommand) -> bool {
-    match command {
-        WireSceneCommand::CreateRoot { properties, .. }
-        | WireSceneCommand::CreateChild { properties, .. } => properties.overlap_enabled,
-        WireSceneCommand::UpdateNode { properties, .. } => properties.overlap_enabled.is_some(),
-        WireSceneCommand::CreateTextRoot { properties, .. }
-        | WireSceneCommand::CreateTextChild { properties, .. } => properties.overlap_enabled,
-        WireSceneCommand::SetContent { .. }
-        | WireSceneCommand::SetText { .. }
-        | WireSceneCommand::SetTextStyle { .. }
-        | WireSceneCommand::Reparent { .. }
-        | WireSceneCommand::RemoveNode { .. }
-        | WireSceneCommand::QueryOverlaps { .. }
-        | WireSceneCommand::UploadTexture { .. }
-        | WireSceneCommand::DestroyTexture { .. }
-        | WireSceneCommand::UploadAnimatedImage { .. }
-        | WireSceneCommand::DestroyAnimatedImage { .. } => false,
-    }
-}
-
-fn wire_command_uses_external_drop(command: &WireSceneCommand) -> bool {
-    match command {
-        WireSceneCommand::CreateRoot { properties, .. }
-        | WireSceneCommand::CreateChild { properties, .. } => properties.external_drop_enabled,
-        WireSceneCommand::UpdateNode { properties, .. } => {
-            properties.external_drop_enabled.is_some()
-        }
-        WireSceneCommand::CreateTextRoot { properties, .. }
-        | WireSceneCommand::CreateTextChild { properties, .. } => properties.external_drop_enabled,
-        WireSceneCommand::SetContent { .. }
-        | WireSceneCommand::SetText { .. }
-        | WireSceneCommand::SetTextStyle { .. }
-        | WireSceneCommand::Reparent { .. }
-        | WireSceneCommand::RemoveNode { .. }
-        | WireSceneCommand::QueryOverlaps { .. }
-        | WireSceneCommand::UploadTexture { .. }
-        | WireSceneCommand::DestroyTexture { .. }
-        | WireSceneCommand::UploadAnimatedImage { .. }
-        | WireSceneCommand::DestroyAnimatedImage { .. } => false,
-    }
-}
-
-fn command_uses_overlap(command: &SceneCommand) -> bool {
-    match command {
-        SceneCommand::CreateRoot { properties, .. }
-        | SceneCommand::CreateChild { properties, .. } => properties.overlap_enabled,
-        SceneCommand::UpdateNode { properties, .. } => properties.overlap_enabled.is_some(),
-        SceneCommand::CreateTextRoot { properties, .. }
-        | SceneCommand::CreateTextChild { properties, .. } => properties.overlap_enabled,
-        SceneCommand::SetContent { .. }
-        | SceneCommand::SetText { .. }
-        | SceneCommand::SetTextStyle { .. }
-        | SceneCommand::Reparent { .. }
-        | SceneCommand::RemoveNode { .. }
-        | SceneCommand::QueryOverlaps { .. }
-        | SceneCommand::UploadTexture { .. }
-        | SceneCommand::DestroyTexture { .. }
-        | SceneCommand::UploadAnimatedImage { .. }
-        | SceneCommand::DestroyAnimatedImage { .. } => false,
-    }
-}
-
-fn command_uses_external_drop(command: &SceneCommand) -> bool {
-    match command {
-        SceneCommand::CreateRoot { properties, .. }
-        | SceneCommand::CreateChild { properties, .. } => properties.external_drop_enabled,
-        SceneCommand::UpdateNode { properties, .. } => properties.external_drop_enabled.is_some(),
-        SceneCommand::CreateTextRoot { properties, .. }
-        | SceneCommand::CreateTextChild { properties, .. } => properties.external_drop_enabled,
-        SceneCommand::SetContent { .. }
-        | SceneCommand::SetText { .. }
-        | SceneCommand::SetTextStyle { .. }
-        | SceneCommand::Reparent { .. }
-        | SceneCommand::RemoveNode { .. }
-        | SceneCommand::QueryOverlaps { .. }
-        | SceneCommand::UploadTexture { .. }
-        | SceneCommand::DestroyTexture { .. }
-        | SceneCommand::UploadAnimatedImage { .. }
-        | SceneCommand::DestroyAnimatedImage { .. } => false,
     }
 }
 
@@ -2344,7 +2154,7 @@ enum WireClientMessage {
     Close,
     Command {
         request_id: String,
-        command: WireSceneCommand,
+        command: Box<WireSceneCommand>,
     },
     Subscribe {
         subscriptions: Vec<WireSubscription>,
@@ -2354,202 +2164,117 @@ enum WireClientMessage {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum WireSceneCommand {
-    CreateRoot {
+    CreateNode {
         #[serde(default)]
-        layer: WireSceneLayer,
-        properties: WireNodeProperties,
-        content: WireNodeContent,
-    },
-    CreateChild {
-        parent: String,
-        properties: WireNodeProperties,
-        content: WireNodeContent,
-    },
-    UpdateNode {
-        node: String,
-        properties: WireNodePropertiesPatch,
-    },
-    SetContent {
-        node: String,
-        content: WireNodeContent,
-    },
-    CreateTextRoot {
-        #[serde(default)]
-        layer: WireSceneLayer,
-        properties: WireTextNodeProperties,
-        text: String,
-        #[serde(default)]
-        style: WireTextStyle,
-    },
-    CreateTextChild {
-        parent: String,
-        properties: WireTextNodeProperties,
-        text: String,
-        #[serde(default)]
-        style: WireTextStyle,
-    },
-    SetText {
-        node: String,
-        text: String,
-    },
-    SetTextStyle {
-        node: String,
-        style: WireTextStyle,
-    },
-    Reparent {
-        node: String,
         parent: Option<String>,
+        #[serde(default)]
+        layer: Option<WireSceneLayer>,
+        node: WireNodeInput,
+    },
+    SetNode {
+        node: String,
+        changes: WireNodeChanges,
     },
     RemoveNode {
         node: String,
     },
-    QueryOverlaps {
+    UploadImage {
+        source: WireImageSource,
+    },
+    RemoveImage {
+        image: String,
+    },
+    IsOverlapping {
         node: String,
     },
-    UploadTexture {
-        width: u32,
-        height: u32,
-    },
-    DestroyTexture {
-        texture: String,
-    },
-    UploadAnimatedImage {
-        format: WireAnimatedImageFormat,
-        byte_length: usize,
-    },
-    DestroyAnimatedImage {
-        image: String,
+    GetOverlaps {
+        node: String,
     },
 }
 
 impl WireSceneCommand {
     fn upload_length(&self) -> Result<Option<usize>> {
         match self {
-            Self::UploadTexture { width, height } => {
-                let bytes =
-                    rgba8_byte_len(*width, *height).context("invalid RGBA8 texture dimensions")?;
-                if bytes > MAX_TEXTURE_BYTES {
-                    return Err(anyhow!(
-                        "a texture may not exceed {MAX_TEXTURE_BYTES} bytes"
-                    ));
-                }
-                Ok(Some(bytes))
-            }
-            Self::UploadAnimatedImage { byte_length, .. } => {
-                if *byte_length > MAX_ANIMATED_IMAGE_ENCODED_BYTES {
-                    return Err(anyhow!(
-                        "an encoded animated image may not exceed {MAX_ANIMATED_IMAGE_ENCODED_BYTES} bytes"
-                    ));
-                }
-                Ok(Some(*byte_length))
-            }
+            Self::UploadImage { source } => source.upload_length().map(Some),
             _ => Ok(None),
         }
     }
 
-    fn into_scene_command(self, pixels: Option<Vec<u8>>) -> Result<SceneCommand> {
+    fn into_clp_scene_command(self, pixels: Option<Vec<u8>>) -> Result<ClpSceneCommand> {
         match self {
-            Self::CreateRoot {
-                layer,
-                properties,
-                content,
-            } => Ok(SceneCommand::CreateRoot {
-                layer: layer.into_scene(),
-                properties: properties.into_input(),
-                content: content.into_input()?,
-            }),
-            Self::CreateChild {
+            Self::CreateNode {
                 parent,
-                properties,
-                content,
-            } => Ok(SceneCommand::CreateChild {
-                parent: parse_node_handle(&parent)?,
-                properties: properties.into_input(),
-                content: content.into_input()?,
-            }),
-            Self::UpdateNode { node, properties } => Ok(SceneCommand::UpdateNode {
-                node: parse_node_handle(&node)?,
-                properties: properties.into_patch(),
-            }),
-            Self::SetContent { node, content } => Ok(SceneCommand::SetContent {
-                node: parse_node_handle(&node)?,
-                content: content.into_input()?,
-            }),
-            Self::CreateTextRoot {
                 layer,
-                properties,
-                text,
-                style,
-            } => Ok(SceneCommand::CreateTextRoot {
-                layer: layer.into_scene(),
-                properties: properties.into_input(),
-                text,
-                style: style.into_scene(),
-            }),
-            Self::CreateTextChild {
-                parent,
-                properties,
-                text,
-                style,
-            } => Ok(SceneCommand::CreateTextChild {
-                parent: parse_node_handle(&parent)?,
-                properties: properties.into_input(),
-                text,
-                style: style.into_scene(),
-            }),
-            Self::SetText { node, text } => Ok(SceneCommand::SetText {
-                node: parse_node_handle(&node)?,
-                text,
-            }),
-            Self::SetTextStyle { node, style } => Ok(SceneCommand::SetTextStyle {
-                node: parse_node_handle(&node)?,
-                style: style.into_scene(),
-            }),
-            Self::Reparent { node, parent } => Ok(SceneCommand::Reparent {
-                node: parse_node_handle(&node)?,
+                node,
+            } => Ok(ClpSceneCommand::CreateNode {
                 parent: parent.as_deref().map(parse_node_handle).transpose()?,
+                layer: layer.map(WireSceneLayer::into_scene),
+                node: node.into_input()?,
             }),
-            Self::RemoveNode { node } => Ok(SceneCommand::RemoveNode {
+            Self::SetNode { node, changes } => Ok(ClpSceneCommand::SetNode {
+                node: parse_node_handle(&node)?,
+                changes: changes.into_input()?,
+            }),
+            Self::RemoveNode { node } => Ok(ClpSceneCommand::RemoveNode {
                 node: parse_node_handle(&node)?,
             }),
-            Self::QueryOverlaps { node } => Ok(SceneCommand::QueryOverlaps {
+            Self::UploadImage { source } => Ok(ClpSceneCommand::UploadImage {
+                image: source.into_input(
+                    pixels.ok_or_else(|| anyhow!("an image upload requires binary image bytes"))?,
+                )?,
+            }),
+            Self::RemoveImage { image } => Ok(ClpSceneCommand::RemoveImage {
+                image: parse_image_handle(&image)?,
+            }),
+            Self::IsOverlapping { node } => Ok(ClpSceneCommand::IsOverlapping {
                 node: parse_node_handle(&node)?,
             }),
-            Self::UploadTexture { width, height } => Ok(SceneCommand::UploadTexture {
-                width,
-                height,
-                pixels: pixels
-                    .ok_or_else(|| anyhow!("an RGBA8 texture upload requires binary pixels"))?,
-            }),
-            Self::DestroyTexture { texture } => Ok(SceneCommand::DestroyTexture {
-                texture: parse_texture_handle(&texture)?,
-            }),
-            Self::UploadAnimatedImage {
-                format,
-                byte_length: _,
-            } => Ok(SceneCommand::UploadAnimatedImage {
-                format: format.into_scene(),
-                bytes: pixels.ok_or_else(|| {
-                    anyhow!("an animated image upload requires encoded binary bytes")
-                })?,
-            }),
-            Self::DestroyAnimatedImage { image } => Ok(SceneCommand::DestroyAnimatedImage {
-                image: parse_animated_image_handle(&image)?,
+            Self::GetOverlaps { node } => Ok(ClpSceneCommand::GetOverlaps {
+                node: parse_node_handle(&node)?,
             }),
         }
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WireAnimatedImageFormat {
-    Gif,
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireImageSource {
+    Rgba8 { width: u32, height: u32 },
+    Gif { byte_length: usize },
 }
 
-impl WireAnimatedImageFormat {
-    const fn into_scene(self) -> AnimatedImageFormat {
+impl WireImageSource {
+    fn upload_length(&self) -> Result<usize> {
         match self {
-            Self::Gif => AnimatedImageFormat::Gif,
+            Self::Rgba8 { width, height } => {
+                let bytes =
+                    rgba8_byte_len(*width, *height).context("invalid RGBA8 image dimensions")?;
+                if bytes > MAX_TEXTURE_BYTES {
+                    return Err(anyhow!(
+                        "an RGBA8 image may not exceed {MAX_TEXTURE_BYTES} bytes"
+                    ));
+                }
+                Ok(bytes)
+            }
+            Self::Gif { byte_length } => {
+                if *byte_length > MAX_ANIMATED_IMAGE_ENCODED_BYTES {
+                    return Err(anyhow!(
+                        "an encoded GIF image may not exceed {MAX_ANIMATED_IMAGE_ENCODED_BYTES} bytes"
+                    ));
+                }
+                Ok(*byte_length)
+            }
+        }
+    }
+
+    fn into_input(self, bytes: Vec<u8>) -> Result<ImageUpload> {
+        match self {
+            Self::Rgba8 { width, height } => Ok(ImageUpload::Rgba8 {
+                width,
+                height,
+                pixels: bytes,
+            }),
+            Self::Gif { .. } => Ok(ImageUpload::Gif { bytes }),
         }
     }
 }
@@ -2735,35 +2460,172 @@ impl WireTextAlign {
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum WireNodeContent {
-    Empty,
-    Solid { color: [u8; 4] },
-    Image { texture: String, opacity: f32 },
-    AnimatedImage { image: String, opacity: f32 },
+enum WireNodeInput {
+    Empty {
+        properties: WireNodeProperties,
+    },
+    Rectangle {
+        properties: WireNodeProperties,
+        color: [u8; 4],
+    },
+    Image {
+        properties: WireNodeProperties,
+        image: String,
+        opacity: f32,
+    },
+    Text {
+        properties: WireTextNodeProperties,
+        text: String,
+        #[serde(default)]
+        style: WireTextStyle,
+    },
 }
 
-impl WireNodeContent {
-    fn into_input(self) -> Result<ContentInput> {
+impl WireNodeInput {
+    fn into_input(self) -> Result<NodeInput> {
         match self {
-            Self::Empty => Ok(ContentInput::Empty),
-            Self::Solid { color } => Ok(ContentInput::Solid { color }),
-            Self::Image { texture, opacity } => Ok(ContentInput::Image {
-                texture: parse_texture_handle(&texture)?,
+            Self::Empty { properties } => Ok(NodeInput::Empty {
+                properties: properties.into_input(),
+            }),
+            Self::Rectangle { properties, color } => Ok(NodeInput::Rectangle {
+                properties: properties.into_input(),
+                color,
+            }),
+            Self::Image {
+                properties,
+                image,
+                opacity,
+            } => Ok(NodeInput::Image {
+                properties: properties.into_input(),
+                image: parse_image_handle(&image)?,
                 opacity,
             }),
-            Self::AnimatedImage { image, opacity } => Ok(ContentInput::AnimatedImage {
-                image: parse_animated_image_handle(&image)?,
+            Self::Text {
+                properties,
+                text,
+                style,
+            } => Ok(NodeInput::Text {
+                properties: properties.into_input(),
+                text,
+                style: style.into_scene(),
+            }),
+        }
+    }
+
+    const fn uses_image(&self) -> bool {
+        matches!(self, Self::Image { .. })
+    }
+
+    const fn uses_text(&self) -> bool {
+        matches!(self, Self::Text { .. })
+    }
+
+    fn uses_overlap(&self) -> bool {
+        match self {
+            Self::Empty { properties }
+            | Self::Rectangle { properties, .. }
+            | Self::Image { properties, .. } => properties.overlap_enabled,
+            Self::Text { properties, .. } => properties.overlap_enabled,
+        }
+    }
+
+    fn uses_external_drop(&self) -> bool {
+        match self {
+            Self::Empty { properties }
+            | Self::Rectangle { properties, .. }
+            | Self::Image { properties, .. } => properties.external_drop_enabled,
+            Self::Text { properties, .. } => properties.external_drop_enabled,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireNodeVisual {
+    Empty,
+    Rectangle { color: [u8; 4] },
+    Image { image: String, opacity: f32 },
+}
+
+impl WireNodeVisual {
+    fn into_input(self) -> Result<NodeVisualInput> {
+        match self {
+            Self::Empty => Ok(NodeVisualInput::Empty),
+            Self::Rectangle { color } => Ok(NodeVisualInput::Rectangle { color }),
+            Self::Image { image, opacity } => Ok(NodeVisualInput::Image {
+                image: parse_image_handle(&image)?,
                 opacity,
             }),
         }
     }
 
-    const fn uses_texture(&self) -> bool {
+    const fn uses_image(&self) -> bool {
         matches!(self, Self::Image { .. })
     }
+}
 
-    const fn uses_animated_image(&self) -> bool {
-        matches!(self, Self::AnimatedImage { .. })
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireNodeParent {
+    Root,
+    Node { node: String },
+}
+
+impl WireNodeParent {
+    fn into_input(self) -> Result<NodeParent> {
+        match self {
+            Self::Root => Ok(NodeParent::Root),
+            Self::Node { node } => Ok(NodeParent::Node(parse_node_handle(&node)?)),
+        }
+    }
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct WireNodeChanges {
+    #[serde(default)]
+    properties: Option<WireNodePropertiesPatch>,
+    #[serde(default)]
+    parent: Option<WireNodeParent>,
+    #[serde(default)]
+    layer: Option<WireSceneLayer>,
+    #[serde(default)]
+    visual: Option<WireNodeVisual>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    text_style: Option<WireTextStyle>,
+}
+
+impl WireNodeChanges {
+    fn into_input(self) -> Result<NodeChanges> {
+        Ok(NodeChanges {
+            properties: self.properties.map(WireNodePropertiesPatch::into_patch),
+            parent: self.parent.map(WireNodeParent::into_input).transpose()?,
+            layer: self.layer.map(WireSceneLayer::into_scene),
+            visual: self.visual.map(WireNodeVisual::into_input).transpose()?,
+            text: self.text,
+            text_style: self.text_style.map(WireTextStyle::into_scene),
+        })
+    }
+
+    fn uses_image(&self) -> bool {
+        self.visual.as_ref().is_some_and(WireNodeVisual::uses_image)
+    }
+
+    const fn uses_text(&self) -> bool {
+        self.text.is_some() || self.text_style.is_some()
+    }
+
+    fn uses_overlap(&self) -> bool {
+        self.properties
+            .as_ref()
+            .is_some_and(|properties| properties.overlap_enabled.is_some())
+    }
+
+    fn uses_external_drop(&self) -> bool {
+        self.properties
+            .as_ref()
+            .is_some_and(|properties| properties.external_drop_enabled.is_some())
     }
 }
 
@@ -2771,12 +2633,8 @@ fn parse_node_handle(value: &str) -> Result<NodeHandle> {
     parse_handle(value, "node-").map(NodeHandle::new)
 }
 
-fn parse_texture_handle(value: &str) -> Result<TextureHandle> {
-    parse_handle(value, "texture-").map(TextureHandle::new)
-}
-
-fn parse_animated_image_handle(value: &str) -> Result<AnimatedImageHandle> {
-    parse_handle(value, "animated-image-").map(AnimatedImageHandle::new)
+fn parse_image_handle(value: &str) -> Result<ImageHandle> {
+    parse_handle(value, "image-").map(ImageHandle::new)
 }
 
 fn parse_handle(value: &str, prefix: &str) -> Result<u64> {
@@ -2815,26 +2673,24 @@ impl From<ProtocolVersion> for WireProtocolVersion {
 #[serde(rename_all = "snake_case")]
 enum WireCapability {
     Scene,
-    Resources,
+    Images,
     Input,
     Timing,
     Overlap,
     ExternalDrop,
     Text,
-    AnimatedImages,
 }
 
 impl WireCapability {
     const fn into_protocol(self) -> Capability {
         match self {
             Self::Scene => Capability::Scene,
-            Self::Resources => Capability::Resources,
+            Self::Images => Capability::Images,
             Self::Input => Capability::Input,
             Self::Timing => Capability::Timing,
             Self::Overlap => Capability::Overlap,
             Self::ExternalDrop => Capability::ExternalDrop,
             Self::Text => Capability::Text,
-            Self::AnimatedImages => Capability::AnimatedImages,
         }
     }
 }
@@ -2843,13 +2699,12 @@ impl From<Capability> for WireCapability {
     fn from(capability: Capability) -> Self {
         match capability {
             Capability::Scene => Self::Scene,
-            Capability::Resources => Self::Resources,
+            Capability::Images => Self::Images,
             Capability::Input => Self::Input,
             Capability::Timing => Self::Timing,
             Capability::Overlap => Self::Overlap,
             Capability::ExternalDrop => Self::ExternalDrop,
             Capability::Text => Self::Text,
-            Capability::AnimatedImages => Self::AnimatedImages,
         }
     }
 }
@@ -3641,51 +3496,45 @@ impl From<FocusEvent> for WireFocusState {
 enum WireCommandResult {
     Node {
         node: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text_metrics: Option<WireTextMetrics>,
     },
-    TextNode {
-        node: String,
-        metrics: WireTextMetrics,
+    NodeUpdated {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text_metrics: Option<WireTextMetrics>,
     },
-    Texture {
-        texture: String,
-    },
-    AnimatedImage {
+    Image {
         image: String,
     },
-    Overlaps {
+    IsOverlapping {
         overlapping: bool,
-        nodes: Vec<String>,
     },
-    TextMetrics {
-        metrics: WireTextMetrics,
+    Overlaps {
+        nodes: Vec<String>,
     },
     Acknowledged,
 }
 
-impl From<SceneCommandResult> for WireCommandResult {
-    fn from(result: SceneCommandResult) -> Self {
+impl From<ClpSceneCommandResult> for WireCommandResult {
+    fn from(result: ClpSceneCommandResult) -> Self {
         match result {
-            SceneCommandResult::Node(node) => Self::Node {
+            ClpSceneCommandResult::Node { node, text_metrics } => Self::Node {
                 node: node.to_string(),
+                text_metrics: text_metrics.map(Into::into),
             },
-            SceneCommandResult::TextNode { node, metrics } => Self::TextNode {
-                node: node.to_string(),
-                metrics: metrics.into(),
+            ClpSceneCommandResult::NodeUpdated { text_metrics } => Self::NodeUpdated {
+                text_metrics: text_metrics.map(Into::into),
             },
-            SceneCommandResult::Texture(texture) => Self::Texture {
-                texture: texture.to_string(),
-            },
-            SceneCommandResult::AnimatedImage(image) => Self::AnimatedImage {
+            ClpSceneCommandResult::Image(image) => Self::Image {
                 image: image.to_string(),
             },
-            SceneCommandResult::Overlaps(nodes) => Self::Overlaps {
-                overlapping: !nodes.is_empty(),
+            ClpSceneCommandResult::IsOverlapping(overlapping) => {
+                Self::IsOverlapping { overlapping }
+            }
+            ClpSceneCommandResult::Overlaps(nodes) => Self::Overlaps {
                 nodes: nodes.into_iter().map(|node| node.to_string()).collect(),
             },
-            SceneCommandResult::TextMetrics(metrics) => Self::TextMetrics {
-                metrics: metrics.into(),
-            },
-            SceneCommandResult::Acknowledged => Self::Acknowledged,
+            ClpSceneCommandResult::Acknowledged => Self::Acknowledged,
         }
     }
 }
@@ -3764,13 +3613,12 @@ impl WireHostMessage {
 fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
     [
         Capability::Scene,
-        Capability::Resources,
+        Capability::Images,
         Capability::Input,
         Capability::Timing,
         Capability::Overlap,
         Capability::ExternalDrop,
         Capability::Text,
-        Capability::AnimatedImages,
     ]
     .into_iter()
     .filter(|capability| capabilities.contains(*capability))
@@ -3872,13 +3720,12 @@ mod tests {
                 .into_iter()
                 .map(|capability| match capability {
                     "scene" => WireCapability::Scene,
-                    "resources" => WireCapability::Resources,
+                    "images" => WireCapability::Images,
                     "input" => WireCapability::Input,
                     "timing" => WireCapability::Timing,
                     "overlap" => WireCapability::Overlap,
                     "external_drop" => WireCapability::ExternalDrop,
                     "text" => WireCapability::Text,
-                    "animated_images" => WireCapability::AnimatedImages,
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -4032,7 +3879,7 @@ mod tests {
                     .drain_host_actions()
                     .into_iter()
                     .find_map(|action| match action {
-                        HostAction::Command(request) => Some(request),
+                        HostAction::Command(request) => Some(*request),
                         HostAction::Cleanup { .. } | HostAction::SessionStarted { .. } => None,
                     })
             {
@@ -4652,21 +4499,23 @@ mod tests {
             &mut client,
             WireClientMessage::Command {
                 request_id: "unsupported-external-drop-target".to_owned(),
-                command: WireSceneCommand::CreateRoot {
-                    layer: WireSceneLayer::Overlay,
-                    properties: WireNodeProperties {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 10.0,
-                        height: 10.0,
-                        visible: true,
-                        clip_children: false,
-                        z_index: 0,
-                        overlap_enabled: false,
-                        external_drop_enabled: true,
+                command: Box::new(WireSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(WireSceneLayer::Overlay),
+                    node: WireNodeInput::Empty {
+                        properties: WireNodeProperties {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 10.0,
+                            height: 10.0,
+                            visible: true,
+                            clip_children: false,
+                            z_index: 0,
+                            overlap_enabled: false,
+                            external_drop_enabled: true,
+                        },
                     },
-                    content: WireNodeContent::Empty,
-                },
+                }),
             },
         );
         let error = receive_host(&mut client);
@@ -4774,10 +4623,10 @@ mod tests {
     }
 
     #[test]
-    fn forwards_ordered_binary_texture_uploads_to_the_host_thread() {
+    fn forwards_rgba8_image_uploads_to_the_host_thread() {
         let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
-        send_client(&mut client, hello(&server, vec!["scene", "resources"]));
+        send_client(&mut client, hello(&server, vec!["images"]));
         let _ = receive_host(&mut client);
         send_client(&mut client, WireClientMessage::InitComplete);
         let _ = receive_host(&mut client);
@@ -4786,35 +4635,39 @@ mod tests {
         send_client(
             &mut client,
             WireClientMessage::Command {
-                request_id: "texture-request".to_owned(),
-                command: WireSceneCommand::UploadTexture {
-                    width: 1,
-                    height: 1,
-                },
+                request_id: "image-request".to_owned(),
+                command: Box::new(WireSceneCommand::UploadImage {
+                    source: WireImageSource::Rgba8 {
+                        width: 1,
+                        height: 1,
+                    },
+                }),
             },
         );
         write_binary_frame(&mut client, &[1, 2, 3, 4]).unwrap();
 
         let request = wait_for_host_command(&server);
-        assert_eq!(request.request_id, "texture-request");
+        assert_eq!(request.request_id, "image-request");
         assert_eq!(
             request.command,
-            SceneCommand::UploadTexture {
-                width: 1,
-                height: 1,
-                pixels: vec![1, 2, 3, 4],
+            ClpSceneCommand::UploadImage {
+                image: ImageUpload::Rgba8 {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 4],
+                },
             }
         );
-        request.respond(HostCommandResponse::Success(SceneCommandResult::Texture(
-            TextureHandle::new(7),
+        request.respond(HostCommandResponse::Success(ClpSceneCommandResult::Image(
+            ImageHandle::new(7),
         )));
 
         let result = receive_host(&mut client);
         assert_eq!(result["type"], "result");
-        assert_eq!(result["request_id"], "texture-request");
+        assert_eq!(result["request_id"], "image-request");
         assert_eq!(
             result["result"],
-            json!({ "kind": "texture", "texture": "texture-7" })
+            json!({ "kind": "image", "image": "image-7" })
         );
 
         send_client(&mut client, WireClientMessage::Close);
@@ -4822,18 +4675,12 @@ mod tests {
     }
 
     #[test]
-    fn forwards_encoded_animated_image_uploads_and_requires_its_capability() {
+    fn forwards_gif_image_uploads_and_requires_the_images_capability() {
         let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
-        send_client(
-            &mut client,
-            hello(&server, vec!["scene", "resources", "animated_images"]),
-        );
+        send_client(&mut client, hello(&server, vec!["images"]));
         let init = receive_host(&mut client);
-        assert_eq!(
-            init["capabilities"],
-            json!(["scene", "resources", "animated_images"])
-        );
+        assert_eq!(init["capabilities"], json!(["images"]));
         send_client(&mut client, WireClientMessage::InitComplete);
         let _ = receive_host(&mut client);
         send_client(&mut client, WireClientMessage::Started);
@@ -4841,38 +4688,35 @@ mod tests {
         send_client(
             &mut client,
             WireClientMessage::Command {
-                request_id: "animated-image-request".to_owned(),
-                command: WireSceneCommand::UploadAnimatedImage {
-                    format: WireAnimatedImageFormat::Gif,
-                    byte_length: 3,
-                },
+                request_id: "gif-image-request".to_owned(),
+                command: Box::new(WireSceneCommand::UploadImage {
+                    source: WireImageSource::Gif { byte_length: 3 },
+                }),
             },
         );
         write_binary_frame(&mut client, &[7, 8, 9]).unwrap();
         let request = wait_for_host_command(&server);
         assert_eq!(
             request.command,
-            SceneCommand::UploadAnimatedImage {
-                format: AnimatedImageFormat::Gif,
-                bytes: vec![7, 8, 9],
+            ClpSceneCommand::UploadImage {
+                image: ImageUpload::Gif {
+                    bytes: vec![7, 8, 9],
+                },
             }
         );
-        request.respond(HostCommandResponse::Success(
-            SceneCommandResult::AnimatedImage(AnimatedImageHandle::new(7)),
-        ));
+        request.respond(HostCommandResponse::Success(ClpSceneCommandResult::Image(
+            ImageHandle::new(7),
+        )));
         let result = receive_host(&mut client);
         assert_eq!(
             result["result"],
-            json!({ "kind": "animated_image", "image": "animated-image-7" })
+            json!({ "kind": "image", "image": "image-7" })
         );
         send_client(&mut client, WireClientMessage::Close);
         let _ = receive_host(&mut client);
 
         let mut denied_client = connect(&server);
-        send_client(
-            &mut denied_client,
-            hello(&server, vec!["resources", "animated_images"]),
-        );
+        send_client(&mut denied_client, hello(&server, vec![]));
         let _ = receive_host(&mut denied_client);
         send_client(&mut denied_client, WireClientMessage::InitComplete);
         let _ = receive_host(&mut denied_client);
@@ -4880,11 +4724,10 @@ mod tests {
         send_client(
             &mut denied_client,
             WireClientMessage::Command {
-                request_id: "denied-animated-image".to_owned(),
-                command: WireSceneCommand::UploadAnimatedImage {
-                    format: WireAnimatedImageFormat::Gif,
-                    byte_length: 1,
-                },
+                request_id: "denied-gif-image".to_owned(),
+                command: Box::new(WireSceneCommand::UploadImage {
+                    source: WireImageSource::Gif { byte_length: 1 },
+                }),
             },
         );
         write_binary_frame(&mut denied_client, &[0]).unwrap();
@@ -4907,10 +4750,12 @@ mod tests {
             &mut client,
             WireClientMessage::Command {
                 request_id: "denied-upload".to_owned(),
-                command: WireSceneCommand::UploadTexture {
-                    width: 1,
-                    height: 1,
-                },
+                command: Box::new(WireSceneCommand::UploadImage {
+                    source: WireImageSource::Rgba8 {
+                        width: 1,
+                        height: 1,
+                    },
+                }),
             },
         );
         write_binary_frame(&mut client, &[0; 4]).unwrap();
@@ -4941,21 +4786,23 @@ mod tests {
             &mut client,
             WireClientMessage::Command {
                 request_id: "denied-external-drop-target".to_owned(),
-                command: WireSceneCommand::CreateRoot {
-                    layer: WireSceneLayer::Overlay,
-                    properties: WireNodeProperties {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 10.0,
-                        height: 10.0,
-                        visible: true,
-                        clip_children: false,
-                        z_index: 0,
-                        overlap_enabled: false,
-                        external_drop_enabled: true,
+                command: Box::new(WireSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(WireSceneLayer::Overlay),
+                    node: WireNodeInput::Empty {
+                        properties: WireNodeProperties {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 10.0,
+                            height: 10.0,
+                            visible: true,
+                            clip_children: false,
+                            z_index: 0,
+                            overlap_enabled: false,
+                            external_drop_enabled: true,
+                        },
                     },
-                    content: WireNodeContent::Empty,
-                },
+                }),
             },
         );
 
@@ -4974,7 +4821,7 @@ mod tests {
     }
 
     #[test]
-    fn forwards_text_commands_and_reports_intrinsic_metrics() {
+    fn creates_text_nodes_and_reports_intrinsic_metrics() {
         let server = ClpServer::start(CapabilitySet::ALL).unwrap();
         let mut client = connect(&server);
         send_client(&mut client, hello(&server, vec!["scene", "text"]));
@@ -4988,9 +4835,34 @@ mod tests {
             &mut client,
             WireClientMessage::Command {
                 request_id: "text-root".to_owned(),
-                command: WireSceneCommand::CreateTextRoot {
-                    layer: WireSceneLayer::Overlay,
-                    properties: WireTextNodeProperties {
+                command: Box::new(WireSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(WireSceneLayer::Overlay),
+                    node: WireNodeInput::Text {
+                        properties: WireTextNodeProperties {
+                            x: 24.0,
+                            y: 48.0,
+                            visible: true,
+                            clip_children: false,
+                            z_index: 0,
+                            overlap_enabled: false,
+                            external_drop_enabled: false,
+                        },
+                        text: "Hello".to_owned(),
+                        style: WireTextStyle::default(),
+                    },
+                }),
+            },
+        );
+        let request = wait_for_host_command(&server);
+        assert_eq!(request.request_id, "text-root");
+        assert_eq!(
+            request.command,
+            ClpSceneCommand::CreateNode {
+                parent: None,
+                layer: Some(SceneLayer::Overlay),
+                node: NodeInput::Text {
+                    properties: TextNodePropertiesInput {
                         x: 24.0,
                         y: 48.0,
                         visible: true,
@@ -5000,38 +4872,19 @@ mod tests {
                         external_drop_enabled: false,
                     },
                     text: "Hello".to_owned(),
-                    style: WireTextStyle::default(),
+                    style: TextStyle::default(),
                 },
-            },
-        );
-        let request = wait_for_host_command(&server);
-        assert_eq!(request.request_id, "text-root");
-        assert_eq!(
-            request.command,
-            SceneCommand::CreateTextRoot {
-                layer: SceneLayer::Overlay,
-                properties: TextNodePropertiesInput {
-                    x: 24.0,
-                    y: 48.0,
-                    visible: true,
-                    clip_children: false,
-                    z_index: 0,
-                    overlap_enabled: false,
-                    external_drop_enabled: false,
-                },
-                text: "Hello".to_owned(),
-                style: TextStyle::default(),
             }
         );
-        request.respond(HostCommandResponse::Success(SceneCommandResult::TextNode {
+        request.respond(HostCommandResponse::Success(ClpSceneCommandResult::Node {
             node: NodeHandle::new(7),
-            metrics: TextMetrics {
+            text_metrics: Some(TextMetrics {
                 columns: 5,
                 rows: 1,
                 width: 48.0,
                 height: 20.0,
                 cells: 5,
-            },
+            }),
         }));
 
         let result = receive_host(&mut client);
@@ -5039,9 +4892,9 @@ mod tests {
         assert_eq!(
             result["result"],
             json!({
-                "kind": "text_node",
+                "kind": "node",
                 "node": "node-7",
-                "metrics": {
+                "text_metrics": {
                     "columns": 5,
                     "rows": 1,
                     "width": 48.0,
@@ -5055,20 +4908,82 @@ mod tests {
     }
 
     #[test]
-    fn requires_the_text_capability_and_related_opt_ins_for_text_nodes() {
-        let text = WireSceneCommand::CreateTextRoot {
-            layer: WireSceneLayer::Overlay,
-            properties: WireTextNodeProperties {
-                x: 0.0,
-                y: 0.0,
-                visible: true,
-                clip_children: false,
-                z_index: 0,
-                overlap_enabled: true,
-                external_drop_enabled: true,
+    fn forwards_atomic_node_changes_and_serializes_their_result() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "move-node".to_owned(),
+                command: Box::new(WireSceneCommand::SetNode {
+                    node: "node-4".to_owned(),
+                    changes: WireNodeChanges {
+                        properties: Some(WireNodePropertiesPatch {
+                            x: Some(48.0),
+                            y: Some(72.0),
+                            width: None,
+                            height: None,
+                            visible: None,
+                            clip_children: None,
+                            z_index: None,
+                            overlap_enabled: None,
+                            external_drop_enabled: None,
+                        }),
+                        ..WireNodeChanges::default()
+                    },
+                }),
             },
-            text: "x".to_owned(),
-            style: WireTextStyle::default(),
+        );
+        let request = wait_for_host_command(&server);
+        assert_eq!(request.request_id, "move-node");
+        assert_eq!(
+            request.command,
+            ClpSceneCommand::SetNode {
+                node: NodeHandle::new(4),
+                changes: NodeChanges {
+                    properties: Some(NodePropertiesPatch {
+                        x: Some(48.0),
+                        y: Some(72.0),
+                        ..NodePropertiesPatch::default()
+                    }),
+                    ..NodeChanges::default()
+                },
+            }
+        );
+        request.respond(HostCommandResponse::Success(
+            ClpSceneCommandResult::NodeUpdated { text_metrics: None },
+        ));
+        let result = receive_host(&mut client);
+        assert_eq!(result["result"], json!({ "kind": "node_updated" }));
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn requires_the_text_capability_and_related_opt_ins_for_text_nodes() {
+        let text = WireSceneCommand::CreateNode {
+            parent: None,
+            layer: Some(WireSceneLayer::Overlay),
+            node: WireNodeInput::Text {
+                properties: WireTextNodeProperties {
+                    x: 0.0,
+                    y: 0.0,
+                    visible: true,
+                    clip_children: false,
+                    z_index: 0,
+                    overlap_enabled: true,
+                    external_drop_enabled: true,
+                },
+                text: "x".to_owned(),
+                style: WireTextStyle::default(),
+            },
         };
         let scene_and_text =
             CapabilitySet::from_capabilities(&[Capability::Scene, Capability::Text]);
@@ -5096,22 +5011,22 @@ mod tests {
             &mut client,
             WireClientMessage::Command {
                 request_id: "overlap-query".to_owned(),
-                command: WireSceneCommand::QueryOverlaps {
+                command: Box::new(WireSceneCommand::GetOverlaps {
                     node: "node-3".to_owned(),
-                },
+                }),
             },
         );
         let request = wait_for_host_command(&server);
         assert_eq!(request.request_id, "overlap-query");
         assert_eq!(
             request.command,
-            SceneCommand::QueryOverlaps {
+            ClpSceneCommand::GetOverlaps {
                 node: NodeHandle::new(3)
             }
         );
-        request.respond(HostCommandResponse::Success(SceneCommandResult::Overlaps(
-            vec![NodeHandle::new(7), NodeHandle::new(9)],
-        )));
+        request.respond(HostCommandResponse::Success(
+            ClpSceneCommandResult::Overlaps(vec![NodeHandle::new(7), NodeHandle::new(9)]),
+        ));
 
         let result = receive_host(&mut client);
         assert_eq!(result["type"], "result");
@@ -5119,7 +5034,6 @@ mod tests {
             result["result"],
             json!({
                 "kind": "overlaps",
-                "overlapping": true,
                 "nodes": ["node-7", "node-9"]
             })
         );
@@ -5136,9 +5050,9 @@ mod tests {
             &mut denied_client,
             WireClientMessage::Command {
                 request_id: "denied-overlap-query".to_owned(),
-                command: WireSceneCommand::QueryOverlaps {
+                command: Box::new(WireSceneCommand::GetOverlaps {
                     node: "node-3".to_owned(),
-                },
+                }),
             },
         );
         let denied = receive_host(&mut denied_client);

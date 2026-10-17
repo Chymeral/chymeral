@@ -80,6 +80,25 @@ impl Display for AnimatedImageHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ImageHandle(u64);
+
+impl ImageHandle {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl Display for ImageHandle {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "image-{}", self.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodePropertiesInput {
     pub x: f64,
@@ -185,6 +204,105 @@ pub enum ContentInput {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum NodeInput {
+    Empty {
+        properties: NodePropertiesInput,
+    },
+    Rectangle {
+        properties: NodePropertiesInput,
+        color: [u8; 4],
+    },
+    Image {
+        properties: NodePropertiesInput,
+        image: ImageHandle,
+        opacity: f32,
+    },
+    Text {
+        properties: TextNodePropertiesInput,
+        text: String,
+        style: TextStyle,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NodeVisualInput {
+    Empty,
+    Rectangle { color: [u8; 4] },
+    Image { image: ImageHandle, opacity: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeParent {
+    Root,
+    Node(NodeHandle),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeChanges {
+    pub properties: Option<NodePropertiesPatch>,
+    pub parent: Option<NodeParent>,
+    pub layer: Option<SceneLayer>,
+    pub visual: Option<NodeVisualInput>,
+    pub text: Option<String>,
+    pub text_style: Option<TextStyle>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImageUpload {
+    Rgba8 {
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
+    Gif {
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClpSceneCommand {
+    CreateNode {
+        parent: Option<NodeHandle>,
+        layer: Option<SceneLayer>,
+        node: NodeInput,
+    },
+    SetNode {
+        node: NodeHandle,
+        changes: NodeChanges,
+    },
+    RemoveNode {
+        node: NodeHandle,
+    },
+    UploadImage {
+        image: ImageUpload,
+    },
+    RemoveImage {
+        image: ImageHandle,
+    },
+    IsOverlapping {
+        node: NodeHandle,
+    },
+    GetOverlaps {
+        node: NodeHandle,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClpSceneCommandResult {
+    Node {
+        node: NodeHandle,
+        text_metrics: Option<TextMetrics>,
+    },
+    NodeUpdated {
+        text_metrics: Option<TextMetrics>,
+    },
+    Image(ImageHandle),
+    IsOverlapping(bool),
+    Overlaps(Vec<NodeHandle>),
+    Acknowledged,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum SceneCommand {
     CreateRoot {
         layer: SceneLayer,
@@ -268,9 +386,11 @@ pub enum SceneCommandResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProgramSceneError {
     InvalidNodeHandle(NodeHandle),
+    InvalidImageHandle(ImageHandle),
     InvalidTextureHandle(TextureHandle),
     InvalidAnimatedImageHandle(AnimatedImageHandle),
     HandleNotOwned,
+    ImageInUse(ImageHandle),
     TextureInUse(TextureHandle),
     AnimatedImageInUse(AnimatedImageHandle),
     TextureDimensionLimitExceeded { limit: u32 },
@@ -285,6 +405,8 @@ pub enum ProgramSceneError {
     TextNodeRequired(NodeHandle),
     IntrinsicTextBounds(NodeHandle),
     TextContentRequiresTextCommands(NodeHandle),
+    NodeKindMismatch(NodeHandle),
+    InvalidNodeChange(&'static str),
     TextLimitExceeded { limit: usize },
     SessionTextLimitExceeded { limit: usize },
     SessionTextNodeLimitExceeded { limit: usize },
@@ -296,10 +418,14 @@ impl Display for ProgramSceneError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidNodeHandle(handle) => write!(formatter, "{handle} is not valid"),
+            Self::InvalidImageHandle(handle) => write!(formatter, "{handle} is not valid"),
             Self::InvalidTextureHandle(handle) => write!(formatter, "{handle} is not valid"),
             Self::InvalidAnimatedImageHandle(handle) => write!(formatter, "{handle} is not valid"),
             Self::HandleNotOwned => {
                 formatter.write_str("the resource handle is not owned by this session")
+            }
+            Self::ImageInUse(handle) => {
+                write!(formatter, "{handle} is still referenced by a scene node")
             }
             Self::TextureInUse(handle) => {
                 write!(formatter, "{handle} is still referenced by a scene node")
@@ -336,6 +462,13 @@ impl Display for ProgramSceneError {
                     "{handle} contains text and must be changed with text commands"
                 )
             }
+            Self::NodeKindMismatch(handle) => {
+                write!(
+                    formatter,
+                    "{handle} cannot change between text and visual content"
+                )
+            }
+            Self::InvalidNodeChange(message) => formatter.write_str(message),
             Self::TextLimitExceeded { limit } => {
                 write!(formatter, "text may not exceed {limit} bytes or cells")
             }
@@ -370,9 +503,11 @@ impl Error for ProgramSceneError {}
 pub struct ProgramSceneResources {
     max_texture_dimension: u32,
     next_node_handle: u64,
+    next_image_handle: u64,
     next_texture_handle: u64,
     next_animated_image_handle: u64,
     nodes: BTreeMap<NodeHandle, OwnedNode>,
+    images: BTreeMap<ImageHandle, OwnedImage>,
     textures: BTreeMap<TextureHandle, OwnedTexture>,
     animated_images: BTreeMap<AnimatedImageHandle, OwnedAnimatedImage>,
     animation_store: AnimatedImageStore,
@@ -393,6 +528,18 @@ struct OwnedTexture {
     session: SessionId,
     texture: crate::resources::TextureId,
     bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct OwnedImage {
+    session: SessionId,
+    resource: ImageResource,
+}
+
+#[derive(Clone, Copy)]
+enum ImageResource {
+    Texture(TextureHandle),
+    AnimatedImage(AnimatedImageHandle),
 }
 
 #[derive(Clone, Copy)]
@@ -437,6 +584,7 @@ impl ProgramSceneResources {
         Self {
             max_texture_dimension,
             next_node_handle: 1,
+            next_image_handle: 1,
             next_texture_handle: 1,
             next_animated_image_handle: 1,
             text_layout: TextLayout::new(16.0, 9.6, 20.0, [])
@@ -456,6 +604,349 @@ impl ProgramSceneResources {
 
     pub fn animated_images_mut(&mut self) -> &mut AnimatedImageStore {
         &mut self.animation_store
+    }
+
+    pub fn execute_clp(
+        &mut self,
+        session: SessionId,
+        command: ClpSceneCommand,
+        scene: &mut Scene,
+        textures: &mut TextureStore,
+    ) -> Result<ClpSceneCommandResult, ProgramSceneError> {
+        match command {
+            ClpSceneCommand::CreateNode {
+                parent,
+                layer,
+                node,
+            } => self.create_clp_node(session, parent, layer, node, scene, textures),
+            ClpSceneCommand::SetNode { node, changes } => {
+                self.set_clp_node(session, node, changes, scene)
+            }
+            ClpSceneCommand::RemoveNode { node } => {
+                self.execute(session, SceneCommand::RemoveNode { node }, scene, textures)?;
+                Ok(ClpSceneCommandResult::Acknowledged)
+            }
+            ClpSceneCommand::UploadImage { image } => {
+                let handle = self.allocate_image_handle()?;
+                let resource = match image {
+                    ImageUpload::Rgba8 {
+                        width,
+                        height,
+                        pixels,
+                    } => match self.execute(
+                        session,
+                        SceneCommand::UploadTexture {
+                            width,
+                            height,
+                            pixels,
+                        },
+                        scene,
+                        textures,
+                    )? {
+                        SceneCommandResult::Texture(texture) => ImageResource::Texture(texture),
+                        _ => unreachable!("an RGBA8 upload returns a texture handle"),
+                    },
+                    ImageUpload::Gif { bytes } => match self.execute(
+                        session,
+                        SceneCommand::UploadAnimatedImage {
+                            format: AnimatedImageFormat::Gif,
+                            bytes,
+                        },
+                        scene,
+                        textures,
+                    )? {
+                        SceneCommandResult::AnimatedImage(image) => {
+                            ImageResource::AnimatedImage(image)
+                        }
+                        _ => unreachable!("a GIF upload returns an animated image handle"),
+                    },
+                };
+                self.images.insert(handle, OwnedImage { session, resource });
+                Ok(ClpSceneCommandResult::Image(handle))
+            }
+            ClpSceneCommand::RemoveImage { image } => {
+                let owned = self.image_for(session, image)?;
+                match owned.resource {
+                    ImageResource::Texture(texture) => {
+                        self.execute(
+                            session,
+                            SceneCommand::DestroyTexture { texture },
+                            scene,
+                            textures,
+                        )
+                        .map_err(|error| match error {
+                            ProgramSceneError::TextureInUse(_) => {
+                                ProgramSceneError::ImageInUse(image)
+                            }
+                            error => error,
+                        })?;
+                    }
+                    ImageResource::AnimatedImage(animated_image) => {
+                        self.execute(
+                            session,
+                            SceneCommand::DestroyAnimatedImage {
+                                image: animated_image,
+                            },
+                            scene,
+                            textures,
+                        )
+                        .map_err(|error| match error {
+                            ProgramSceneError::AnimatedImageInUse(_) => {
+                                ProgramSceneError::ImageInUse(image)
+                            }
+                            error => error,
+                        })?;
+                    }
+                }
+                self.images.remove(&image);
+                Ok(ClpSceneCommandResult::Acknowledged)
+            }
+            ClpSceneCommand::IsOverlapping { node } => Ok(ClpSceneCommandResult::IsOverlapping(
+                !self.overlaps_for(session, node, scene)?.is_empty(),
+            )),
+            ClpSceneCommand::GetOverlaps { node } => Ok(ClpSceneCommandResult::Overlaps(
+                self.overlaps_for(session, node, scene)?,
+            )),
+        }
+    }
+
+    fn create_clp_node(
+        &mut self,
+        session: SessionId,
+        parent: Option<NodeHandle>,
+        layer: Option<SceneLayer>,
+        node: NodeInput,
+        scene: &mut Scene,
+        textures: &mut TextureStore,
+    ) -> Result<ClpSceneCommandResult, ProgramSceneError> {
+        if parent.is_some() && layer.is_some() {
+            return Err(ProgramSceneError::InvalidNodeChange(
+                "only root nodes may specify a layer",
+            ));
+        }
+
+        let result = match node {
+            NodeInput::Empty { properties } => self.create_clp_visual_node(
+                session,
+                parent,
+                layer.unwrap_or_default(),
+                (properties, ContentInput::Empty),
+                scene,
+                textures,
+            )?,
+            NodeInput::Rectangle { properties, color } => self.create_clp_visual_node(
+                session,
+                parent,
+                layer.unwrap_or_default(),
+                (properties, ContentInput::Solid { color }),
+                scene,
+                textures,
+            )?,
+            NodeInput::Image {
+                properties,
+                image,
+                opacity,
+            } => self.create_clp_visual_node(
+                session,
+                parent,
+                layer.unwrap_or_default(),
+                (
+                    properties,
+                    self.resolve_clp_visual(session, NodeVisualInput::Image { image, opacity })?,
+                ),
+                scene,
+                textures,
+            )?,
+            NodeInput::Text {
+                properties,
+                text,
+                style,
+            } => match parent {
+                Some(parent) => self.execute(
+                    session,
+                    SceneCommand::CreateTextChild {
+                        parent,
+                        properties,
+                        text,
+                        style,
+                    },
+                    scene,
+                    textures,
+                )?,
+                None => self.execute(
+                    session,
+                    SceneCommand::CreateTextRoot {
+                        layer: layer.unwrap_or_default(),
+                        properties,
+                        text,
+                        style,
+                    },
+                    scene,
+                    textures,
+                )?,
+            },
+        };
+
+        match result {
+            SceneCommandResult::Node(node) => Ok(ClpSceneCommandResult::Node {
+                node,
+                text_metrics: None,
+            }),
+            SceneCommandResult::TextNode { node, metrics } => Ok(ClpSceneCommandResult::Node {
+                node,
+                text_metrics: Some(metrics),
+            }),
+            _ => unreachable!("creating a node returns a node handle"),
+        }
+    }
+
+    fn create_clp_visual_node(
+        &mut self,
+        session: SessionId,
+        parent: Option<NodeHandle>,
+        layer: SceneLayer,
+        node: (NodePropertiesInput, ContentInput),
+        scene: &mut Scene,
+        textures: &mut TextureStore,
+    ) -> Result<SceneCommandResult, ProgramSceneError> {
+        let (properties, content) = node;
+        match parent {
+            Some(parent) => self.execute(
+                session,
+                SceneCommand::CreateChild {
+                    parent,
+                    properties,
+                    content,
+                },
+                scene,
+                textures,
+            ),
+            None => self.execute(
+                session,
+                SceneCommand::CreateRoot {
+                    layer,
+                    properties,
+                    content,
+                },
+                scene,
+                textures,
+            ),
+        }
+    }
+
+    fn set_clp_node(
+        &mut self,
+        session: SessionId,
+        handle: NodeHandle,
+        changes: NodeChanges,
+        scene: &mut Scene,
+    ) -> Result<ClpSceneCommandResult, ProgramSceneError> {
+        let node = self.node_for(session, handle)?;
+        let (is_text, current_properties, current_parent) = {
+            let current = scene
+                .node(node)
+                .ok_or(ProgramSceneError::InvalidNodeHandle(handle))?;
+            (
+                matches!(current.content(), NodeContent::Text(_)),
+                current.properties(),
+                current.parent(),
+            )
+        };
+        if is_text && changes.visual.is_some() {
+            return Err(ProgramSceneError::NodeKindMismatch(handle));
+        }
+        if !is_text && (changes.text.is_some() || changes.text_style.is_some()) {
+            return Err(ProgramSceneError::NodeKindMismatch(handle));
+        }
+        if is_text
+            && changes
+                .properties
+                .is_some_and(|properties| properties.width.is_some() || properties.height.is_some())
+        {
+            return Err(ProgramSceneError::IntrinsicTextBounds(handle));
+        }
+
+        let mut properties = changes
+            .properties
+            .map(|properties| properties.apply(current_properties))
+            .transpose()?
+            .unwrap_or(current_properties);
+        self.validate_overlap_capacity(
+            session,
+            current_properties.overlap_enabled,
+            properties.overlap_enabled,
+            scene,
+        )?;
+
+        let parent = changes
+            .parent
+            .map(|parent| match parent {
+                NodeParent::Root => Ok(None),
+                NodeParent::Node(parent) => self.node_for(session, parent).map(Some),
+            })
+            .transpose()?
+            .unwrap_or(current_parent);
+        if changes.layer.is_some() && parent.is_some() {
+            return Err(ProgramSceneError::InvalidNodeChange(
+                "only root nodes may specify a layer",
+            ));
+        }
+        scene
+            .validate_reparent(node, parent)
+            .map_err(ProgramSceneError::Scene)?;
+
+        let visual = changes
+            .visual
+            .map(|visual| {
+                self.resolve_clp_visual(session, visual)
+                    .and_then(|visual| self.resolve_content(session, visual))
+            })
+            .transpose()?;
+        let text = if is_text && (changes.text.is_some() || changes.text_style.is_some()) {
+            let existing = self.text_node_for(handle, node, scene)?;
+            let (text, metrics) = self.create_text_node(
+                session,
+                changes.text.unwrap_or_else(|| existing.text().to_owned()),
+                changes
+                    .text_style
+                    .unwrap_or_else(|| existing.style().clone()),
+                scene,
+                Some(&existing),
+            )?;
+            properties.bounds = Rect::new(0.0, 0.0, metrics.width, metrics.height)
+                .map_err(ProgramSceneError::Geometry)?;
+            Some((text, metrics))
+        } else {
+            None
+        };
+
+        scene
+            .set_properties(node, properties)
+            .expect("a validated scene node remains valid");
+        if let Some(visual) = visual {
+            scene
+                .set_content(node, visual)
+                .expect("a validated scene node remains valid");
+        }
+        if let Some((text, _)) = &text {
+            scene
+                .set_content(node, NodeContent::Text(text.clone()))
+                .expect("a validated scene node remains valid");
+        }
+        if current_parent != parent {
+            scene
+                .reparent(node, parent)
+                .expect("a validated scene hierarchy remains valid");
+        }
+        if let Some(layer) = changes.layer {
+            scene
+                .set_root_layer(node, layer)
+                .expect("a validated root node remains valid");
+        }
+        self.reconcile_overlaps(session, scene)?;
+        Ok(ClpSceneCommandResult::NodeUpdated {
+            text_metrics: text.map(|(_, metrics)| metrics),
+        })
     }
 
     pub fn execute(
@@ -778,6 +1269,7 @@ impl ProgramSceneResources {
             }
         }
         self.session_texture_bytes.remove(&session);
+        self.images.retain(|_, owned| owned.session != session);
         self.discard_missing_overlap_pairs();
     }
 
@@ -1104,6 +1596,25 @@ impl ProgramSceneResources {
             .map_err(ProgramSceneError::Scene)
     }
 
+    fn resolve_clp_visual(
+        &self,
+        session: SessionId,
+        visual: NodeVisualInput,
+    ) -> Result<ContentInput, ProgramSceneError> {
+        match visual {
+            NodeVisualInput::Empty => Ok(ContentInput::Empty),
+            NodeVisualInput::Rectangle { color } => Ok(ContentInput::Solid { color }),
+            NodeVisualInput::Image { image, opacity } => {
+                match self.image_for(session, image)?.resource {
+                    ImageResource::Texture(texture) => Ok(ContentInput::Image { texture, opacity }),
+                    ImageResource::AnimatedImage(image) => {
+                        Ok(ContentInput::AnimatedImage { image, opacity })
+                    }
+                }
+            }
+        }
+    }
+
     fn resolve_content(
         &self,
         session: SessionId,
@@ -1153,6 +1664,22 @@ impl ProgramSceneResources {
         Ok(owned.texture)
     }
 
+    fn image_for(
+        &self,
+        session: SessionId,
+        handle: ImageHandle,
+    ) -> Result<OwnedImage, ProgramSceneError> {
+        let owned = self
+            .images
+            .get(&handle)
+            .copied()
+            .ok_or(ProgramSceneError::InvalidImageHandle(handle))?;
+        if owned.session != session {
+            return Err(ProgramSceneError::HandleNotOwned);
+        }
+        Ok(owned)
+    }
+
     fn animated_image_for(
         &self,
         session: SessionId,
@@ -1179,6 +1706,15 @@ impl ProgramSceneResources {
             .checked_add(1)
             .ok_or(ProgramSceneError::HandleExhausted)?;
         self.nodes.insert(handle, OwnedNode { session, node });
+        Ok(handle)
+    }
+
+    fn allocate_image_handle(&mut self) -> Result<ImageHandle, ProgramSceneError> {
+        let handle = ImageHandle(self.next_image_handle);
+        self.next_image_handle = self
+            .next_image_handle
+            .checked_add(1)
+            .ok_or(ProgramSceneError::HandleExhausted)?;
         Ok(handle)
     }
 
@@ -2358,6 +2894,197 @@ mod tests {
                 )
                 .unwrap(),
             SceneCommandResult::Overlaps(vec![])
+        );
+    }
+
+    #[test]
+    fn clp_v2_unifies_images_and_rejects_partial_node_changes() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let image = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::UploadImage {
+                    image: ImageUpload::Rgba8 {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![255, 127, 0, 255],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Image(image) => image,
+            _ => unreachable!(),
+        };
+        let node = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: NodeInput::Rectangle {
+                        properties: properties(),
+                        color: [0, 0, 255, 255],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            resources.execute_clp(
+                session,
+                ClpSceneCommand::SetNode {
+                    node,
+                    changes: NodeChanges {
+                        properties: Some(NodePropertiesPatch {
+                            x: Some(99.0),
+                            ..NodePropertiesPatch::default()
+                        }),
+                        text: Some("not allowed".to_owned()),
+                        ..NodeChanges::default()
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::NodeKindMismatch(node))
+        );
+        let scene_node = resources.node_for(session, node).unwrap();
+        assert_eq!(
+            scene.node(scene_node).unwrap().properties().transform.x(),
+            1.0
+        );
+
+        resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SetNode {
+                    node,
+                    changes: NodeChanges {
+                        visual: Some(NodeVisualInput::Image {
+                            image,
+                            opacity: 0.5,
+                        }),
+                        ..NodeChanges::default()
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(matches!(
+            resources.execute_clp(
+                session,
+                ClpSceneCommand::RemoveImage { image },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::ImageInUse(handle)) if handle == image
+        ));
+        resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SetNode {
+                    node,
+                    changes: NodeChanges {
+                        visual: Some(NodeVisualInput::Rectangle {
+                            color: [0, 0, 255, 255],
+                        }),
+                        ..NodeChanges::default()
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert_eq!(
+            resources
+                .execute_clp(
+                    session,
+                    ClpSceneCommand::RemoveImage { image },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            ClpSceneCommandResult::Acknowledged
+        );
+    }
+
+    #[test]
+    fn clp_v2_reports_boolean_and_complete_overlap_queries() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let collider = |x| NodeInput::Empty {
+            properties: NodePropertiesInput {
+                x,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                visible: true,
+                clip_children: false,
+                z_index: 0,
+                overlap_enabled: true,
+                external_drop_enabled: false,
+            },
+        };
+        let create = |resources: &mut ProgramSceneResources,
+                      scene: &mut Scene,
+                      textures: &mut TextureStore,
+                      node| {
+            match resources
+                .execute_clp(
+                    session,
+                    ClpSceneCommand::CreateNode {
+                        parent: None,
+                        layer: None,
+                        node,
+                    },
+                    scene,
+                    textures,
+                )
+                .unwrap()
+            {
+                ClpSceneCommandResult::Node { node, .. } => node,
+                _ => unreachable!(),
+            }
+        };
+        let first = create(&mut resources, &mut scene, &mut textures, collider(0.0));
+        let second = create(&mut resources, &mut scene, &mut textures, collider(5.0));
+
+        assert_eq!(
+            resources
+                .execute_clp(
+                    session,
+                    ClpSceneCommand::IsOverlapping { node: first },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            ClpSceneCommandResult::IsOverlapping(true)
+        );
+        assert_eq!(
+            resources
+                .execute_clp(
+                    session,
+                    ClpSceneCommand::GetOverlaps { node: first },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            ClpSceneCommandResult::Overlaps(vec![second])
         );
     }
 }

@@ -565,20 +565,15 @@ impl Scene {
     }
 
     pub fn reparent(&mut self, node: NodeId, parent: Option<NodeId>) -> Result<(), SceneError> {
+        self.validate_reparent(node, parent)?;
         let current_node = self.require_node(node)?;
         let current_parent = current_node.parent;
         if current_parent == parent {
             return Ok(());
         }
-        let layer = if let Some(parent) = parent {
-            let parent_node = self.require_node(parent)?;
-            if self.is_descendant_of(parent, node) {
-                return Err(SceneError::WouldCreateCycle { node, parent });
-            }
-            parent_node.layer
-        } else {
-            current_node.layer
-        };
+        let layer = parent
+            .and_then(|parent| self.node(parent).map(Node::layer))
+            .unwrap_or(current_node.layer);
 
         self.detach(node, current_parent);
         self.require_node_mut(node)?.parent = parent;
@@ -587,6 +582,24 @@ impl Scene {
             None => self.roots.push(node),
         }
         self.set_subtree_layer(node, layer)?;
+        Ok(())
+    }
+
+    pub fn validate_reparent(
+        &self,
+        node: NodeId,
+        parent: Option<NodeId>,
+    ) -> Result<(), SceneError> {
+        let current_node = self.require_node(node)?;
+        if current_node.parent == parent {
+            return Ok(());
+        }
+        if let Some(parent) = parent {
+            self.require_node(parent)?;
+            if self.is_descendant_of(parent, node) {
+                return Err(SceneError::WouldCreateCycle { node, parent });
+            }
+        }
         Ok(())
     }
 

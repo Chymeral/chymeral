@@ -1,9 +1,7 @@
 # Chymeral Main Manual
 
-This manual describes the stable CLP v1.3 contract and the implemented,
-provisional CLP v1.4 `external_drop`, `text`, and `animated_images`
-extensions. It is written for terminal users, application authors, and SDK
-implementers.
+This manual describes the public CLP v2.0 contract. It is written for terminal
+users, application authors, and SDK implementers.
 For the design and milestone history, see the [Technical Journal](Technical_Journal.md).
 
 ## 1. Product model
@@ -173,10 +171,9 @@ has `id`, optional `parent`, `x`, `y`, `width`, `height`, `color`, `opacity`,
 ## 5. CLP sessions
 
 **CLP** means *Chymeral Link Protocol*. It is a versioned, language-neutral
-contract between a Chymeral window and an application process. The stable
-contract is **CLP v1.3**. The host currently also negotiates provisional
-**CLP v1.4** `external_drop`, `text`, and `animated_images` capabilities; v1.3
-clients remain supported and never receive those capabilities.
+contract between a Chymeral window and an application process. The public
+contract is **CLP v2.0**. It intentionally does not accept CLP v1.x clients or
+provide command aliases for their prior vocabulary.
 
 When Chymeral starts its shell, the shell and its descendants inherit two
 private variables:
@@ -225,13 +222,12 @@ intersection with its supported set:
 | Capability | Enables |
 | --- | --- |
 | `scene` | Creating and changing retained nodes. |
-| `resources` | Uploading and destroying session-owned RGBA8 textures. |
+| `images` | Uploading and removing session-owned RGBA8 or GIF images. |
 | `input` | Resize, focused keyboard input, raw input subscriptions, terminal state subscriptions, and scene interaction. |
 | `timing` | Tick and frame subscriptions. |
 | `overlap` | Rectangle overlap state, queries, and transitions; also requires `scene` for commands. |
-| `external_drop` *(provisional v1.4)* | Incoming desktop-file drops targeted to opt-in scene nodes. |
-| `text` *(provisional v1.4)* | Creating and changing intrinsic scene-text nodes; also requires `scene`. |
-| `animated_images` *(provisional v1.4)* | Uploading GIF-backed animated image resources; also requires `scene` and `resources`. |
+| `external_drop` | Incoming desktop-file drops targeted to opt-in scene nodes. |
+| `text` | Creating and changing intrinsic scene-text nodes; also requires `scene`. |
 
 After the lifecycle handshake, a client may replace its subscription set:
 
@@ -281,39 +277,62 @@ overlap_enabled
 external_drop_enabled
 ```
 
-Node content is `empty`, a premultiplied RGBA8 `solid` color, a static `image`
-that references an uploaded texture, or an `animated_image` that references a
-GIF-backed animated resource; both image kinds have independent opacity.
-Intrinsic text is a separate node kind because its width and height are
-host-computed. The public scene operations are:
+Nodes use one of four kinds: `empty`, `rectangle`, `image`, or `text`.
+`rectangle` carries an RGBA8 color. `image` references one unified static RGBA8
+or GIF image handle and has independent opacity. Text is a separate intrinsic
+family because the host computes its width and height. The public scene
+operations are:
 
 ```text
-create_root       create_child       update_node
-set_content       reparent           remove_node
-upload_texture    destroy_texture    query_overlaps
-create_text_root  create_text_child  set_text  set_text_style
-upload_animated_image  destroy_animated_image
+create_node       set_node           remove_node
+upload_image      remove_image
+is_overlapping    get_overlaps
 ```
 
-`upload_texture` accepts exactly `width × height × 4` RGBA8 bytes. Chymeral
-does not read arbitrary client file paths or accept base64 texture data. Handles
-returned for nodes and textures are opaque, session-owned values. A session may
-not access another session's handles; its nodes and textures are safely cleaned
-up when it closes, faults, or disconnects.
+Each session owns one implicit retained scene tree. `create_node` creates a
+root when `parent` is omitted, or a child when it names an owned node. `layer`
+is optional for roots only and defaults to `overlay`; it must be omitted for
+children. A successful result contains `node-N`, plus `text_metrics` for a text
+node. There is no `create_scene_tree` operation because a session cannot create
+another scene.
 
-The host validates dimensions, ownership, capabilities, texture usage, and
-resource limits before applying a command. An individual static texture is
-limited to 64 MiB of RGBA8 data; the combined static-texture and decoded
-animated-image total is limited to 128 MiB per session, in addition to GPU
-limits.
+`set_node` applies one validated patch atomically. Its `changes` object may
+include `properties`, `parent`, `layer`, `visual`, `text`, or `text_style`.
+Omit a field to preserve it. A parent change uses either
+`{ "kind": "root" }` or `{ "kind": "node", "node": "node-N" }`.
+`layer` remains root-only. Visual nodes may switch among `empty`, `rectangle`,
+and `image`; text nodes may change text or style but cannot become visual, and
+visual nodes cannot become text. Create a replacement node for a cross-family
+change.
 
-### 6.1 Intrinsic scene text *(provisional CLP v1.4)*
+`upload_image` sends metadata followed by consecutive binary CLP frames. Its
+source is either `{ "kind": "rgba8", "width": W, "height": H }`, requiring
+exactly `W × H × 4` RGBA8 bytes, or `{ "kind": "gif", "byte_length": N }`,
+requiring exactly `N` encoded GIF bytes. Chymeral does not read client paths or
+accept base64 image data. It returns one opaque, session-owned `image-N` handle
+for either source. `remove_image` rejects an image that a node still references.
+Nodes and images are safely cleaned up when a session closes, faults, or
+disconnects.
 
-With `scene` and `text`, an application creates a text root or child with
-`x`, `y`, text, and one style. Its origin is the upper-left corner of the first
-cell, not the visible ink bounds. The host returns terminal-cell metrics and
-uses the resulting rectangle for drawing, clipping, hit testing, dragging, and
-opt-in overlap or external-drop targeting.
+The host validates dimensions, ownership, capabilities, image use, and resource
+limits before applying a command. An individual static image is limited to
+64 MiB of RGBA8 data; the combined static-image and decoded-GIF total is
+limited to 128 MiB per session, in addition to GPU limits.
+
+Command rejection uses a stable machine-readable `code` plus a diagnostic
+message. The v2 codes are `unsupported_version`, `capability_denied`,
+`invalid_command`, `invalid_handle`, `not_owner`, `image_in_use`,
+`resource_limit`, `invalid_argument`, `invalid_node_change`, `host_capacity`,
+`host_unavailable`, and `protocol_violation`. Clients should branch only on the
+code; messages are for people and diagnostics.
+
+### 6.1 Intrinsic scene text
+
+With `scene` and `text`, an application creates a `text` node through
+`create_node`. Its origin is the upper-left corner of the first cell, not the
+visible ink bounds. The host returns terminal-cell metrics and uses the
+resulting rectangle for drawing, clipping, hit testing, dragging, and opt-in
+overlap or external-drop targeting.
 
 Text accepts printable Unicode, explicit `\n`, and `\t`. Tabs advance to local
 eight-cell stops; wide and combining Unicode follow terminal cell-width rules.
@@ -333,25 +352,19 @@ A session retains at most 16 MiB of text, 1 Mi terminal cells, and 1,024 text
 nodes. These limits prevent a client from exhausting host memory or rendering
 resources.
 
-### 6.2 Animated scene images *(provisional CLP v1.4)*
+### 6.2 Animated scene images
 
-With `scene`, `resources`, and `animated_images`, a client uploads an encoded
-GIF as a binary resource. It first sends an `upload_animated_image` command
-with `format: "gif"` and `byte_length`; it then sends consecutive CLP binary
-frames whose combined length is exactly `byte_length`. A successful result has
-`kind: "animated_image"` and an opaque `animated-image-N` handle. That handle
-is used as scene content:
-
-```text
-{ "kind": "animated_image", "image": "animated-image-N", "opacity": 1.0 }
-```
+With `images`, a client uploads encoded GIF bytes through the same
+`upload_image` operation used for RGBA8 images. It declares
+`{ "kind": "gif", "byte_length": N }`, sends exactly `N` consecutive binary
+bytes, receives `image-N`, then creates or updates an `image` node using that
+handle.
 
 An animated resource uses the same explicit rectangle, clipping, stacking,
 hit-testing, drag, overlap, and external-drop behavior as a static image node.
 It does not infer a rectangle from GIF dimensions and no client filesystem path
-is accepted. `destroy_animated_image` rejects a resource that is still
-referenced by an owned node; removing those nodes or closing the session makes
-it releasable.
+is accepted. `remove_image` rejects an image that is still referenced by an
+owned node; removing those nodes or closing the session makes it releasable.
 
 Chymeral decodes and schedules GIF frames itself. Delays are clamped to 20 ms
 through 10 s. A delayed host turn advances at most one frame, so it never emits
@@ -364,9 +377,8 @@ becomes visible.
 
 The encoded upload is limited to 16 MiB, an animation to 300 frames and 64 MiB
 of decoded RGBA8 data, and every frame must meet the active GPU dimension and
-64 MiB image limits. GIF is the only animated-source format in this provisional
-extension. APNG, animated WebP, video, and property interpolation are not part
-of this contract.
+64 MiB image limits. GIF is the only animated-source format. APNG, animated
+WebP, video, and property interpolation are not part of this contract.
 
 ## 7. Input, interaction, and overlap
 
@@ -398,13 +410,13 @@ nodes can therefore serve as colliders. Touching only an edge is not an
 overlap. There is no cross-session collision state.
 
 `OverlapEnter` and `OverlapLeave` occur on a state transition. A program can
-also call `query_overlaps` immediately after changing a node to retrieve its
+call `is_overlapping` for the direct boolean state or `get_overlaps` for its
 current same-session contacts in deterministic order. The queried node itself
 does not need to have overlap enabled. This supports keyboard-driven games and
 layout rules without imposing physics. Image alpha silhouettes, collision
 response, non-rectangular shapes, native gamepads, and multitouch are outside
-the current contract. Incoming external file drop is available provisionally
-through `external_drop`; outgoing desktop drag-and-drop is not implemented.
+the current contract. Incoming external file drop uses the `external_drop`
+capability; outgoing desktop drag-and-drop is not implemented.
 
 ## 8. Timing and delivery pressure
 
@@ -443,7 +455,7 @@ Run the application from a Chymeral terminal, then connect and create a node:
 
 ```rust
 use chymeral_rust_sdk::{
-    Capabilities, Capability, Client, NodeContent, NodeProperties, SceneLayer,
+    Capabilities, Capability, Client, NodeInput, NodeProperties, SceneLayer,
 };
 
 fn main() -> chymeral_rust_sdk::Result<()> {
@@ -451,10 +463,13 @@ fn main() -> chymeral_rust_sdk::Result<()> {
         Capability::Scene,
     ]))?;
 
-    let _node = client.create_root(
-        SceneLayer::Overlay,
-        NodeProperties::new(48.0, 48.0, 160.0, 96.0),
-        NodeContent::Solid { color: [249, 115, 22, 255] },
+    let _node = client.create_node(
+        None,
+        Some(SceneLayer::Overlay),
+        NodeInput::Rectangle {
+            properties: NodeProperties::new(48.0, 48.0, 160.0, 96.0),
+            color: [249, 115, 22, 255],
+        },
     )?;
 
     let _reason = client.close()?;
@@ -462,15 +477,13 @@ fn main() -> chymeral_rust_sdk::Result<()> {
 }
 ```
 
-The current published SDK release exposes typed CLP v1.3 capabilities, session
-and opaque-handle types, node properties and patches, scene and texture
-commands, subscriptions, notifications, close reasons, and client errors. Its
-development checkout also contains provisional conformance and visual probes
-for lifecycle, subscriptions, timing, resources, scene mutation, overlap, and
-intrinsic text. `clp_probe` is the interactive orange/blue drag test, while
-`clp_text_probe` is the visual text-node probe. Typed SDK support for all
-provisional v1.4 extensions, including animated images, is intentionally
-deferred to the M19 freeze.
+The `0.2.0` development SDK exposes typed CLP v2.0 capabilities, session and
+opaque-handle types, nodes, atomic node changes, unified images, subscriptions,
+notifications, close reasons, and client errors. `clp_probe` is the interactive
+orange/blue drag test, `clp_text_probe` is the visual text-node probe, and
+`clp_conformance` exercises lifecycle, timing, images, text, scene mutation,
+and overlap against a live Chymeral endpoint, including both RGBA8 and GIF
+image uploads.
 
 CLP itself remains language-neutral. Other language SDKs or direct protocol
 clients have equal architectural status when they conform to the negotiated
@@ -486,7 +499,6 @@ repository:
 cargo run --example clp_conformance
 cargo run --example clp_probe
 cargo run --example clp_text_probe
-cargo run --example clp_animated_image_probe
 ```
 
 The conformance client must return successfully to the same terminal. The probe
@@ -495,11 +507,22 @@ then press `q` while they overlap. Only the probe session closes; the Chymeral
 terminal remains open. The text probe creates a panel and text children; check
 their offset, tab width, Unicode cell geometry, and multiline alignment. Press
 `u` to update its text, `b` to update style, and `q` to close only that session.
-The internal animated-image probe creates two nodes from one in-memory GIF.
-Confirm that their colors remain in phase, press `h` to hide and show both
-without resetting their phase, then press `q` to remove both nodes, destroy the
-resource, and close only the probe session. It is a host validation tool, not a
-public SDK example.
+The core repository also retains an internal animated-image probe for renderer
+and GIF-lifecycle validation; it is not a public SDK example.
+
+For non-graphical host/SDK compatibility checks, the core repository provides
+the `clp_fixture_server` example. From the core checkout, it launches an SDK
+conformance client with a temporary authenticated CLP endpoint and services
+its commands without creating a window:
+
+```text
+cargo run --release --example clp_fixture_server -- \
+  cargo run --manifest-path ../chymeral-rust-sdk/Cargo.toml --release --example clp_conformance
+```
+
+This fixture proves protocol framing, lifecycle, commands, resources, text,
+and overlap behavior. Desktop GIF playback, interaction, and external file
+drop still require the Linux and Windows visual validation described above.
 
 ## 11. Boundaries and next steps
 

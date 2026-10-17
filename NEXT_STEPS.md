@@ -7,9 +7,9 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M17 are complete.
-- CLP v1.3 is the current public protocol contract.
-- The Rust SDK is the reference client implementation for CLP v1.3.
+- M1–M19 are complete; M20 is the next planned phase.
+- CLP v2.0 is the current public protocol contract.
+- `chymeral-rust-sdk` 0.2.0 is the reference Rust implementation for CLP v2.0.
 - No phase below has started unless its status explicitly says otherwise.
 
 ## How to maintain this record
@@ -39,13 +39,12 @@ Validation:
 ## Protocol position for M15–M19
 
 M15 changes terminal behavior only and does not require a CLP revision. M16,
-M17, and M18 are the planned scene/protocol expansion. Their public shapes must
-remain provisional until they are frozen together as **CLP v1.4** in M19.
+M17, and M18 introduced a provisional v1.4 scene/protocol expansion. M19
+replaces that provisional plan with the first public **CLP v2.0** contract.
 
-CLP v1.3 clients must remain supported. New behavior must be behind negotiated
-capabilities rather than inferred from a host version alone. The precise v1.4
-capability names are not final until M19, but the current planning names are
-`external_drop`, `text`, and `animated_images`.
+The M19 contract intentionally breaks the v1.3 and provisional v1.4 wire
+surfaces. There are no protocol aliases or compatibility shims: all future SDKs
+bind directly to the v2.0 vocabulary and semantics.
 
 ## M15 — Terminal Interaction
 
@@ -660,58 +659,253 @@ _None._
 - Manual Windows: after a native VM release build and launch, the user
   confirmed the same probe operates correctly on 2026-10-05.
 
-## M19 — CLP v1.4 and Rust SDK Consolidation
+## M19 — CLP v2.0 and Rust SDK Consolidation
 
-**Status:** Planned
+**Status:** Complete
 
 ### Scope
 
-- Freeze the M16–M18 protocol design as CLP v1.4.
-- Keep CLP v1.3 clients operational without access to new capabilities.
-- Update `chymeral-rust-sdk` with typed text, animated-image, and external-drop
-  APIs.
-- Update protocol conformance, examples, documentation, and compatibility
-  tests.
+- Replace CLP v1.3 and the provisional v1.4 surface with a deliberately
+  breaking CLP v2.0 contract.
+- Make the v2.0 canonical wire vocabulary the direct reference for every SDK.
+- Update `chymeral-rust-sdk` to a v2.0-facing `0.2.0` API.
+- Unify static RGBA8 and GIF-backed animated resources as client-visible images.
+- Update protocol conformance, examples, documentation, and migration tests.
 - Add or verify the SDK's Linux/Windows CI workflow for Rust 1.85 and stable.
+
+### Canonical v2.0 operations
+
+```text
+create_node              set_node              remove_node
+upload_image             remove_image
+is_overlapping           get_overlaps
+```
+
+`create_node` accepts an optional parent and an optional root layer, so it
+creates either roots or children. `set_node` atomically applies valid changes
+to one node. `is_overlapping` is the direct boolean query; `get_overlaps`
+returns the owned intersecting node handles when an application needs them.
+
+Each CLP session owns one implicit retained scene tree. M19 does not add a
+`create_scene_tree` wire operation: that name would incorrectly imply that a
+session can create another scene. A future SDK-only declarative tree helper may
+be added without changing CLP.
+
+### Canonical v2.0 model
+
+- Nodes are `empty`, `rectangle`, `image`, or `text`.
+- A text node retains its intrinsic layout family. A visual node may change
+  among `empty`, `rectangle`, and `image`, but it cannot become text; create a
+  new node when changing between those families.
+- `set_node` covers geometry, visibility, clipping, stacking, parenting,
+  overlap participation, external-drop targeting, visual content, and text or
+  text-style changes where valid for the node family.
+- `upload_image` accepts `rgba8` and `gif` sources and returns one opaque
+  `ImageHandle`; `remove_image` releases an unreferenced owned image.
+- `images` replaces the v1.3 `resources` and provisional v1.4
+  `animated_images` capabilities. The resulting v2.0 capability set is
+  `scene`, `images`, `input`, `timing`, `overlap`, `external_drop`, and `text`.
+- Incoming external drop remains capability- and node-opt-in based; it is an
+  event family, not a scene command.
 
 ### Required SDK coverage
 
-- Handshake/version negotiation against v1.3 and v1.4 hosts.
-- Capability denial and unsupported-feature errors.
-- Text creation and intrinsic-bounds behavior.
-- Animated-image upload, playback lifecycle, ownership, and cleanup.
+- Handshake/version rejection for legacy CLP and successful v2.0 negotiation.
+- Canonical-operation, capability-denial, and stable error-code coverage.
+- Creation and atomic mutation of every node family, including intrinsic text.
+- Unified-image upload, playback lifecycle, ownership, and cleanup.
 - External-drop events, target ownership, and terminal/scene separation.
 - Clean session close during each new operation.
 
 ### Planned examples
 
-- `clp_conformance` extended for every v1.4 capability.
+- `clp_conformance` covers every v2.0 capability and operation.
 - `text_probe` for Unicode, styles, clipping, and calculated bounds.
 - `animated_image_probe` for GIF playback and cleanup.
 - `external_drop_probe` for manual desktop file-drop validation.
 
-### Pending technical decisions
+### Finalized wire contract
 
-- Exact protocol-minor compatibility policy and public error vocabulary.
-- SDK version number and release policy.
-- Shared fixtures strategy between the core and separate SDK repository.
-- CI integration strategy for cross-repository conformance.
+`create_node` uses `{ "op": "create_node", "parent"?: "node-N",
+"layer"?: "underlay" | "overlay", "node": ... }`. Omitted `parent` creates
+a root; omitted root `layer` defaults to `overlay`; a child must omit `layer`.
+`node` is tagged `empty`, `rectangle`, `image`, or `text`.
+
+`set_node` uses `{ "op": "set_node", "node": "node-N", "changes": ... }`.
+Every field in `changes` is optional: `properties`, `layer`, `visual`, `text`,
+and `text_style` preserve their existing values when omitted. A structural
+change is unambiguous because `parent` is either `{ "kind": "root" }` or
+`{ "kind": "node", "node": "node-N" }`; omission means no parent change.
+`visual` is tagged `empty`, `rectangle`, or `image`.
+
+`upload_image` takes `source: { "kind": "rgba8", "width": W,
+"height": H }` or `source: { "kind": "gif", "byte_length": N }`, followed
+by exact consecutive binary bytes. The stable result tags are `node`,
+`node_updated`, `image`, `is_overlapping`, `overlaps`, and `acknowledged`.
+
+The stable v2 command-error vocabulary is `unsupported_version`,
+`capability_denied`, `invalid_command`, `invalid_handle`, `not_owner`,
+`image_in_use`, `resource_limit`, `invalid_argument`, `invalid_node_change`,
+`host_capacity`, `host_unavailable`, and `protocol_violation`.
 
 ### Acceptance criteria
 
-- Core and SDK conformance pass on Linux and Windows.
+- Core and SDK v2.0 conformance pass on Linux and Windows.
 - SDK CI runs format, tests, warnings-denied Clippy, and release examples on
   Rust 1.85 and stable.
-- Public documentation describes every granted capability and its fallback.
+- Public documentation describes every v2.0 operation, capability, limit, and
+  backend fallback.
 - M16–M18 decisions are transferred to `Technical_Journal.md`.
 
 ### Accepted decisions
 
-_None yet._
+- **Date:** 2026-10-06
+  **Decision:** M19 replaces the planned CLP v1.4 freeze with a breaking CLP
+  v2.0 contract. CLP v1.3 and provisional v1.4 clients are not supported by
+  the v2.0 host.
+  **Context:** All existing protocol use is test-stage work, so retaining a
+  less coherent surface would impose permanent compatibility cost without a
+  user benefit.
+  **Rationale:** A major version creates one clear, language-neutral source of
+  truth before external SDKs or applications adopt the protocol.
+  **Consequences:** The host, SDK, examples, fixtures, documentation, and
+  conformance tests move together. No wire aliases are added.
+  **Validation:** Legacy-version rejection and v2.0 negotiation are tested on
+  Linux and Windows.
+
+- **Date:** 2026-10-06
+  **Decision:** The canonical v2.0 operation vocabulary is `create_node`,
+  `set_node`, `remove_node`, `upload_image`, `remove_image`,
+  `is_overlapping`, and `get_overlaps`.
+  **Context:** SDK authors need direct, understandable protocol operations to
+  bind in their language rather than reverse-engineering host-internal terms.
+  **Rationale:** The vocabulary describes the retained scene model while
+  leaving language-specific casing and ergonomics to each SDK.
+  **Consequences:** Root/child, static/animated-image, and overlap-query
+  variants are consolidated under their canonical operations.
+  **Validation:** Every operation has wire, host, SDK, conformance, and
+  capability-denial coverage.
+
+- **Date:** 2026-10-06
+  **Decision:** A session owns one implicit scene tree. `create_node` selects a
+  root or child through an optional parent; M19 does not add a
+  `create_scene_tree` operation.
+  **Context:** A separate tree-creation operation would misrepresent the
+  session model and prematurely freeze bulk-transaction semantics.
+  **Rationale:** Incremental retained-node mutation is sufficient for dynamic
+  applications, while a later SDK-only declarative builder remains possible.
+  **Consequences:** Root layer is valid only for parentless nodes.
+  **Validation:** Conformance covers roots, children, reparenting through
+  `set_node`, deterministic ordering, and subtree removal.
+
+- **Date:** 2026-10-06
+  **Decision:** v2.0 exposes four node families: `empty`, `rectangle`,
+  `image`, and `text`. Text is intrinsic and cannot change into a visual node;
+  visual nodes may change among the other three visual forms.
+  **Context:** Text has host-computed bounds and distinct validation, whereas
+  empty, rectangle, and image nodes share explicit rectangle geometry.
+  **Rationale:** This preserves intuitive mutation without weakening text
+  layout guarantees.
+  **Consequences:** `set_node` validates the final node family atomically.
+  **Validation:** Tests cover valid visual mutation and rejected cross-family
+  text conversions.
+
+- **Date:** 2026-10-06
+  **Decision:** v2.0 unifies client-visible RGBA8 and GIF resources as opaque
+  images. `upload_image` and `remove_image` replace texture and animated-image
+  operations; `images` replaces `resources` and `animated_images`.
+  **Context:** Both resource kinds occupy the same scene role and differ only
+  in host decoding and playback details.
+  **Rationale:** One image handle and one node-content form simplify every SDK
+  without relaxing bounded upload, ownership, or cleanup rules.
+  **Consequences:** Initial formats are `rgba8` and `gif`; future formats extend
+  image source metadata rather than node semantics.
+  **Validation:** Conformance covers both formats, shared GIF phase, limits,
+  reference denial, cleanup, and cross-session ownership.
+
+- **Date:** 2026-10-06
+  **Decision:** The Rust SDK releases its breaking v2.0 binding as crate
+  version `0.2.0`, remains unpublished on crates.io until M20, and uses the
+  same canonical operation names in Rust snake case.
+  **Context:** The SDK is a separate reference implementation and must not tie
+  its crate version to the protocol major mechanically.
+  **Rationale:** The version communicates an intentional pre-1.0 API break
+  while retaining Git or path consumption during validation.
+  **Consequences:** Existing v1.3 SDK examples and tests are replaced rather
+  than compatibility-wrapped.
+  **Validation:** Rust 1.85 and stable CI run format, tests, warnings-denied
+  Clippy, release examples, and cross-repository conformance.
+
+- **Date:** 2026-10-06
+  **Decision:** Canonical language-neutral v2.0 fixtures live in the core
+  repository. Cross-repository CI checks out fixed core and SDK revisions and
+  runs the SDK conformance client against a real non-graphical CLP server;
+  graphical GIF and external-drop behavior is additionally validated manually
+  on Linux and Windows.
+  **Context:** A standalone fixture repository would add lifecycle overhead
+  before a second non-Rust SDK exists, while mock-only SDK tests cannot prove
+  host compatibility.
+  **Rationale:** The core owns the protocol and can provide the authoritative
+  fixture and server behavior without adding a third project.
+  **Consequences:** CI proves framing, lifecycle, commands, ownership, and
+  negotiated capabilities; desktop integration remains an explicit matrix.
+  **Validation:** The pinned cross-repository job and Linux/Windows manual
+  validation both pass before M19 closes.
+
+- **Date:** 2026-10-17
+  **Decision:** `set_node` uses a single optional-field patch with tagged
+  parent and visual forms; it never overloads JSON `null` to mean a root.
+  **Context:** The protocol must distinguish an omitted parent update from a
+  request to make a node root, without forcing SDKs to preserve language-
+  specific nested-option behavior.
+  **Rationale:** Tagged forms are readable in raw CLP, map predictably to every
+  JSON SDK, and keep the command's atomic scope explicit.
+  **Consequences:** Root/child changes, visual replacement, and intrinsic text
+  changes all route through `set_node`; legacy mutation commands have no v2
+  aliases.
+  **Validation:** Core and SDK serialization tests cover the exact operation
+  names, tagged shapes, capability gates, and rejected cross-family changes.
+
+- **Date:** 2026-10-17
+  **Decision:** Freeze the v2 command-error codes listed in the finalized wire
+  contract above.
+  **Context:** SDKs need reliable machine-readable outcomes while the host can
+  continue improving human diagnostic messages.
+  **Rationale:** A short stable vocabulary supports portable error handling and
+  conformance testing without exposing Rust error types or renderer internals.
+  **Consequences:** SDKs branch on `code`, not message text. New host detail is
+  represented by a message or a future major/minor contract decision.
+  **Validation:** Host dispatch maps all scene/image validation failures to the
+  frozen vocabulary and the public manual records it.
 
 ### Validation record
 
-_Not started._
+- Automated core: `cargo fmt --check`, `cargo test --all-targets --
+  --test-threads=1`, `cargo clippy --all-targets -- -D warnings`, and
+  `cargo build --release --examples` pass with 136 library tests, 65 binary
+  tests, and the inherited-process CLP v2 client.
+  Targeted tests cover v1-major rejection, capability negotiation, RGBA8/GIF
+  image framing, canonical result forms, text metrics, overlap queries, unified
+  image ownership, and rejected partial cross-family `set_node` changes.
+- Automated SDK: `cargo fmt --check`, `cargo test --all-targets --
+  --test-threads=1`, `cargo clippy --all-targets -- -D warnings`, and
+  `cargo build --release --examples` pass for the 0.2.0 client, wire
+  serialization, and all examples.
+- Cross-repository fixture: the core's non-graphical `clp_fixture_server`
+  launched the SDK's release `clp_conformance` example successfully on the
+  Linux build host. It exercises the real v2.0 framing and lifecycle plus every
+  canonical operation, both image source forms, text, timing, and overlap.
+- Manual Linux: on 2026-10-17, the user confirmed the current release host and
+  Rust SDK `clp_conformance` client completed successfully in a graphical
+  Chymeral session. The terminal remained open and reported exit code `0`.
+- Manual Windows: on 2026-10-17, the same graphical conformance client passed
+  in the VM and reported `CLP v2.0 conformance client passed.` with exit code
+  `0`. An initial failure was diagnosed as a stale `chymeral.exe` from before
+  the v2 implementation; a clean native rebuild produced the validated host.
+- M16–M18 drag, text, animated-image, and external-drop behavior retain their
+  prior Linux and Windows manual validation records. The SDK workflow provides
+  a Rust 1.85/stable Linux/Windows quality matrix plus a manually dispatched
+  cross-repository conformance job that takes a pinned core commit SHA.
 
 ## M20 — Public Release Preparation
 
@@ -758,10 +952,10 @@ _Not started._
 
 ### Scope
 
-- Establish shared CLP fixtures or an IDL after v1.4 behavior is stable.
+- Establish shared CLP fixtures or an IDL after v2.0 behavior is stable.
 - Select the next SDK according to actual user demand.
 - Keep the Rust SDK as a conformance reference, not a privileged runtime path.
 
 ### Prerequisite
 
-M19 must be complete and the v1.4 protocol contract must be stable.
+M19 must be complete and the v2.0 protocol contract must be stable.
