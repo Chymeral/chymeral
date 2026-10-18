@@ -88,6 +88,13 @@ An absent file uses the built-in defaults. Unknown TOML keys are rejected so a
 misspelled configuration cannot silently change behavior. Every relative path is
 resolved from the directory containing `chymeral.toml`.
 
+On Linux, normal launches let `winit` select the active desktop backend. Setting
+`CHYMERAL_FORCE_X11=1` explicitly selects X11 for Chymeral's window. In a
+Wayland session this requires an available Xwayland server and `DISPLAY`; it is
+useful for portable launches that need the X11 external-drop path. This setting
+does not remove or rewrite the Wayland session variables inherited by terminal
+children.
+
 ### 4.1 Complete example
 
 [`chymeral.toml.example`](chymeral.toml.example) is the maintained template.

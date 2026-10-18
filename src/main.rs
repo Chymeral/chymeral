@@ -51,7 +51,7 @@ use winit::{
     event::{ElementState, KeyEvent as WinitKeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key as WinitKey, ModifiersState, NamedKey as WinitNamedKey},
-    window::{Window, WindowId},
+    window::{Icon, Window, WindowId},
 };
 
 use crate::{
@@ -69,6 +69,10 @@ const PADDING: f64 = 12.0;
 const MAX_PTY_CHUNKS_PER_UPDATE: usize = 64;
 const RESIZE_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
 const RUNTIME_TICK_INTERVAL: Duration = Duration::from_millis(16);
+const BUNDLED_WINDOW_ICON: &[u8] = include_bytes!("../branding/chymeral-logo.png");
+
+#[cfg(target_os = "linux")]
+const FORCE_X11_ENV: &str = "CHYMERAL_FORCE_X11";
 
 #[derive(Debug)]
 pub enum UserEvent {
@@ -1542,10 +1546,18 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
             return;
         }
 
+        let window_icon = bundled_window_icon();
         let window_attributes = Window::default_attributes()
             .with_title("Chymeral")
             .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
-            .with_transparent(self.appearance.background.requires_window_transparency());
+            .with_transparent(self.appearance.background.requires_window_transparency())
+            .with_window_icon(window_icon.clone());
+        #[cfg(target_os = "windows")]
+        let window_attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+
+            window_attributes.with_taskbar_icon(window_icon)
+        };
         let window = match event_loop.create_window(window_attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -2311,9 +2323,7 @@ fn main() -> Result<()> {
     if let Some(path) = &loaded_config.path {
         eprintln!("Chymeral: loaded configuration from {}", path.display());
     }
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .context("could not create the event loop")?;
+    let event_loop = create_event_loop()?;
     let external_drop_supported = platform_supports_external_drop(&event_loop);
     report_platform_external_drop_support(external_drop_supported);
     let mut app = ChymeralApp::new(
@@ -2327,6 +2337,52 @@ fn main() -> Result<()> {
     event_loop
         .run_app(&mut app)
         .context("event loop terminated unexpectedly")
+}
+
+fn create_event_loop() -> Result<EventLoop<UserEvent>> {
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+
+        let mut event_loop_builder = EventLoop::<UserEvent>::with_user_event();
+        if force_x11_backend() {
+            eprintln!("Chymeral: forcing the X11 backend through {FORCE_X11_ENV}");
+            event_loop_builder.with_x11();
+        }
+        event_loop_builder
+            .build()
+            .context("could not create the event loop")
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        EventLoop::<UserEvent>::with_user_event()
+            .build()
+            .context("could not create the event loop")
+    }
+}
+
+fn bundled_window_icon() -> Option<Icon> {
+    let image = match image::load_from_memory(BUNDLED_WINDOW_ICON) {
+        Ok(image) => image.into_rgba8(),
+        Err(error) => {
+            eprintln!("Chymeral: could not decode the bundled window icon: {error}");
+            return None;
+        }
+    };
+    let (width, height) = (image.width(), image.height());
+    match Icon::from_rgba(image.into_raw(), width, height) {
+        Ok(icon) => Some(icon),
+        Err(error) => {
+            eprintln!("Chymeral: could not create the bundled window icon: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn force_x11_backend() -> bool {
+    matches!(std::env::var(FORCE_X11_ENV).as_deref(), Ok("1"))
 }
 
 #[cfg(target_os = "linux")]
@@ -2423,7 +2479,7 @@ mod tests {
     };
 
     use crate::{
-        TerminalProgram, available_clp_capabilities,
+        TerminalProgram, available_clp_capabilities, bundled_window_icon,
         config::{Appearance, Rgb, TestingNode, TestingScene},
         engine_focus, engine_key, engine_modifiers, engine_pointer_button, engine_scroll_delta,
         external_file_drop_position_from_physical, grid_size, install_testing_scene,
@@ -2442,6 +2498,11 @@ mod tests {
         },
         scene::{Scene, SceneLayer},
     };
+
+    #[test]
+    fn loads_the_bundled_window_icon() {
+        assert!(bundled_window_icon().is_some());
+    }
 
     #[test]
     fn keeps_the_same_grid_for_the_same_logical_window_size() {
