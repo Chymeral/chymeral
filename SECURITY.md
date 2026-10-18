@@ -11,8 +11,8 @@
 
 Do not report suspected vulnerabilities through a public issue, discussion, or
 pull request. Use this repository's GitHub private vulnerability-reporting
-channel when it is available. Before the first public distribution, repository
-maintainers must enable that GitHub setting.
+channel when it is available. Repository maintainers should keep that GitHub
+setting enabled.
 
 If private reporting is temporarily unavailable, contact a repository owner
 privately through GitHub and include enough information to reproduce the issue:

@@ -2,6 +2,12 @@
   <img src="branding/chymeral_logo.svg" alt="Chymeral logo" width="192">
 </p>
 
+<p align="center">
+  <a href="https://github.com/Chymeral/chymeral/actions/workflows/ci.yml"><img src="https://github.com/Chymeral/chymeral/actions/workflows/ci.yml/badge.svg" alt="Chymeral quality checks"></a>
+  <a href="https://github.com/Chymeral/chymeral/releases/latest"><img src="https://img.shields.io/github/v/release/Chymeral/chymeral?display_name=tag&amp;sort=semver" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Chymeral/chymeral" alt="MIT License"></a>
+</p>
+
 # Chymeral
 
 > A minimalist terminal emulator with a reusable local graphics runtime for
@@ -51,7 +57,22 @@ not become a host-loaded plugin.
 - A separate reference client library: the
   [Chymeral Rust SDK](https://github.com/Chymeral/chymeral-rust-sdk).
 
-## Quick start
+## Downloads
+
+The quickest way to use Chymeral is a portable edition from the
+[latest release](https://github.com/Chymeral/chymeral/releases/latest). No
+installation is required:
+
+- **Linux x86_64:** extract the archive and run `Launch Chymeral.sh`. The
+  launcher explicitly selects X11; a Wayland desktop therefore needs Xwayland
+  and `DISPLAY` available.
+- **Windows x86_64:** extract the archive and run `Launch Chymeral.cmd`.
+
+Each archive includes its launcher, configuration file, application icon,
+license, and documentation. See the [Main Manual](Main_Manual.md) for
+configuration and platform behavior.
+
+## Build from source
 
 Building from source requires Rust `1.90` or newer. The repository pins
 `1.90.0` for reproducible local development. Build and launch with:
@@ -78,10 +99,13 @@ may be relative to the configuration file.
 
 - [Main Manual](Main_Manual.md) — installation, configuration, terminal
   behavior, CLP concepts, event model, scene model, and testing guidance.
+- [Latest release](https://github.com/Chymeral/chymeral/releases/latest) —
+  portable Linux and Windows editions.
 - [Technical Journal](Technical_Journal.md) — the architectural record and the
   milestone record formerly kept in this README.
 - [Chymeral Rust SDK](https://github.com/Chymeral/chymeral-rust-sdk) — the
-  separate reference Rust client and its conformance examples.
+  separate reference Rust client and its conformance examples, published on
+  [crates.io](https://crates.io/crates/chymeral-rust-sdk).
 - [Contributing guide](CONTRIBUTING.md) — setup, checks, and protocol-change
   expectations for collaborators.
 - [Changelog](CHANGELOG.md) — released behavior and compatibility notes.
@@ -89,12 +113,12 @@ may be relative to the configuration file.
 
 ## Project state
 
-Chymeral `1.0.0` is the first stable source baseline. It implements CLP v2.0
-and is paired with the separate `chymeral-rust-sdk` `1.0.0` reference binding.
-These version lines are independent: the application is distributed as a
-terminal program, CLP is the language-neutral contract, and the SDK is one
-client implementation. Linux and Windows manual acceptance has passed;
-distribution packaging and release assets remain the next phase.
+Chymeral `1.0.0` is the first stable release. It implements CLP v2.0 and is
+paired with the separate `chymeral-rust-sdk` `1.0.0` reference binding. These
+version lines are independent: the application is distributed as a terminal
+program, CLP is the language-neutral contract, and the SDK is one client
+implementation. Linux and Windows manual acceptance has passed, and portable
+editions are available from [GitHub Releases](https://github.com/Chymeral/chymeral/releases/latest).
 
 ## License
 

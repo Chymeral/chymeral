@@ -27,11 +27,26 @@ Chymeral is not a widget toolkit, mod manager, plugin loader, game engine, or
 global daemon. It does not choose an application's language or load application
 code into its own process.
 
-## 2. Supported platforms and build
+## 2. Supported platforms and installation
 
 Chymeral targets Linux and Windows. Windows requires Windows 10 version 1809 or
 newer, or Windows 11, because the terminal uses ConPTY. macOS is intentionally
 not supported.
+
+### 2.1 Portable editions
+
+Portable Linux x86_64 and Windows x86_64 editions are available from the
+[latest GitHub release](https://github.com/Chymeral/chymeral/releases/latest).
+They require no installation: extract the matching archive and run its launcher.
+Each archive includes a bundled `chymeral.toml`, application icon, license, and
+documentation.
+
+On Linux, run `Launch Chymeral.sh`. The portable launcher explicitly selects
+the X11 backend for predictable desktop integration and external-drop behavior.
+When it is launched from a Wayland desktop, an Xwayland server and `DISPLAY`
+must be available. On Windows, run `Launch Chymeral.cmd`.
+
+### 2.2 Build from source
 
 Building from source requires Rust `1.90` or newer. The repository pins
 `1.90.0` for reproducible development. Build and run it with:
