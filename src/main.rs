@@ -181,7 +181,7 @@ struct WindowState {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     text_buffer: Buffer,
-    scene_text_renderer: TextRenderer,
+    scene_text_renderers: HashMap<NodeId, TextRenderer>,
     scene_text_buffer: Buffer,
     window: Arc<Window>,
 }
@@ -278,8 +278,6 @@ impl WindowState {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, surface_config.format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-        let scene_text_renderer =
-            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
         let mut text_buffer = Buffer::new(
             &mut font_system,
             physical_font_metrics(&appearance.font, scale_factor),
@@ -374,7 +372,7 @@ impl WindowState {
             atlas,
             text_renderer,
             text_buffer,
-            scene_text_renderer,
+            scene_text_renderers: HashMap::new(),
             scene_text_buffer,
             window,
         };
@@ -1242,7 +1240,15 @@ impl WindowState {
         );
         self.scene_text_buffer
             .shape_until_scroll(&mut self.font_system, false);
-        self.scene_text_renderer.prepare(
+        let scene_text_renderer = self.scene_text_renderers.entry(node).or_insert_with(|| {
+            TextRenderer::new(
+                &mut self.atlas,
+                &self.device,
+                MultisampleState::default(),
+                None,
+            )
+        });
+        scene_text_renderer.prepare(
             &self.device,
             &self.queue,
             &mut self.font_system,
@@ -1268,6 +1274,12 @@ impl WindowState {
         view: &wgpu::TextureView,
         layer: SceneLayer,
     ) -> Result<()> {
+        let scene = &self.scene;
+        self.scene_text_renderers.retain(|node, _| {
+            scene
+                .node(*node)
+                .is_some_and(|node| matches!(node.content(), NodeContent::Text(_)))
+        });
         for node in self.scene.paint_order_in_layer(layer) {
             let Some(content) = self.scene.node(node).map(|node| node.content().clone()) else {
                 continue;
@@ -1313,8 +1325,10 @@ impl WindowState {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    self.scene_text_renderer
-                        .render(&self.atlas, &self.viewport, &mut pass)?;
+                    let Some(scene_text_renderer) = self.scene_text_renderers.get(&node) else {
+                        continue;
+                    };
+                    scene_text_renderer.render(&self.atlas, &self.viewport, &mut pass)?;
                 }
             }
         }
