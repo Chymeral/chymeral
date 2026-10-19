@@ -1018,7 +1018,7 @@ The stable v2 command-error vocabulary is `unsupported_version`,
 
 ## M21 — Public Release Preparation
 
-**Status:** In progress
+**Status:** Public release delivered; follow-up hardening remains ongoing
 
 ### Scope
 
@@ -1031,14 +1031,11 @@ The stable v2 command-error vocabulary is `unsupported_version`,
 ### Exclusions
 
 - New graphics or protocol features.
-- Additional language SDKs before the Rust reference remains conformant.
+- Additional language SDK work, which is tracked separately in M22.
 
 ### Pending technical decisions
 
-- Distribution formats for Linux and Windows.
 - Signing policy for Windows artifacts.
-- Whether the first public artifact release is labelled preview, beta, or
-  stable, despite the accepted `1.0.0` source baseline.
 - Support matrix for desktop environments and GPU drivers.
 
 ### Acceptance criteria
@@ -1051,10 +1048,15 @@ The stable v2 command-error vocabulary is `unsupported_version`,
 ### Accepted decisions
 
 - **Version identity:** The core source baseline is Chymeral `1.0.0`, paired
-  with CLP v2.0 and `chymeral-rust-sdk` `1.0.0`. Those three version lines have
-  separate compatibility roles. This decision does not mark distribution
-  artifacts as released; M21 still owns packaging, signing, installation, and
-  clean-environment acceptance.
+  with CLP v2.0, `chymeral-rust-sdk` `1.0.0`, and `@chymeral/node-sdk` `1.0.0`.
+  Those four version lines have separate compatibility roles. The first public
+  artifact release was accepted as stable under M21; later SDK versions retain
+  their own independent version lines.
+- **First public delivery:** Chymeral `v1.0.0` is distributed as portable
+  Linux x86_64 and Windows x86_64 ZIP archives through GitHub Releases. Each
+  archive contains a platform launcher, configuration template, icon, license,
+  and documentation. The Linux launcher selects X11 and therefore requires
+  Xwayland plus `DISPLAY` on a Wayland desktop.
 - **Core distribution boundary:** Chymeral is delivered as an application, not
   as a supported Rust host library. Its manifest uses `publish = false`; CLP
   and language SDKs are the application-development boundaries.
@@ -1073,18 +1075,31 @@ The stable v2 command-error vocabulary is `unsupported_version`,
   security-reporting policy, and Linux/Windows CI matrices for their minimum
   supported Rust and stable Rust. The core passed its full local matrix on Rust
   `1.90` and stable; the SDK passed its full local matrix on Rust `1.85` and
-  stable. GitHub-hosted matrix runs remain pending the next push.
+  stable.
+- **Public release (2026-10-18):** Chymeral `v1.0.0` was published with its
+  portable Linux and Windows editions. The paired Rust SDK `1.0.0` was
+  published to crates.io.
 
 ## M22 — Language-Neutral SDK Ecosystem
 
-**Status:** Deferred
+**Status:** In progress
 
 ### Scope
 
 - Establish shared CLP fixtures or an IDL after v2.0 behavior is stable.
-- Select the next SDK according to actual user demand.
-- Keep the Rust SDK as a conformance reference, not a privileged runtime path.
+- Maintain the Rust SDK as a conformance reference and the Node.js and
+  TypeScript SDK as an independently released client; neither has a privileged
+  runtime path.
+- Select additional SDKs according to actual user demand.
 
 ### Prerequisite
 
 M20 must be complete and the v2.0 protocol contract must be stable.
+
+### Delivered
+
+- **Node.js and TypeScript SDK (2026-10-19):**
+  [`@chymeral/node-sdk`](https://www.npmjs.com/package/@chymeral/node-sdk)
+  `1.0.0` was released on npm with ESM support for Node.js `22` or newer. It
+  implements the same public CLP v2.0 contract through local IPC and retains
+  independent Linux and Windows quality checks.

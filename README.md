@@ -54,8 +54,11 @@ not become a host-loaded plugin.
   bounded image and text resource use.
 - Program delivery for events, resize, tick, frame, lifecycle, closing, and
   overload recovery notifications.
-- A separate reference client library: the
-  [Chymeral Rust SDK](https://github.com/Chymeral/chymeral-rust-sdk).
+- Separate official client libraries: the
+  [Chymeral Rust SDK](https://github.com/Chymeral/chymeral-rust-sdk), the
+  reference and conformance client, and the
+  [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) for
+  Node.js and TypeScript applications.
 
 ## Downloads
 
@@ -106,6 +109,9 @@ may be relative to the configuration file.
 - [Chymeral Rust SDK](https://github.com/Chymeral/chymeral-rust-sdk) — the
   separate reference Rust client and its conformance examples, published on
   [crates.io](https://crates.io/crates/chymeral-rust-sdk).
+- [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) — the
+  separate Node.js and TypeScript client, published on
+  [npm](https://www.npmjs.com/package/@chymeral/node-sdk).
 - [Contributing guide](CONTRIBUTING.md) — setup, checks, and protocol-change
   expectations for collaborators.
 - [Changelog](CHANGELOG.md) — released behavior and compatibility notes.
@@ -114,11 +120,12 @@ may be relative to the configuration file.
 ## Project state
 
 Chymeral `1.0.0` is the first stable release. It implements CLP v2.0 and is
-paired with the separate `chymeral-rust-sdk` `1.0.0` reference binding. These
-version lines are independent: the application is distributed as a terminal
-program, CLP is the language-neutral contract, and the SDK is one client
-implementation. Linux and Windows manual acceptance has passed, and portable
-editions are available from [GitHub Releases](https://github.com/Chymeral/chymeral/releases/latest).
+paired with two separate stable SDKs: the `chymeral-rust-sdk` `1.0.0` reference
+binding and the `@chymeral/node-sdk` `1.0.0` Node.js and TypeScript binding.
+These version lines are independent: the application is distributed as a
+terminal program, CLP is the language-neutral contract, and each SDK is one
+client implementation. Linux and Windows manual acceptance has passed, and
+portable editions are available from [GitHub Releases](https://github.com/Chymeral/chymeral/releases/latest).
 
 ## License
 

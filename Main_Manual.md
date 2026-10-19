@@ -481,11 +481,29 @@ only that session with `host_overloaded`; the terminal and other sessions stay
 alive. Transient operating-system backpressure is retried through the running
 session writer instead of being treated as an immediate protocol failure.
 
-## 9. Rust client quick start
+## 9. Official SDK quick starts
 
-The reference Rust SDK is developed and released separately as
-[`chymeral-rust-sdk`](https://github.com/Chymeral/chymeral-rust-sdk). It is a
-client library, not a host plugin and not a requirement for other languages.
+Chymeral currently has two stable external client SDKs:
+
+- [`chymeral-rust-sdk`](https://github.com/Chymeral/chymeral-rust-sdk), the
+  reference and conformance client for Rust, published on
+  [crates.io](https://crates.io/crates/chymeral-rust-sdk).
+- [`@chymeral/node-sdk`](https://github.com/Chymeral/chymeral-node-sdk), the
+  Node.js and TypeScript client, published on
+  [npm](https://www.npmjs.com/package/@chymeral/node-sdk).
+
+They are client libraries, not host plugins and not requirements for other
+languages.
+
+### Rust
+
+For a released version, add the crate from `crates.io` to an application
+project:
+
+```toml
+[dependencies]
+chymeral-rust-sdk = "1.0"
+```
 
 For local development, add a path dependency to an application project:
 
@@ -527,27 +545,48 @@ node input passthrough. `clp_conformance` exercises lifecycle, timing, images,
 text, scene mutation, and overlap against a live Chymeral endpoint, including
 both RGBA8 and GIF image uploads.
 
-CLP itself remains language-neutral. Other language SDKs or direct protocol
-clients have equal architectural status when they conform to the negotiated
-protocol and session rules.
+### Node.js and TypeScript
+
+The Node SDK requires Node.js `22` or newer and uses ESM. Install it in an
+application project with:
+
+```text
+npm install @chymeral/node-sdk
+```
+
+Run the application from a Chymeral terminal so it inherits the private CLP
+endpoint and token. The [Node SDK README](https://github.com/Chymeral/chymeral-node-sdk#readme)
+contains its TypeScript quick start, API reference, and live conformance
+instructions.
+
+CLP itself remains language-neutral. The Rust and Node SDKs have equal
+architectural status with direct protocol clients and future language SDKs when
+they conform to the negotiated protocol and session rules.
 
 ## 10. Operational testing
 
 Use the configuration fixture only for visual internal checks. For CLP behavior,
-start Chymeral, open its terminal, then run the Rust SDK examples from the SDK
-repository:
+start Chymeral, open its terminal, then run a conformance client from an SDK
+repository. For Rust:
 
 ```text
 cargo run --locked --example clp_conformance
 ```
 
-The conformance client must return successfully to the same terminal without
+For Node.js and TypeScript:
+
+```text
+npm ci
+npm run example:conformance
+```
+
+Each conformance client must return successfully to the same terminal without
 closing the surrounding Chymeral terminal.
 
 To validate alpha image contact and node passthrough interactively, run the
-same SDK executable with
-`cargo run --locked --example clp_conformance -- --manual`.
-It shows a blue target, an orange alpha-frame image, a pink GIF tile that
+Rust client with `cargo run --locked --example clp_conformance -- --manual` or
+the Node client with `npm run example:conformance -- --manual`. The manual
+scenario shows a blue target, an orange alpha-frame image, a pink GIF tile that
 alternates between opaque and transparent, and a visible white band with
 `input_passthrough`. The terminal identifies each directed scene event and the
 GIF's overlap transitions: the orange rim must target the image; its transparent
@@ -560,13 +599,13 @@ close only the client session.
 
 CLP deliberately favors a small, reliable foundation. It has no public package
 manifest standard, no protocol IDL, no widget library, and no 3D scene API.
-The Rust reference SDK is not a privileged host component; future language
-bindings can share an IDL and the conformance suite without changing the
-ordinary-program model at the center of Chymeral.
+Neither the Rust reference SDK nor the Node SDK is a privileged host component;
+additional language bindings can share an IDL and the conformance suite without
+changing the ordinary-program model at the center of Chymeral.
 
 The first stable source baseline is Chymeral `1.0.0`, which implements CLP
-v2.0. The separate Rust reference binding is also `1.0.0`; its crate version
-does not version the protocol or the terminal application. The host Rust crate
-exists to share implementation between the executable and its tests. It is not
-a supported application-development API: programs should use CLP directly or
-a language SDK.
+v2.0. The separate Rust reference binding and Node binding are both `1.0.0`;
+their package versions do not version the protocol or the terminal application.
+The host Rust crate exists to share implementation between the executable and
+its tests. It is not a supported application-development API: programs should
+use CLP directly or a language SDK.

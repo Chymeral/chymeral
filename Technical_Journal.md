@@ -48,6 +48,8 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 | M18 | Retained GIF scene images. | The host owns decode, playback, quotas, and one shared phase per image resource. |
 | M19 | Breaking CLP v2.0 consolidation and the reference Rust SDK API. | One canonical wire vocabulary and unified RGBA8/GIF image handle precede public SDK stability. |
 | M20 | Alpha-derived image contact and generic input passthrough. | Visual layering can be spatially truthful without turning Chymeral into a physics or widget engine. |
+| M21 | Public Chymeral `v1.0.0` portable Linux and Windows releases. | The host is distributed as an application; CLP and language SDKs remain the application-development boundary. |
+| M22 | Node.js and TypeScript SDK `1.0.0`, published as `@chymeral/node-sdk`. | A second stable client validates the language-neutral CLP contract without changing the host or privileging a runtime. |
 
 ## CLP evolution
 
@@ -114,11 +116,13 @@ layer from duplicating the interaction behavior of a node beneath it.
 
 ## Validation record
 
-The M1–M19 implementation has been exercised on Linux and Windows. The core
+The M1–M22 implementation has been exercised on Linux and Windows. The core
 validation suite covers formatting, unit and integration tests, warnings-denied
 Clippy, and release builds. The Rust SDK has a separate GitHub Actions matrix
 for Rust 1.85 and stable on both platforms, including formatting, tests,
-Clippy, and release builds of its examples.
+Clippy, and release builds of its examples. The Node SDK has a separate
+Linux/Windows matrix for Node.js 22 and 24, including type checks, protocol
+tests, builds, formatting, and package dry runs.
 
 The reference conformance program validates lifecycle, timing subscriptions,
 RGBA8/GIF upload and destruction, scene mutation, same-session overlap, and
@@ -137,16 +141,16 @@ single-line paste, both bracketed-paste states, and alternate-screen behavior.
 M20 automated coverage verifies static alpha hit testing, alpha overlap, input
 passthrough with interactive descendants, alpha-aware external-drop targeting,
 transport serialization, and GIF-frame overlap reconciliation. The separate
-Rust SDK exposes the same CLP v2.0 surface as version `1.0.0`. Manual Linux
-and Windows acceptance confirmed static alpha, passthrough, and animated-alpha
-interaction. Native Wayland correctly continues to withhold the separate,
-incoming external-file-drop capability.
+Rust and Node SDKs expose the same public CLP v2.0 surface as version `1.0.0`.
+Manual Linux and Windows acceptance confirmed static alpha, passthrough, and
+animated-alpha interaction. Native Wayland correctly continues to withhold the
+separate, incoming external-file-drop capability.
 
 ## Intentional boundaries
 
 The following are deferred, not accidental omissions:
 
-- SDKs for languages other than Rust and a shared protocol IDL.
+- Additional SDKs beyond Rust and Node, and a shared protocol IDL.
 - Package manifests, application discovery, or a central program registry.
 - A widget toolkit, host-loaded extensions, physics, or native gamepad policy.
 - Arbitrary vector/polygon collision, multitouch, and outgoing external

@@ -4,8 +4,10 @@ Thank you for improving Chymeral. This repository contains the terminal
 application and local graphics runtime. Its supported application boundary is
 the language-neutral Chymeral Link Protocol (CLP); it is not a public Rust
 framework. Rust applications should use the separate
-[`chymeral-rust-sdk`](https://github.com/Chymeral/chymeral-rust-sdk) or speak
-CLP directly.
+[`chymeral-rust-sdk`](https://github.com/Chymeral/chymeral-rust-sdk), and
+Node.js or TypeScript applications should use
+[`@chymeral/node-sdk`](https://github.com/Chymeral/chymeral-node-sdk). Clients
+in other languages may speak CLP directly or use a conforming SDK.
 
 ## Development setup
 

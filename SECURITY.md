@@ -22,4 +22,6 @@ disclosure.
 
 This policy covers the terminal application, its CLP parser and transport,
 desktop integration, bundled configuration examples, and release artifacts.
-The separate Rust SDK has its own matching policy in its repository.
+The separate [Rust](https://github.com/Chymeral/chymeral-rust-sdk/blob/main/SECURITY.md)
+and [Node](https://github.com/Chymeral/chymeral-node-sdk/blob/main/SECURITY.md)
+SDKs have matching policies in their respective repositories.
