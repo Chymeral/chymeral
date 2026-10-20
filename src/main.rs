@@ -1421,7 +1421,13 @@ impl WindowState {
                 self.window.request_redraw();
                 return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.surface_config);
+                self.window.request_redraw();
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                drop(frame);
                 self.surface.configure(&self.device, &self.surface_config);
                 self.window.request_redraw();
                 return Ok(());
