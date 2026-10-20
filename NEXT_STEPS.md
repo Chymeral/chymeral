@@ -7,11 +7,28 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M20 are complete; M21 is the next planned phase.
-- CLP v2.0 is frozen and accepted for its first public release preparation.
-- `chymeral-rust-sdk` `1.0.0` is the accepted stable reference API; its release
-  tag and any later package publication belong to M21.
+- M1–M21 are complete and M22 is in progress; M23 and M24 are planned
+  follow-up work.
+- CLP v2.0 is frozen and publicly released. M23 and M24 target the compatible
+  CLP v2.1 update; v2.0 clients must retain their existing behavior on an
+  updated host.
+- `chymeral-rust-sdk` `1.0.0` is the accepted stable reference API and was
+  published with M21. Later SDK and protocol publications belong to M22 and
+  their respective feature milestones.
 - No phase below has started unless its status explicitly says otherwise.
+
+### M23–M24 release target
+
+- **Chymeral:** the coordinated public feature release is `v1.1.0`.
+- **CLP:** the protocol advances from `v2.0` to `v2.1`. A v2.1 host continues
+  to accept v2.0 clients, which simply cannot request the new capabilities.
+- **Supported SDKs:** the Rust and Node.js/TypeScript SDKs advance from `1.0.0`
+  to `2.0.0` and expose the finalized CLP v2.1 APIs. Their release notes must
+  state their behavior against a v2.0-only host and the migration path from the
+  `1.0.0` bindings.
+- These are separate version lines: Chymeral `1.1.0` denotes the next official
+  feature release, CLP `2.1` denotes a backward-compatible wire expansion, and
+  SDK `2.0.0` denotes the corresponding application-facing API generation.
 
 ## How to maintain this record
 
@@ -1103,3 +1120,177 @@ M20 must be complete and the v2.0 protocol contract must be stable.
   `1.0.0` was released on npm with ESM support for Node.js `22` or newer. It
   implements the same public CLP v2.0 contract through local IPC and retains
   independent Linux and Windows quality checks.
+
+## M23 — Frame-Paced Scene Presentation
+
+**Status:** Planned
+
+### Scope
+
+- Measure end-to-end continuous-interaction latency: host input arrival,
+  application notification delivery, command receipt, scene mutation, render
+  submission, and presentation where the backend exposes that boundary.
+- Benchmark retained-scene interactions that update a parent transform and a
+  related control in response to high-rate pointer movement, scrolling, and
+  resizing.
+- Validate and, if necessary, extend continuous-notification coalescing so the
+  newest pointer or scroll state wins under pressure while discrete input keeps
+  its ordering and delivery guarantees.
+- Add an opt-in, session-local frame-presentation path for bounded transient
+  scene state. It must atomically commit related visual changes at a renderer
+  frame without requiring a separate `set_node` acknowledgement per property.
+- Ensure retained parent transforms, clipping, and sibling control updates do
+  not rebuild or re-upload unaffected scene descendants.
+
+### Exclusions
+
+- A general widget, layout, or application framework.
+- Artificial interpolation intended to hide stale input, or a fixed-FPS promise
+  to CLP applications.
+- Unbounded concurrent commands that weaken session ownership, command order,
+  or deterministic scene mutation semantics.
+
+### Accepted strategic decision
+
+- **Date:** 2026-10-20
+  **Decision:** Retain the current ordered CLP command path as the reliable
+  control plane, and add a separate opt-in frame-presentation lane for
+  high-frequency visual state in CLP v2.1.
+  **Context:** A retained scene already gives Chymeral the correct ownership
+  and mutation model for desktop applications. Treating every pointer sample
+  as a command that must complete an IPC round-trip before the next sample is
+  processed, however, makes continuous interaction feel delayed even when only
+  a parent transform and a scrollbar thumb change.
+  **Rationale:** Graphics engines keep structural commands reliable while
+  presenting the newest available transient state once per display opportunity.
+  Adopting that separation preserves CLP's deterministic control semantics
+  without using a fixed-rate application tick or interpolation to mask stale
+  input.
+  **Consequences:** `create_node`, structural `set_node`, ownership, and
+  discrete input remain ordered and acknowledged exactly as in CLP v2.0. The
+  new lane is limited to documented presentational properties, coalesces stale
+  continuous state, and commits each accepted packet atomically at a host frame
+  boundary. It is not arbitrary concurrent command execution.
+  **Validation:** A host trace, stress benchmark, SDK conformance fixture, and
+  Linux/Windows manual profiling matrix must prove both the latency improvement
+  and preservation of existing control-plane semantics.
+
+### Architecture and delivery strategy
+
+1. **Measure before changing the wire.** Add correlation identifiers and
+   timestamps for input receipt, CLP delivery, command/batch acceptance, render
+   submission, and presentation where available. The benchmark must include a
+   static terminal with a moving scene subtree and control, so terminal redraw
+   cost cannot be confused with scene-update cost.
+2. **Keep two explicit lanes.** The reliable lane continues to serialize and
+   acknowledge structural work. The new presentation lane accepts only a
+   bounded packet of transient state for one session; a newer pending packet
+   replaces an older unpresented packet from that session.
+3. **Commit once per renderer frame.** The host drains the latest eligible
+   presentation packet at its redraw/vsync opportunity and applies the packet
+   atomically. Applications receive bounded completion or error reporting for
+   the packet, never a synchronous round-trip for every property mutation.
+4. **Make presentation work cheap.** Parent transforms, clips, and dynamic
+   controls must compose over cached terminal and unaffected scene content.
+   The renderer must use dirty regions or retained GPU state rather than
+   recreate terminal glyphs, scene nodes, or image uploads for those updates.
+5. **Protect input freshness.** Pointer movement and scroll may coalesce to the
+   newest state. Press, release, key, focus, close, ownership, and structural
+   command events never take the lossy path or change relative order.
+6. **Version and expose deliberately.** Freeze the capability, packet limits,
+   eligible properties, completion semantics, and SDK APIs only after the host
+   prototype and trace show the required behavior. Release the result with
+   Chymeral `1.1.0`, CLP v2.1, and the `2.0.0` SDK line; CLP v2.0 clients remain
+   on the reliable path unchanged.
+
+### Performance quality bar
+
+- The host should use every practical display-refresh opportunity rather than
+  impose an artificial update cap below the active surface's refresh rate.
+- On agreed reference hardware, the interaction benchmark targets stable
+  60 Hz-or-better presentation when the display supports it, with higher
+  refresh rates exercised when available.
+- The benchmark records input-to-presentation latency in refresh intervals.
+  The initial target is p95 at or below two refresh intervals and no unbounded
+  stale-input backlog; platform and driver limitations must be reported rather
+  than hidden.
+- This is a performance quality bar and regression gate, not a universal fixed
+  FPS or latency guarantee to every CLP application.
+
+### Acceptance criteria
+
+- Diagnostics distinguish time spent in the host input queue, client delivery,
+  IPC/command processing, renderer submission, and the nearest available
+  presentation boundary; unavailable platform timing is labelled as such.
+- Under sustained pointer movement, obsolete continuous updates do not create
+  an unbounded visible-latency queue. The rendered position reflects the newest
+  eligible state at each presentation opportunity.
+- Press, release, key, close, ownership, and command ordering semantics remain
+  unchanged while continuous notification or mutation coalescing is active.
+- A parent translation plus its scrollbar/control position commits as one
+  ordered visual update through the frame-presentation path, without rebuilding
+  unaffected terminal or scene content.
+- The documented benchmark meets the performance quality bar on its reference
+  Linux and Windows systems and reports results separately by backend and
+  display refresh rate.
+- Automated stress coverage and manual profiling pass on Windows and on Linux
+  X11/XWayland and native Wayland where the backend supports the required
+  measurements.
+
+## M24 — CLP Application Window Metadata
+
+**Status:** Planned
+
+### Scope
+
+- Add an optional `window_metadata` CLP capability in CLP v2.1.
+- Let an owning application session declare its presented window title and a
+  bounded static application icon so the native window and taskbar can identify
+  the program rather than only Chymeral.
+- Apply metadata for the lifetime of its declaring session only, with a clear
+  fallback to Chymeral's terminal-derived title and bundled icon when metadata
+  is cleared or the session closes.
+- Expose the finalized operation and types consistently through the Rust and
+  Node SDKs, shared fixtures, protocol documentation, and conformance probes.
+
+### Exclusions
+
+- Window position, size, fullscreen, opacity, decorations, menus,
+  notifications, or arbitrary desktop-window management.
+- Persistent launcher metadata, configuration-file changes, remote icon URLs,
+  or host filesystem paths supplied by an application.
+- Animated window icons or metadata ownership shared across sessions.
+
+### Planned protocol direction
+
+- The capability will provide a session-owned metadata update operation
+  (candidate name: `set_window_metadata`) with optional title/name and icon
+  fields. Its exact wire shape and limits must be frozen with the v2.1
+  specification.
+- An application-owned title is presented verbatim while its metadata claim is
+  active; it takes precedence over terminal OSC title updates. Clearing the
+  claim or closing its session restores normal terminal-title behavior.
+- Icon input must be a bounded static raster resource or payload owned by the
+  declaring session. It must not fetch data or grant filesystem access. The
+  protocol design must define whether this reuses a constrained image handle or
+  introduces a dedicated icon resource.
+- Metadata conflicts between concurrent sessions require a deterministic,
+  documented ownership and restoration rule before implementation begins.
+- CLP v2.0 clients neither request nor depend on this capability and continue
+  to receive Chymeral's existing title and icon behavior on an updated host.
+
+### Acceptance criteria
+
+- Capability negotiation, title/icon validation, limits, session ownership,
+  replacement, clearing, session closure, and v2.0 fallback have wire and
+  conformance coverage.
+- A program can present its own title without a forced `Chymeral —` prefix
+  while its metadata claim is active.
+- The native title and icon update correctly on Windows and on supported Linux
+  backends. Backend or desktop-environment icon limitations, especially under
+  Wayland, are detected or documented rather than silently misrepresented.
+- Closing the declaring application restores terminal-derived title behavior
+  and Chymeral's fallback icon without leaving process-specific metadata in
+  later sessions.
+- SDK examples demonstrate title-only metadata and title-plus-icon metadata
+  without relying on platform-specific file paths.
