@@ -7,14 +7,14 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M21 are complete and M22 is in progress; M23 and M24 are planned
+- M1–M22 are complete; M23 and M24 are planned
   follow-up work.
 - CLP v2.0 is frozen and publicly released. M23 and M24 target the compatible
   CLP v2.1 update; v2.0 clients must retain their existing behavior on an
   updated host.
-- `chymeral-rust-sdk` `1.0.0` is the accepted stable reference API and was
-  published with M21. Later SDK and protocol publications belong to M22 and
-  their respective feature milestones.
+- `chymeral-rust-sdk` `1.0.0` and `@chymeral/node-sdk` `1.0.1` are accepted
+  stable public APIs. Later SDK and protocol publications belong to their
+  respective feature milestones.
 - No phase below has started unless its status explicitly says otherwise.
 
 ### M23–M24 release target
@@ -1099,7 +1099,7 @@ The stable v2 command-error vocabulary is `unsupported_version`,
 
 ## M22 — Language-Neutral SDK Ecosystem
 
-**Status:** In progress
+**Status:** Complete (2026-10-20)
 
 ### Scope
 
@@ -1115,11 +1115,34 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 
 ### Delivered
 
+- **Canonical CLP v2.0 fixtures (2026-10-20):**
+  [`protocol/fixtures/v2.0`](protocol/fixtures/v2.0/README.md) supplies a
+  versioned, language-neutral corpus for lifecycle, subscriptions, retained
+  scene mutation, intrinsic text, overlap, RGBA8/GIF binary uploads,
+  notifications, errors, and termination. The core validates its client frames
+  against the actual wire types, binary lengths against the transport, and
+  command responses against a prior request in the same vector.
+  `SHA256SUMS` locks its exact bytes for vendor snapshots. It is a portable
+  regression reference, not a network dependency, code generator, or
+  replacement for live conformance.
 - **Node.js and TypeScript SDK (2026-10-19):**
   [`@chymeral/node-sdk`](https://www.npmjs.com/package/@chymeral/node-sdk)
-  `1.0.0` was released on npm with ESM support for Node.js `22` or newer. It
+  `1.0.1` is released on npm with ESM support for Node.js `22` or newer. It
   implements the same public CLP v2.0 contract through local IPC and retains
   independent Linux and Windows quality checks.
+- **Independent SDK validation:** The Rust SDK `1.0.0` remains the conformance
+  reference without a privileged runtime path. Both SDKs vendor and SHA-check
+  the same corpus, then replay every vector through their public APIs and own
+  fake hosts in their Linux/Windows version matrices.
+
+### Validation record
+
+- The canonical corpus is parsed and checked in the core transport tests.
+- Rust runs `fixture_corpus` on Rust 1.85 and stable for Linux and Windows;
+  Node runs its equivalent test on Node.js 22 and 24 for both platforms.
+- Rust and Node SDKs retain separate deterministic fake-host coverage and live
+  conformance executables; neither imports the host implementation or another
+  SDK.
 
 ## M23 — Frame-Paced Scene Presentation
 

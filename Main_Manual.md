@@ -495,6 +495,18 @@ Chymeral currently has two stable external client SDKs:
 They are client libraries, not host plugins and not requirements for other
 languages.
 
+### Shared fixture corpus
+
+The versioned [CLP v2.0 fixture corpus](protocol/fixtures/v2.0/README.md)
+provides portable ordered examples of framing, lifecycle, capabilities, scene
+commands, binary image transfer, notifications, errors, and closure. It is the
+shared regression reference for language SDKs; it does not make an SDK a host
+dependency and it does not replace a live endpoint conformance run. SDK authors
+should pin a reviewed Chymeral revision when copying those vectors into their
+own test harnesses rather than downloading them during ordinary CI. The Rust
+and Node SDKs vendor a byte-checked snapshot with `SHA256SUMS` and replay it
+through their public APIs and own fake hosts in their Linux/Windows CI matrices.
+
 ### Rust
 
 For a released version, add the crate from `crates.io` to an application
@@ -600,8 +612,10 @@ close only the client session.
 CLP deliberately favors a small, reliable foundation. It has no public package
 manifest standard, no protocol IDL, no widget library, and no 3D scene API.
 Neither the Rust reference SDK nor the Node SDK is a privileged host component;
-additional language bindings can share an IDL and the conformance suite without
-changing the ordinary-program model at the center of Chymeral.
+additional language bindings can share the versioned fixture corpus and the
+conformance suite without changing the ordinary-program model at the center of
+Chymeral. An IDL remains deferred until it removes real duplication that the
+fixtures and independent SDKs cannot address.
 
 The first stable source baseline is Chymeral `1.0.0`, which implements CLP
 v2.0. The separate Rust reference binding and Node binding are both `1.0.0`;

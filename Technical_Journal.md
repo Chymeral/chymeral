@@ -49,7 +49,7 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 | M19 | Breaking CLP v2.0 consolidation and the reference Rust SDK API. | One canonical wire vocabulary and unified RGBA8/GIF image handle precede public SDK stability. |
 | M20 | Alpha-derived image contact and generic input passthrough. | Visual layering can be spatially truthful without turning Chymeral into a physics or widget engine. |
 | M21 | Public Chymeral `v1.0.0` portable Linux and Windows releases. | The host is distributed as an application; CLP and language SDKs remain the application-development boundary. |
-| M22 | Node.js and TypeScript SDK `1.0.0`, published as `@chymeral/node-sdk`. | A second stable client validates the language-neutral CLP contract without changing the host or privileging a runtime. |
+| M22 | Shared CLP v2.0 fixture corpus and stable Rust and Node SDKs. | A portable contract corpus lets independently maintained clients validate wire compatibility without changing the host or privileging a runtime. |
 
 ## CLP evolution
 
@@ -141,7 +141,10 @@ single-line paste, both bracketed-paste states, and alternate-screen behavior.
 M20 automated coverage verifies static alpha hit testing, alpha overlap, input
 passthrough with interactive descendants, alpha-aware external-drop targeting,
 transport serialization, and GIF-frame overlap reconciliation. The separate
-Rust and Node SDKs expose the same public CLP v2.0 surface as version `1.0.0`.
+Rust `1.0.0` and Node `1.0.1` SDKs expose the same public CLP v2.0 surface.
+The versioned fixture corpus and its SHA-256 manifest are vendored by both SDKs;
+their public-API replay runners execute in the Rust and Node Linux/Windows
+matrices while live conformance remains mandatory.
 Manual Linux and Windows acceptance confirmed static alpha, passthrough, and
 animated-alpha interaction. Native Wayland correctly continues to withhold the
 separate, incoming external-file-drop capability.

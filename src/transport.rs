@@ -3732,15 +3732,289 @@ impl From<SessionCloseReason> for WireCloseReason {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
     use interprocess::local_socket::{GenericNamespaced, ToNsName, prelude::LocalSocketStream};
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
 
     use crate::protocol::{ClientHello, ProgramInitContext, SessionManager};
     use crate::runtime::KeyEvent;
 
     use super::*;
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureCorpus {
+        format: String,
+        fixture_version: u32,
+        protocol: FixtureProtocolVersion,
+        transport: FixtureTransport,
+        vectors: Vec<FixtureVector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureProtocolVersion {
+        major: u16,
+        minor: u16,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureTransport {
+        length_prefix: String,
+        json_discriminator: String,
+        binary_discriminator: String,
+        maximum_frame_bytes: usize,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureVector {
+        id: String,
+        description: String,
+        frames: Vec<FixtureFrame>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum FixtureDirection {
+        ClientToHost,
+        HostToClient,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum FixtureFrameKind {
+        Json,
+        Binary,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureFrame {
+        direction: FixtureDirection,
+        kind: FixtureFrameKind,
+        #[serde(default)]
+        message: Option<Value>,
+        #[serde(default)]
+        bytes_hex: Option<String>,
+    }
+
+    #[test]
+    fn validates_the_canonical_clp_v2_fixture_corpus() {
+        let fixture_bytes = include_bytes!("../protocol/fixtures/v2.0/fixtures.json");
+        let expected_hash = include_str!("../protocol/fixtures/v2.0/SHA256SUMS")
+            .split_whitespace()
+            .next()
+            .expect("fixture SHA256SUMS must contain a checksum");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fixture_bytes)),
+            expected_hash
+        );
+
+        let corpus: FixtureCorpus =
+            serde_json::from_str(include_str!("../protocol/fixtures/v2.0/fixtures.json"))
+                .expect("the canonical CLP fixture corpus must be valid JSON");
+
+        assert_eq!(corpus.format, "chymeral-clp-fixture-corpus");
+        assert_eq!(corpus.fixture_version, 1);
+        assert_eq!(
+            (corpus.protocol.major, corpus.protocol.minor),
+            (
+                crate::protocol::CLP_PROTOCOL_VERSION.major(),
+                crate::protocol::CLP_PROTOCOL_VERSION.minor()
+            )
+        );
+        assert_eq!(
+            corpus.transport.length_prefix,
+            "unsigned 32-bit big-endian payload length including the one-byte discriminator"
+        );
+        assert_eq!(corpus.transport.json_discriminator, "J");
+        assert_eq!(corpus.transport.binary_discriminator, "B");
+        assert_eq!(corpus.transport.maximum_frame_bytes, MAX_FRAME_BYTES);
+
+        let expected_vectors: BTreeSet<_> = [
+            "delivery-errors-and-fault-close",
+            "image-upload-and-cleanup",
+            "lifecycle-and-subscriptions",
+            "scene-text-and-overlap",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut vector_ids = BTreeSet::new();
+        let mut client_message_types = BTreeSet::new();
+        let mut host_message_types = BTreeSet::new();
+
+        for vector in corpus.vectors {
+            assert!(!vector.id.is_empty());
+            assert!(!vector.description.is_empty());
+            assert!(vector_ids.insert(vector.id));
+
+            let mut pending_upload_length = None;
+            let mut pending_request_ids = BTreeSet::new();
+            for frame in vector.frames {
+                match (frame.direction, frame.kind) {
+                    (FixtureDirection::ClientToHost, FixtureFrameKind::Json) => {
+                        assert!(pending_upload_length.is_none());
+                        assert!(frame.bytes_hex.is_none());
+                        let message = frame.message.expect("JSON frames need a message");
+                        let message_type = fixture_message_type(&message);
+                        client_message_types.insert(message_type.to_owned());
+                        let message: WireClientMessage = serde_json::from_value(message)
+                            .expect("client fixture messages must match the CLP wire type");
+                        if let WireClientMessage::Command {
+                            request_id,
+                            command,
+                        } = &message
+                        {
+                            assert!(
+                                pending_request_ids.insert(request_id.clone()),
+                                "fixture command request IDs must be unique within a vector"
+                            );
+                            pending_upload_length = command
+                                .upload_length()
+                                .expect("fixture image uploads must have valid dimensions");
+                        }
+                    }
+                    (FixtureDirection::ClientToHost, FixtureFrameKind::Binary) => {
+                        assert!(frame.message.is_none());
+                        let bytes = fixture_hex_bytes(
+                            &frame.bytes_hex.expect("binary frames need fixture bytes"),
+                        );
+                        assert_eq!(
+                            pending_upload_length.take(),
+                            Some(bytes.len()),
+                            "a binary fixture frame must immediately complete its image upload"
+                        );
+                        let frame = raw_frame_bytes(b'B', &bytes)
+                            .expect("fixture binary frames must fit the CLP transport");
+                        assert_eq!(
+                            usize::try_from(u32::from_be_bytes(frame[..4].try_into().unwrap()))
+                                .unwrap(),
+                            bytes.len() + 1
+                        );
+                        assert_eq!(frame[4], b'B');
+                    }
+                    (FixtureDirection::HostToClient, FixtureFrameKind::Json) => {
+                        assert!(pending_upload_length.is_none());
+                        assert!(frame.bytes_hex.is_none());
+                        let message = frame.message.expect("JSON frames need a message");
+                        let message_type = fixture_host_message_type(&message);
+                        host_message_types.insert(message_type.to_owned());
+                        if matches!(message_type, "result" | "command_error") {
+                            let request_id = message
+                                .as_object()
+                                .and_then(|message| message.get("request_id"))
+                                .and_then(Value::as_str)
+                                .expect("command responses need a string request_id");
+                            assert!(
+                                pending_request_ids.remove(request_id),
+                                "fixture command response must follow its request in the same vector"
+                            );
+                        }
+                    }
+                    (FixtureDirection::HostToClient, FixtureFrameKind::Binary) => {
+                        panic!("CLP v2.0 does not send binary host frames")
+                    }
+                }
+            }
+            assert!(pending_upload_length.is_none());
+            assert!(
+                pending_request_ids.is_empty(),
+                "fixture vectors must not leave commands without a response"
+            );
+        }
+
+        assert_eq!(vector_ids, expected_vectors);
+        assert_eq!(
+            client_message_types,
+            [
+                "close",
+                "command",
+                "fault",
+                "hello",
+                "init_complete",
+                "started",
+                "subscribe",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+        assert_eq!(
+            host_message_types,
+            [
+                "closed",
+                "command_error",
+                "delivery_gap",
+                "event",
+                "frame",
+                "init",
+                "resize",
+                "result",
+                "start",
+                "subscribed",
+                "tick",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+    }
+
+    fn fixture_message_type(message: &Value) -> &str {
+        message
+            .as_object()
+            .and_then(|message| message.get("type"))
+            .and_then(Value::as_str)
+            .expect("fixture messages must have a string type")
+    }
+
+    fn fixture_host_message_type(message: &Value) -> &str {
+        let object = message
+            .as_object()
+            .expect("host fixture messages must be JSON objects");
+        let message_type = fixture_message_type(message);
+        let required_fields: &[&str] = match message_type {
+            "init" => &["protocol", "session_id", "capabilities", "context"],
+            "start" => &["session_id"],
+            "subscribed" => &["session_id", "subscriptions"],
+            "resize" => &[
+                "session_id",
+                "physical_width",
+                "physical_height",
+                "logical_width",
+                "logical_height",
+                "scale_factor",
+            ],
+            "tick" | "frame" => &["session_id", "dt_ns"],
+            "event" => &["session_id", "event"],
+            "delivery_gap" => &["session_id", "categories"],
+            "result" => &["request_id", "result"],
+            "command_error" => &["request_id", "code", "message"],
+            "closed" => &["session_id", "reason"],
+            _ => panic!("unsupported host fixture message type {message_type}"),
+        };
+        for field in required_fields {
+            assert!(
+                object.contains_key(*field),
+                "{message_type} fixture messages need {field}"
+            );
+        }
+        message_type
+    }
+
+    fn fixture_hex_bytes(value: &str) -> Vec<u8> {
+        assert!(value.len().is_multiple_of(2));
+        (0..value.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).unwrap())
+            .collect()
+    }
 
     fn connect(server: &ClpServer) -> LocalSocketStream {
         try_connect(server).unwrap()

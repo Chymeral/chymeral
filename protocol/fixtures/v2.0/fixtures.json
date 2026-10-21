@@ -1,0 +1,690 @@
+{
+  "format": "chymeral-clp-fixture-corpus",
+  "fixture_version": 1,
+  "protocol": {
+    "major": 2,
+    "minor": 0
+  },
+  "transport": {
+    "length_prefix": "unsigned 32-bit big-endian payload length including the one-byte discriminator",
+    "json_discriminator": "J",
+    "binary_discriminator": "B",
+    "maximum_frame_bytes": 1048576
+  },
+  "vectors": [
+    {
+      "id": "lifecycle-and-subscriptions",
+      "description": "A successful full-capability session, its subscription acknowledgement, timing delivery, and clean client close.",
+      "frames": [
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "hello",
+            "protocol": {
+              "major": 2,
+              "minor": 0
+            },
+            "token": "fixture-token-not-a-secret",
+            "capabilities": [
+              "scene",
+              "images",
+              "input",
+              "timing",
+              "overlap",
+              "external_drop",
+              "text"
+            ]
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "init",
+            "protocol": {
+              "major": 2,
+              "minor": 0
+            },
+            "session_id": "session-1",
+            "capabilities": [
+              "scene",
+              "images",
+              "input",
+              "timing",
+              "overlap",
+              "external_drop",
+              "text"
+            ],
+            "context": {
+              "arguments": [
+                "--fixture"
+              ],
+              "initial_commands": [
+                {
+                  "name": "open",
+                  "arguments": [
+                    "fixture"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "init_complete"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "start",
+            "session_id": "session-1"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "started"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "subscribe",
+            "subscriptions": [
+              "raw_input",
+              "terminal",
+              "timing"
+            ]
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "subscribed",
+            "session_id": "session-1",
+            "subscriptions": [
+              "raw_input",
+              "terminal",
+              "timing"
+            ]
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "resize",
+            "session_id": "session-1",
+            "physical_width": 1600,
+            "physical_height": 900,
+            "logical_width": 800.0,
+            "logical_height": 450.0,
+            "scale_factor": 2.0
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "tick",
+            "session_id": "session-1",
+            "dt_ns": "16666667"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "frame",
+            "session_id": "session-1",
+            "dt_ns": "16666667"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "close"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "closed",
+            "session_id": "session-1",
+            "reason": {
+              "kind": "client_requested"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-text-and-overlap",
+      "description": "A running session creates visual and intrinsic text nodes, receives an overlap transition, mutates a node atomically, queries contact state, and removes its nodes.",
+      "frames": [
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-create-rectangle",
+            "command": {
+              "op": "create_node",
+              "layer": "overlay",
+              "node": {
+                "kind": "rectangle",
+                "properties": {
+                  "x": 24.0,
+                  "y": 32.0,
+                  "width": 160.0,
+                  "height": 72.0,
+                  "visible": true,
+                  "clip_children": false,
+                  "z_index": 2,
+                  "overlap_enabled": true,
+                  "external_drop_enabled": false,
+                  "input_passthrough": false
+                },
+                "color": [
+                  37,
+                  99,
+                  235,
+                  230
+                ]
+              }
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-create-rectangle",
+            "result": {
+              "kind": "node",
+              "node": "node-1"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-create-text",
+            "command": {
+              "op": "create_node",
+              "layer": "overlay",
+              "node": {
+                "kind": "text",
+                "properties": {
+                  "x": 48.0,
+                  "y": 56.0,
+                  "visible": true,
+                  "clip_children": false,
+                  "z_index": 3,
+                  "overlap_enabled": true,
+                  "external_drop_enabled": false,
+                  "input_passthrough": false
+                },
+                "text": "Status:\tready\n界",
+                "style": {
+                  "weight": "bold",
+                  "align": "start",
+                  "color": [
+                    220,
+                    230,
+                    255,
+                    255
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-create-text",
+            "result": {
+              "kind": "node",
+              "node": "node-2",
+              "text_metrics": {
+                "columns": 13,
+                "rows": 2,
+                "width": 104.0,
+                "height": 36.0
+              }
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "event",
+            "session_id": "session-1",
+            "event": {
+              "kind": "scene",
+              "event": {
+                "kind": "overlap_enter",
+                "first": "node-1",
+                "second": "node-2"
+              }
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-set-rectangle",
+            "command": {
+              "op": "set_node",
+              "node": "node-1",
+              "changes": {
+                "properties": {
+                  "x": 64.0,
+                  "input_passthrough": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-set-rectangle",
+            "result": {
+              "kind": "node_updated"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-is-overlapping",
+            "command": {
+              "op": "is_overlapping",
+              "node": "node-1"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-is-overlapping",
+            "result": {
+              "kind": "is_overlapping",
+              "overlapping": true
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-get-overlaps",
+            "command": {
+              "op": "get_overlaps",
+              "node": "node-1"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-get-overlaps",
+            "result": {
+              "kind": "overlaps",
+              "nodes": [
+                "node-2"
+              ]
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-remove-text",
+            "command": {
+              "op": "remove_node",
+              "node": "node-2"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-remove-text",
+            "result": {
+              "kind": "acknowledged"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-remove-rectangle",
+            "command": {
+              "op": "remove_node",
+              "node": "node-1"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-remove-rectangle",
+            "result": {
+              "kind": "acknowledged"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "image-upload-and-cleanup",
+      "description": "A running session transfers raw RGBA8 and encoded GIF bytes after their upload metadata, creates an alpha-contact image node, then releases all image resources.",
+      "frames": [
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-upload-rgba8",
+            "command": {
+              "op": "upload_image",
+              "source": {
+                "kind": "rgba8",
+                "width": 1,
+                "height": 1
+              }
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "binary",
+          "bytes_hex": "ff8000ff"
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-upload-rgba8",
+            "result": {
+              "kind": "image",
+              "image": "image-1"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-create-alpha-image",
+            "command": {
+              "op": "create_node",
+              "layer": "overlay",
+              "node": {
+                "kind": "image",
+                "properties": {
+                  "x": 96.0,
+                  "y": 64.0,
+                  "width": 48.0,
+                  "height": 48.0,
+                  "visible": true,
+                  "clip_children": false,
+                  "z_index": 1,
+                  "overlap_enabled": true,
+                  "external_drop_enabled": true,
+                  "input_passthrough": false
+                },
+                "image": "image-1",
+                "opacity": 0.75,
+                "contact_shape": {
+                  "kind": "alpha",
+                  "threshold": 1
+                }
+              }
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-create-alpha-image",
+            "result": {
+              "kind": "node",
+              "node": "node-3"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-remove-alpha-image-node",
+            "command": {
+              "op": "remove_node",
+              "node": "node-3"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-remove-alpha-image-node",
+            "result": {
+              "kind": "acknowledged"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-remove-rgba8",
+            "command": {
+              "op": "remove_image",
+              "image": "image-1"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-remove-rgba8",
+            "result": {
+              "kind": "acknowledged"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-upload-gif",
+            "command": {
+              "op": "upload_image",
+              "source": {
+                "kind": "gif",
+                "byte_length": 43
+              }
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "binary",
+          "bytes_hex": "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024c01003b"
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-upload-gif",
+            "result": {
+              "kind": "image",
+              "image": "image-2"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-remove-gif",
+            "command": {
+              "op": "remove_image",
+              "image": "image-2"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-remove-gif",
+            "result": {
+              "kind": "acknowledged"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "delivery-errors-and-fault-close",
+      "description": "Representative host notifications, a machine-readable command rejection, and a program-fault termination for a running session.",
+      "frames": [
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "event",
+            "session_id": "session-1",
+            "event": {
+              "kind": "scene",
+              "event": {
+                "kind": "external_drop",
+                "target": "node-5",
+                "position": {
+                  "x": 120.0,
+                  "y": 80.0
+                },
+                "files": [
+                  {
+                    "uri": "file:///tmp/fixture.txt"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "delivery_gap",
+            "session_id": "session-1",
+            "categories": [
+              "scene",
+              "timing"
+            ]
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-invalid-owner",
+            "command": {
+              "op": "is_overlapping",
+              "node": "node-99"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "command_error",
+            "request_id": "fixture-invalid-owner",
+            "code": "not_owner",
+            "message": "node-99 is not owned by this session"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "fault",
+            "phase": "event",
+            "message": "fixture program fault"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "closed",
+            "session_id": "session-1",
+            "reason": {
+              "kind": "program_fault",
+              "phase": "event",
+              "message": "fixture program fault"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

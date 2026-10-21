@@ -55,10 +55,11 @@ modules deliberately keep related state and invariants together; do not move
 code solely to reduce line count without preserving that cohesion.
 
 Treat CLP as a public contract. A CLP change must update the protocol types,
-host behavior, wire tests, `Main_Manual.md`, the compatibility record, and the
-reference SDK when applicable. Do not add silent protocol aliases or make Rust
-a privileged runtime path. Discuss breaking contract changes before coding
-them.
+host behavior, wire tests, the applicable
+[`protocol/fixtures`](protocol/fixtures/), `Main_Manual.md`, the compatibility
+record, `SHA256SUMS`, and every affected SDK snapshot and replay test. Do not
+add silent protocol aliases or make Rust a privileged runtime path. Discuss
+breaking contract changes before coding them.
 
 The core Rust modules are shared executable internals, not a semver-stable API.
 Avoid depending on them from external projects. Security issues belong in the

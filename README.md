@@ -112,6 +112,8 @@ may be relative to the configuration file.
 - [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) — the
   separate Node.js and TypeScript client, published on
   [npm](https://www.npmjs.com/package/@chymeral/node-sdk).
+- [CLP v2.0 fixture corpus](protocol/fixtures/v2.0/README.md) — portable,
+  language-neutral framed-message vectors for SDK conformance work.
 - [Contributing guide](CONTRIBUTING.md) — setup, checks, and protocol-change
   expectations for collaborators.
 - [Changelog](CHANGELOG.md) — released behavior and compatibility notes.
@@ -121,7 +123,7 @@ may be relative to the configuration file.
 
 Chymeral `1.0.0` is the first stable release. It implements CLP v2.0 and is
 paired with two separate stable SDKs: the `chymeral-rust-sdk` `1.0.0` reference
-binding and the `@chymeral/node-sdk` `1.0.0` Node.js and TypeScript binding.
+binding and the `@chymeral/node-sdk` `1.0.1` Node.js and TypeScript binding.
 These version lines are independent: the application is distributed as a
 terminal program, CLP is the language-neutral contract, and each SDK is one
 client implementation. Linux and Windows manual acceptance has passed, and
