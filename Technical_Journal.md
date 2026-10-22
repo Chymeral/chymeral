@@ -50,15 +50,19 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 | M20 | Alpha-derived image contact and generic input passthrough. | Visual layering can be spatially truthful without turning Chymeral into a physics or widget engine. |
 | M21 | Public Chymeral `v1.0.0` portable Linux and Windows releases. | The host is distributed as an application; CLP and language SDKs remain the application-development boundary. |
 | M22 | Shared CLP v2.0 fixture corpus and stable Rust and Node SDKs. | A portable contract corpus lets independently maintained clients validate wire compatibility without changing the host or privileging a runtime. |
+| M23 | Frame-paced scene presentation and CLP v2.1 fixtures. | Reliable structural commands remain ordered; bounded transient geometry is a newest-state mailbox committed at a renderer frame. |
 
 ## CLP evolution
 
 CLP began as an internal lifecycle contract and became an actual local transport
 without exposing host memory, Rust types, graphics backend types, or a global
-socket. The active protocol is **v2.0**. It has seven opt-in capabilities:
-`scene`, `images`, `input`, `timing`, `overlap`, `external_drop`, and `text`.
-M19 deliberately removed the v1.x and provisional v1.4 wire vocabularies
-before public SDK stability; the host provides no compatibility aliases.
+socket. The released protocol is **v2.0**. The current source-tree development
+contract is **v2.1**, which retains v2.0 compatibility and adds the opt-in
+`presentation` capability. CLP v2.0 has seven opt-in capabilities: `scene`,
+`images`, `input`, `timing`, `overlap`, `external_drop`, and `text`; v2.1 adds
+`presentation` for bounded transient geometry. M19 deliberately removed the
+v1.x and provisional v1.4 wire vocabularies before public SDK stability; the
+host provides no compatibility aliases.
 
 The negotiated lifecycle is deliberately strict:
 
@@ -77,6 +81,16 @@ must reconstruct derived state. It does not silently drop discrete input or
 resize; a session that cannot preserve them is isolated with `host_overloaded`.
 The running-session writer also treats short-lived operating-system backpressure
 as retryable work, avoiding premature session loss on Windows named pipes.
+
+M23 adds a separate frame-presentation lane rather than weakening that ordered
+path. A `present_scene` packet can atomically change only geometry (`x`, `y`,
+`width`, and `height`; intrinsic text permits `x` and `y`). It is bounded to
+256 unique owned nodes, a 128-byte identifier, and 64 KiB of JSON. The host
+retains only the newest unpresented packet per session. Its `presented`,
+`superseded`, and `rejected` notifications are advisory/coalesced: `presented`
+means that Chymeral called `queue.present`, never that a compositor reported
+physical scanout. `CHYMERAL_PRESENTATION_TRACE=1` makes the same boundary
+honest by labelling client delivery and scanout as unavailable.
 
 ## Scene and interaction policy
 
@@ -148,6 +162,21 @@ matrices while live conformance remains mandatory.
 Manual Linux and Windows acceptance confirmed static alpha, passthrough, and
 animated-alpha interaction. Native Wayland correctly continues to withhold the
 separate, incoming external-file-drop capability.
+
+M23 adds a versioned CLP v2.1 fixture corpus, independent Rust and Node SDK
+replay coverage, atomic-mailbox transport tests, and a visual presentation
+probe. Linux manual acceptance passed on native Wayland and forced
+X11/Xwayland with zero rejected presentation packets; the observed probe-status
+p50/p95 was 30.23/40.44 ms and 30.21/40.32 ms respectively. Those are
+application-submit-to-host-status figures, not physical input-to-photon
+measurements. The optional native-Wayland trace reported host
+transport-to-`present` p50/p95 of 18.626/25.486 ms and a 457.954 ms maximum
+during its instrumented interactive run; it still excludes client delivery and
+scanout. The Windows VM passed functional presentation validation with zero
+rejections and clean CLP closure, but is intentionally not a performance
+reference. Manual stress testing also found and fixed a terminal scrollback
+resize defect: retained rows are now rendered, selected, and copied using their
+own historical cell width rather than a newer widened terminal grid.
 
 ## Intentional boundaries
 

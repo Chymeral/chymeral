@@ -1,0 +1,172 @@
+{
+  "format": "chymeral-clp-fixture-corpus",
+  "fixture_version": 1,
+  "protocol": {
+    "major": 2,
+    "minor": 1
+  },
+  "transport": {
+    "length_prefix": "unsigned 32-bit big-endian payload length including the one-byte discriminator",
+    "json_discriminator": "J",
+    "binary_discriminator": "B",
+    "maximum_frame_bytes": 1048576
+  },
+  "vectors": [
+    {
+      "id": "frame-presentation",
+      "description": "A full-capability session submits bounded geometry through the frame-presentation lane, receives an asynchronous confirmation, then receives a rejected intrinsic-text bounds update and closes cleanly.",
+      "frames": [
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "hello",
+            "protocol": {
+              "major": 2,
+              "minor": 1
+            },
+            "token": "fixture-token-not-a-secret",
+            "capabilities": [
+              "scene",
+              "images",
+              "input",
+              "timing",
+              "overlap",
+              "external_drop",
+              "text",
+              "presentation"
+            ]
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "init",
+            "protocol": {
+              "major": 2,
+              "minor": 1
+            },
+            "session_id": "session-1",
+            "capabilities": [
+              "scene",
+              "images",
+              "input",
+              "timing",
+              "overlap",
+              "external_drop",
+              "text",
+              "presentation"
+            ],
+            "context": {
+              "arguments": ["--fixture-presentation"],
+              "initial_commands": []
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "init_complete"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "start",
+            "session_id": "session-1"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "started"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "present_scene",
+            "presentation_id": "fixture-presentation-1",
+            "updates": [
+              {
+                "node": "node-1",
+                "properties": {
+                  "x": 96.0,
+                  "y": 64.0
+                }
+              },
+              {
+                "node": "node-2",
+                "properties": {
+                  "width": 48.0,
+                  "height": 24.0
+                }
+              }
+            ]
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "presentation_status",
+            "session_id": "session-1",
+            "presentation_id": "fixture-presentation-1",
+            "status": "presented"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "present_scene",
+            "presentation_id": "fixture-presentation-2",
+            "updates": [
+              {
+                "node": "node-3",
+                "properties": {
+                  "width": 88.0
+                }
+              }
+            ]
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "presentation_status",
+            "session_id": "session-1",
+            "presentation_id": "fixture-presentation-2",
+            "status": "rejected",
+            "code": "invalid_node_change",
+            "message": "node-3 has intrinsic text bounds that cannot be set directly"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "close"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "closed",
+            "session_id": "session-1",
+            "reason": {
+              "kind": "client_requested"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

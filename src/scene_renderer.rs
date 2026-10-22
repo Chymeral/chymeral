@@ -90,7 +90,7 @@ struct GpuAnimatedImage {
     frame_index: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Draw {
     node: NodeId,
     source: DrawSource,
@@ -104,7 +104,7 @@ struct TerminalSelectionDraw {
     scissor: ScissorRect,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DrawSource {
     Texture(TextureId),
     AnimatedImage(AnimatedImageId),
@@ -149,6 +149,8 @@ pub struct ImageRenderer {
     gpu_animated_images: HashMap<AnimatedImageId, GpuAnimatedImage>,
     gpu_solids: HashMap<[u8; 4], GpuImage>,
     draws: Vec<Draw>,
+    draw_indices: HashMap<NodeId, usize>,
+    vertex_bytes: Vec<Vec<u8>>,
 }
 
 impl ImageRenderer {
@@ -190,6 +192,8 @@ impl ImageRenderer {
             gpu_animated_images: HashMap::new(),
             gpu_solids: HashMap::new(),
             draws: Vec::new(),
+            draw_indices: HashMap::new(),
+            vertex_bytes: Vec::new(),
         }
     }
 
@@ -222,8 +226,8 @@ impl ImageRenderer {
         self.gpu_solids
             .retain(|color, _| solid_colors.contains(color));
 
-        let mut vertices = Vec::new();
-        self.draws.clear();
+        let mut next_draws = Vec::new();
+        let mut next_vertex_bytes = Vec::new();
         for node_id in paint_order {
             let Some(node) = scene.node(node_id) else {
                 continue;
@@ -265,25 +269,64 @@ impl ImageRenderer {
             ) else {
                 continue;
             };
-            let first_vertex = u32::try_from(self.draws.len())
+            let first_vertex = u32::try_from(next_draws.len())
                 .ok()
                 .and_then(|count| count.checked_mul(VERTICES_PER_IMAGE))
                 .context("too many image nodes to render")?;
+            let mut vertices = Vec::with_capacity(usize::try_from(IMAGE_VERTEX_STRIDE * 6)?);
             for vertex in quad {
                 append_vertex(&mut vertices, vertex);
             }
-            self.draws.push(Draw {
+            next_draws.push(Draw {
                 node: node_id,
                 source,
                 first_vertex,
                 scissor,
             });
+            next_vertex_bytes.push(vertices);
         }
 
-        self.ensure_vertex_capacity(device, vertices.len() as u64);
-        if !vertices.is_empty() {
-            queue.write_buffer(&self.vertex_buffer, 0, &vertices);
+        let required = next_vertex_bytes
+            .iter()
+            .try_fold(0_u64, |total, bytes| {
+                total.checked_add(u64::try_from(bytes.len()).ok()?)
+            })
+            .context("scene image vertex buffer size overflows")?;
+        let capacity_changed = self.ensure_vertex_capacity(device, required);
+        let layout_changed = capacity_changed || !draw_layout_matches(&self.draws, &next_draws);
+        if layout_changed {
+            let mut vertices = Vec::with_capacity(usize::try_from(required)?);
+            for bytes in &next_vertex_bytes {
+                vertices.extend_from_slice(bytes);
+            }
+            if !vertices.is_empty() {
+                queue.write_buffer(&self.vertex_buffer, 0, &vertices);
+            }
+        } else {
+            for (index, (_, next)) in self
+                .vertex_bytes
+                .iter()
+                .zip(&next_vertex_bytes)
+                .enumerate()
+                .filter(|(_, (previous, next))| previous != next)
+            {
+                let offset = u64::try_from(index)
+                    .ok()
+                    .and_then(|index| {
+                        index.checked_mul(IMAGE_VERTEX_STRIDE * u64::from(VERTICES_PER_IMAGE))
+                    })
+                    .context("scene image vertex offset overflows")?;
+                queue.write_buffer(&self.vertex_buffer, offset, next);
+            }
         }
+        self.draws = next_draws;
+        self.draw_indices = self
+            .draws
+            .iter()
+            .enumerate()
+            .map(|(index, draw)| (draw.node, index))
+            .collect();
+        self.vertex_bytes = next_vertex_bytes;
         Ok(())
     }
 
@@ -335,7 +378,10 @@ impl ImageRenderer {
     }
 
     pub fn render_node<'a>(&'a self, pass: &mut RenderPass<'a>, node: NodeId) {
-        let Some(draw) = self.draws.iter().find(|draw| draw.node == node) else {
+        let Some(index) = self.draw_indices.get(&node) else {
+            return;
+        };
+        let Some(draw) = self.draws.get(*index) else {
             return;
         };
         self.render_draw(pass, draw);
@@ -499,9 +545,9 @@ impl ImageRenderer {
         })
     }
 
-    fn ensure_vertex_capacity(&mut self, device: &Device, required: u64) {
+    fn ensure_vertex_capacity(&mut self, device: &Device, required: u64) -> bool {
         if required <= self.vertex_capacity {
-            return;
+            return false;
         }
         let size = required.checked_next_power_of_two().unwrap_or(required);
         self.vertex_buffer = device.create_buffer(&BufferDescriptor {
@@ -511,6 +557,7 @@ impl ImageRenderer {
             mapped_at_creation: false,
         });
         self.vertex_capacity = size;
+        true
     }
 
     fn ensure_terminal_selection_vertex_capacity(&mut self, device: &Device, required: u64) {
@@ -526,6 +573,15 @@ impl ImageRenderer {
         });
         self.terminal_selection_vertex_capacity = size;
     }
+}
+
+fn draw_layout_matches(previous: &[Draw], next: &[Draw]) -> bool {
+    previous.len() == next.len()
+        && previous.iter().zip(next).all(|(previous, next)| {
+            previous.node == next.node
+                && previous.source == next.source
+                && previous.first_vertex == next.first_vertex
+        })
 }
 
 fn upload_gpu_texture(
@@ -712,9 +768,12 @@ fn append_vertex(bytes: &mut Vec<u8>, vertex: [f32; 5]) {
 
 #[cfg(test)]
 mod tests {
-    use chymeral::scene::Rect;
+    use chymeral::scene::{NodeProperties, Rect, Scene};
 
-    use super::{ImageViewport, ScissorRect, image_vertices, scissor_rect};
+    use super::{
+        Draw, DrawSource, ImageViewport, ScissorRect, draw_layout_matches, image_vertices,
+        scissor_rect,
+    };
 
     #[test]
     fn maps_logical_bounds_to_clip_space() {
@@ -759,5 +818,33 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn preserves_vertex_layout_when_only_a_nodes_clip_changes() {
+        let mut scene = Scene::new();
+        let node = scene.create_root(NodeProperties::default());
+        let previous = [Draw {
+            node,
+            source: DrawSource::Solid([37, 99, 235, 255]),
+            first_vertex: 0,
+            scissor: ScissorRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            },
+        }];
+        let next = [Draw {
+            scissor: ScissorRect {
+                x: 8,
+                y: 8,
+                width: 48,
+                height: 48,
+            },
+            ..previous[0]
+        }];
+
+        assert!(draw_layout_matches(&previous, &next));
     }
 }

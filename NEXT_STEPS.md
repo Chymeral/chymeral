@@ -7,8 +7,7 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M22 are complete; M23 and M24 are planned
-  follow-up work.
+- M1–M23 are complete; M24 remains planned follow-up work.
 - CLP v2.0 is frozen and publicly released. M23 and M24 target the compatible
   CLP v2.1 update; v2.0 clients must retain their existing behavior on an
   updated host.
@@ -1146,7 +1145,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 
 ## M23 — Frame-Paced Scene Presentation
 
-**Status:** Planned
+**Status:** Complete (2026-10-22)
 
 ### Scope
 
@@ -1198,6 +1197,60 @@ M20 must be complete and the v2.0 protocol contract must be stable.
   Linux/Windows manual profiling matrix must prove both the latency improvement
   and preservation of existing control-plane semantics.
 
+### Accepted implementation decisions
+
+- **Date:** 2026-10-21
+  **Decision:** The first presentation lane changes geometry only: `x`, `y`,
+  `width`, and `height`; intrinsic text accepts only `x` and `y`.
+  **Context:** Continuous interaction needs parent translation and companion
+  control movement without turning the lane into an unordered replacement for
+  retained-scene commands.
+  **Rationale:** Geometry is sufficient for panning, dragging, scrolling, and
+  lightweight controls while preserving the ownership, resource, style,
+  hierarchy, visibility, and interaction contracts of `set_node`.
+  **Consequences:** A packet contains 1–256 unique owned node handles, has a
+  non-empty UTF-8 identifier of at most 128 bytes, and has at most 64 KiB of
+  JSON payload. Every update is validated before any geometry is changed;
+  invalid packets leave the retained scene unchanged.
+  **Validation:** Core unit tests cover text-bound exclusion, ownership,
+  duplicate handles, non-finite geometry, and atomic rejection. The shared
+  v2.1 fixture covers one accepted packet and one rejected text-bounds packet.
+
+- **Date:** 2026-10-21
+  **Decision:** Retain only the newest unpresented presentation packet per
+  session. A later reliable scene mutation or a later committed presentation
+  replaces any state that has not reached `queue.present`.
+  **Context:** A redraw can be deferred or rejected by an outdated, occluded,
+  or temporarily unavailable surface after a packet has been committed.
+  **Rationale:** Reporting such state as presented on a later frame would lie
+  about what the user could have observed and would reintroduce stale visual
+  backlog.
+  **Consequences:** `presented`, `superseded`, and `rejected` statuses are
+  advisory coalesced notifications, not a per-packet acknowledgement queue.
+  `presented` means Chymeral called `queue.present`; it does not promise
+  physical scanout. Applications keep structural changes on the ordered
+  command path and submit the newest transient state without waiting for every
+  status.
+  **Validation:** Transport tests prove mailbox replacement and absence of a
+  command round trip; the Node presentation probe reports observed statuses
+  during pointer, scroll, resize, and burst traffic.
+
+- **Date:** 2026-10-21
+  **Decision:** Trace only host-observable boundaries and label unavailable
+  client-delivery and physical-scanout timing explicitly.
+  **Context:** CLP applications can run in arbitrary runtimes and wgpu/window
+  backends do not expose a portable scanout timestamp.
+  **Rationale:** Invented end-to-end figures would make latency diagnostics
+  less trustworthy than an honest staged trace.
+  **Consequences:** `CHYMERAL_PRESENTATION_TRACE=1` reports contextual latest
+  host input to transport receipt, transport receipt to commit, commit to
+  submission, and transport/commit to the host `present` call. It writes
+  `client_delivery_ms=unavailable` and `scanout_timing=unavailable` rather
+  than claiming those boundaries were measured.
+  **Validation:** The probe documents its application-submit-to-observed-status
+  metric separately from the host trace and does not call either physical
+  input-to-photon timing.
+
 ### Architecture and delivery strategy
 
 1. **Measure before changing the wire.** Add correlation identifiers and
@@ -1233,10 +1286,12 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 - On agreed reference hardware, the interaction benchmark targets stable
   60 Hz-or-better presentation when the display supports it, with higher
   refresh rates exercised when available.
-- The benchmark records input-to-presentation latency in refresh intervals.
-  The initial target is p95 at or below two refresh intervals and no unbounded
-  stale-input backlog; platform and driver limitations must be reported rather
-  than hidden.
+- The benchmark records the closest available host-to-presentation stage in
+  refresh intervals. Client delivery and physical scanout are explicitly
+  labelled unavailable where the backend cannot expose them. The initial target
+  is p95 at or below two refresh intervals for that available host stage and no
+  unbounded stale-input backlog; platform and driver limitations must be
+  reported rather than hidden.
 - This is a performance quality bar and regression gate, not a universal fixed
   FPS or latency guarantee to every CLP application.
 
@@ -1253,12 +1308,45 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 - A parent translation plus its scrollbar/control position commits as one
   ordered visual update through the frame-presentation path, without rebuilding
   unaffected terminal or scene content.
-- The documented benchmark meets the performance quality bar on its reference
-  Linux and Windows systems and reports results separately by backend and
-  display refresh rate.
-- Automated stress coverage and manual profiling pass on Windows and on Linux
-  X11/XWayland and native Wayland where the backend supports the required
-  measurements.
+- The documented benchmark meets the performance quality bar on designated
+  reference hardware and reports results separately by backend and display
+  refresh rate. Constrained virtual machines are functional-validation
+  platforms, not performance gates.
+- Automated stress coverage and manual functional validation pass on Windows
+  and on Linux X11/Xwayland and native Wayland where the backend supports the
+  required measurements.
+
+### Completion record
+
+- CLP v2.1 adds the negotiated `presentation` capability and its bounded,
+  geometry-only `present_scene` mailbox. The reliable `set_node` control plane
+  remains ordered and acknowledged; visual packets are atomic and newest-state
+  wins before a renderer frame.
+- `presentation_status` and `CHYMERAL_PRESENTATION_TRACE=1` deliberately
+  report host-observable stages only. Status delivery is advisory and
+  coalesced; neither the probe nor the trace claims physical scanout timing.
+- Core formatting, tests, warnings-denied Clippy, release build, and the v2.1
+  fixture corpus passed on Linux. Windows passed the regression test,
+  warnings-denied Clippy, and a release build after the same source update.
+  The Rust and Node SDKs passed their independent fixture and conformance
+  coverage on both platforms.
+- Manual Linux acceptance completed on native Wayland and forced X11/Xwayland.
+  The native Wayland probe reported 2,314 submitted packets, 1,799 presented,
+  513 superseded, zero rejected, and observed status p50/p95 of 30.23/40.44
+  ms. The forced X11/Xwayland probe reported 1,654 submitted, 1,199
+  presented, 455 superseded, zero rejected, and p50/p95 of 30.21/40.32 ms.
+- The opt-in native-Wayland host trace measured transport-to-`present` p50/p95
+  of 18.626/25.486 ms, with a 457.954 ms maximum during the explicitly traced
+  interactive run. It excludes client delivery and physical scanout, so it is
+  evidence for the host stage rather than an input-to-photon claim.
+- The constrained Windows VM is accepted as a functional platform, not a
+  performance reference: its probe completed cleanly with zero rejected
+  packets and preserved the terminal after CLP closure. Its observed status
+  timing is recorded separately because it is not physical scanout timing.
+- Manual stress testing exposed a terminal scrollback resize defect: rows
+  retained at a narrower historic width could be indexed using a newer wider
+  grid width. Rendering, selection, and copy now bound each retained row by
+  its own cell length; a regression test covers the case.
 
 ## M24 — CLP Application Window Metadata
 

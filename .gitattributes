@@ -1,3 +1,5 @@
 # Preserve the byte-checked CLP fixture snapshot across Linux and Windows checkouts.
 protocol/fixtures/v2.0/fixtures.json text eol=lf
 protocol/fixtures/v2.0/SHA256SUMS text eol=lf
+protocol/fixtures/v2.1/fixtures.json text eol=lf
+protocol/fixtures/v2.1/SHA256SUMS text eol=lf

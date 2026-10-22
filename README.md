@@ -60,6 +60,17 @@ not become a host-loaded plugin.
   [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) for
   Node.js and TypeScript applications.
 
+## Development preview
+
+The released `1.0.0` line implements CLP `v2.0`. The current source tree also
+contains the in-progress M23 implementation for **CLP `v2.1`**: an opt-in
+`presentation` capability that coalesces bounded transient geometry packets at
+the renderer frame boundary. It leaves the acknowledged `set_node` control
+plane intact, accepts CLP v2.0 clients without the new capability, and is not
+yet part of a published portable edition. See the marked v2.1 section in the
+[Main Manual](Main_Manual.md#61-frame-paced-presentation-unreleased-clp-v21)
+and the [v2.1 fixture corpus](protocol/fixtures/v2.1/README.md).
+
 ## Downloads
 
 The quickest way to use Chymeral is a portable edition from the
@@ -114,6 +125,8 @@ may be relative to the configuration file.
   [npm](https://www.npmjs.com/package/@chymeral/node-sdk).
 - [CLP v2.0 fixture corpus](protocol/fixtures/v2.0/README.md) — portable,
   language-neutral framed-message vectors for SDK conformance work.
+- [CLP v2.1 presentation fixture corpus](protocol/fixtures/v2.1/README.md) —
+  development vectors for the M23 frame-presentation capability.
 - [Contributing guide](CONTRIBUTING.md) — setup, checks, and protocol-change
   expectations for collaborators.
 - [Changelog](CHANGELOG.md) — released behavior and compatibility notes.

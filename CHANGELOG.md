@@ -6,7 +6,29 @@ the CLP protocol and language SDKs have independent version numbers.
 
 ## [Unreleased]
 
-No unreleased user-visible changes.
+### Added
+
+- A CLP v2.1 `presentation` capability for bounded, atomic
+  frame-paced geometry packets. It keeps the newest unpresented packet per
+  session while preserving the ordered `set_node` control plane.
+- Advisory `presentation_status` notifications (`presented`, `superseded`, or
+  `rejected`) and `CHYMERAL_PRESENTATION_TRACE=1` host-stage diagnostics.
+- A versioned CLP v2.1 presentation fixture corpus with exact byte checks for
+  SDK conformance work.
+
+### Changed
+
+- Image-scene rendering now retains vertex chunks and updates only chunks whose
+  visible geometry changed, while retaining uploaded image resources.
+- Terminal scrollback rows now retain their historical width safely after a
+  window resize, including their rendering, selection, and copy paths.
+
+### Compatibility
+
+- These source-tree changes target Chymeral `1.1.0` and CLP v2.1. The released
+  `1.0.x` portable editions remain CLP v2.0 releases.
+- A CLP v2.1 host continues to accept CLP v2.0 clients without granting the
+  new `presentation` capability.
 
 ## [1.0.0] - 2026-10-17
 

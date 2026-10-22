@@ -31,9 +31,10 @@ use crate::runtime::{
 use crate::{
     animated_image::MAX_ANIMATED_IMAGE_ENCODED_BYTES,
     program_scene::{
-        ClpSceneCommand, ClpSceneCommandResult, ImageHandle, ImageUpload, MAX_TEXTURE_BYTES,
-        NodeChanges, NodeHandle, NodeInput, NodeParent, NodePropertiesInput, NodePropertiesPatch,
-        NodeVisualInput, TextNodePropertiesInput,
+        ClpSceneCommand, ClpSceneCommandResult, ImageHandle, ImageUpload, MAX_PRESENTATION_UPDATES,
+        MAX_TEXTURE_BYTES, NodeChanges, NodeHandle, NodeInput, NodeParent, NodePropertiesInput,
+        NodePropertiesPatch, NodeVisualInput, PresentationPacket, PresentationPropertiesPatch,
+        PresentationUpdate, TextNodePropertiesInput,
     },
     resources::rgba8_byte_len,
     scene::{ImageContactShape, NodeId, SceneLayer},
@@ -46,6 +47,8 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_PENDING_HANDSHAKES: usize = 16;
 pub const MAX_PENDING_HOST_ACTIONS: usize = 64;
 pub const MAX_PENDING_HOST_NOTIFICATIONS: usize = 64;
+pub const MAX_PRESENTATION_PACKET_BYTES: usize = 64 * 1024;
+pub const MAX_PRESENTATION_ID_BYTES: usize = 128;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_GRACE_PERIOD: Duration = Duration::from_millis(250);
@@ -88,6 +91,76 @@ pub struct ClpServer {
     cleanup_actions: Mutex<Receiver<SessionId>>,
     lifecycle_actions: Mutex<Receiver<SessionId>>,
     notifications: Arc<SessionNotifications>,
+    presentations: Arc<PresentationMailbox>,
+}
+
+/// A frame-presentation packet accepted by the local transport and awaiting a
+/// renderer frame. It is intentionally separate from [`HostAction`]: no
+/// command response waits for it, and a session retains only its newest packet.
+#[derive(Clone, Debug)]
+pub struct PresentationSubmission {
+    session_id: SessionId,
+    packet: PresentationPacket,
+    received_at: Instant,
+}
+
+impl PresentationSubmission {
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn packet(&self) -> &PresentationPacket {
+        &self.packet
+    }
+
+    pub const fn received_at(&self) -> Instant {
+        self.received_at
+    }
+}
+
+#[derive(Default)]
+struct PresentationMailbox {
+    packets: Mutex<BTreeMap<SessionId, PresentationSubmission>>,
+}
+
+impl PresentationMailbox {
+    fn submit(
+        &self,
+        session_id: SessionId,
+        packet: PresentationPacket,
+    ) -> Option<PresentationSubmission> {
+        self.lock_packets().insert(
+            session_id,
+            PresentationSubmission {
+                session_id,
+                packet,
+                received_at: Instant::now(),
+            },
+        )
+    }
+
+    fn take_all(&self) -> Vec<PresentationSubmission> {
+        std::mem::take(&mut *self.lock_packets())
+            .into_values()
+            .collect()
+    }
+
+    fn take(&self, session_id: SessionId) -> Option<PresentationSubmission> {
+        self.lock_packets().remove(&session_id)
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.lock_packets().is_empty()
+    }
+
+    fn lock_packets(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<SessionId, PresentationSubmission>> {
+        match self.packets.lock() {
+            Ok(packets) => packets,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 }
 
 pub enum HostAction {
@@ -136,6 +209,7 @@ struct HostActionBroker {
     sender: SyncSender<HostAction>,
     cleanup_sender: mpsc::Sender<SessionId>,
     lifecycle_sender: mpsc::Sender<SessionId>,
+    presentations: Arc<PresentationMailbox>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -155,9 +229,20 @@ enum HostNotification {
         logical_height: f64,
         scale_factor: f64,
     },
+    PresentationStatus {
+        presentation_id: String,
+        status: PresentationStatus,
+    },
     DeliveryGap {
         categories: BTreeSet<DeliveryCategory>,
     },
+}
+
+#[derive(Clone)]
+enum PresentationStatus {
+    Presented,
+    Rejected { code: String, message: String },
+    Superseded,
 }
 
 impl HostNotification {
@@ -165,7 +250,9 @@ impl HostNotification {
         match self {
             Self::Event(event) => event.delivery_category(),
             Self::Tick { .. } | Self::Frame { .. } => Some(DeliveryCategory::Timing),
-            Self::Resize { .. } | Self::DeliveryGap { .. } => None,
+            Self::Resize { .. } | Self::PresentationStatus { .. } | Self::DeliveryGap { .. } => {
+                None
+            }
         }
     }
 
@@ -188,6 +275,9 @@ impl HostNotification {
             Self::Event(WireEvent::Terminal {
                 state: WireTerminalState::OutputAvailable,
             }) => Some(NotificationCoalescingClass::TerminalOutputAvailable),
+            Self::PresentationStatus { .. } => {
+                Some(NotificationCoalescingClass::PresentationStatus)
+            }
             Self::Event(_) | Self::Resize { .. } | Self::DeliveryGap { .. } => None,
         }
     }
@@ -202,6 +292,7 @@ enum NotificationCoalescingClass {
     SceneDragMove,
     SceneExternalDropOver,
     TerminalOutputAvailable,
+    PresentationStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -520,6 +611,22 @@ impl SessionNotifications {
     }
 }
 
+fn enqueue_presentation_status(
+    notifications: &SessionNotifications,
+    session_id: SessionId,
+    presentation_id: String,
+    status: PresentationStatus,
+) {
+    notifications.send_matching(
+        session_id,
+        HostNotification::PresentationStatus {
+            presentation_id,
+            status,
+        },
+        |session| session.capabilities.contains(Capability::Presentation),
+    );
+}
+
 impl ClpServer {
     pub fn start(available_capabilities: CapabilitySet) -> Result<Self> {
         Self::start_with_wake(available_capabilities, || {})
@@ -536,10 +643,12 @@ impl ClpServer {
         let (cleanup_sender, cleanup_actions) = mpsc::channel();
         let (lifecycle_sender, lifecycle_actions) = mpsc::channel();
         let notifications = Arc::new(SessionNotifications::default());
+        let presentations = Arc::new(PresentationMailbox::default());
         let broker = HostActionBroker {
             sender: host_action_sender,
             cleanup_sender,
             lifecycle_sender,
+            presentations: Arc::clone(&presentations),
             wake: Arc::new(wake),
         };
         let listener_control = Arc::clone(&control);
@@ -570,6 +679,7 @@ impl ClpServer {
             cleanup_actions: Mutex::new(cleanup_actions),
             lifecycle_actions: Mutex::new(lifecycle_actions),
             notifications,
+            presentations,
         })
     }
 
@@ -586,6 +696,66 @@ impl ClpServer {
 
     pub fn notification_metrics(&self) -> ClpNotificationMetrics {
         self.notifications.metrics()
+    }
+
+    /// Returns the newest accepted presentation packet for every session.
+    ///
+    /// The window loop consumes this only immediately before rendering. This
+    /// keeps presentation traffic out of the ordered command queue while
+    /// retaining deterministic per-session ownership checks at commit time.
+    pub fn drain_presentation_packets(&self) -> Vec<PresentationSubmission> {
+        self.presentations.take_all()
+    }
+
+    pub fn has_pending_presentation_packets(&self) -> bool {
+        self.presentations.has_pending()
+    }
+
+    /// Discards a packet that has not reached the renderer because a later
+    /// reliable mutation for the same session superseded it.
+    pub fn discard_pending_presentation(
+        &self,
+        session_id: SessionId,
+    ) -> Option<PresentationSubmission> {
+        self.presentations.take(session_id)
+    }
+
+    pub fn report_presentation_presented(&self, session_id: SessionId, presentation_id: String) {
+        self.report_presentation_status(session_id, presentation_id, PresentationStatus::Presented);
+    }
+
+    pub fn report_presentation_rejected(
+        &self,
+        session_id: SessionId,
+        presentation_id: String,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.report_presentation_status(
+            session_id,
+            presentation_id,
+            PresentationStatus::Rejected {
+                code: code.into(),
+                message: message.into(),
+            },
+        );
+    }
+
+    pub fn report_presentation_superseded(&self, session_id: SessionId, presentation_id: String) {
+        self.report_presentation_status(
+            session_id,
+            presentation_id,
+            PresentationStatus::Superseded,
+        );
+    }
+
+    fn report_presentation_status(
+        &self,
+        session_id: SessionId,
+        presentation_id: String,
+        status: PresentationStatus,
+    ) {
+        enqueue_presentation_status(&self.notifications, session_id, presentation_id, status);
     }
 
     pub fn shutdown(&mut self) {
@@ -751,7 +921,18 @@ impl HostActionBroker {
         }
     }
 
+    fn submit_presentation(
+        &self,
+        session_id: SessionId,
+        packet: PresentationPacket,
+    ) -> Option<PresentationSubmission> {
+        let replaced = self.presentations.submit(session_id, packet);
+        (self.wake)();
+        replaced
+    }
+
     fn cleanup(&self, session_id: SessionId) {
+        self.presentations.take(session_id);
         if self.cleanup_sender.send(session_id).is_ok() {
             (self.wake)();
         }
@@ -1106,6 +1287,17 @@ fn handle_connection(
             return;
         }
         if let WireFrame::Json(payload) = &frame
+            && let Ok(WireClientMessage::PresentScene { .. }) = serde_json::from_slice(payload)
+        {
+            close_protocol_violation(
+                &mut stream,
+                &manager,
+                session_id,
+                "presentation packets require a running session",
+            );
+            return;
+        }
+        if let WireFrame::Json(payload) = &frame
             && let Ok(WireClientMessage::Subscribe { .. }) = serde_json::from_slice(payload)
         {
             close_protocol_violation(
@@ -1423,6 +1615,72 @@ fn run_running_session(
         }
 
         if let WireFrame::Json(payload) = &frame
+            && let Ok(WireClientMessage::PresentScene {
+                presentation_id,
+                updates,
+            }) = serde_json::from_slice(payload)
+        {
+            if presentation_id.is_empty() || presentation_id.len() > MAX_PRESENTATION_ID_BYTES {
+                let _ = writer.queue(&WireHostMessage::Error {
+                    code: "invalid_presentation".to_owned(),
+                    message: format!(
+                        "a presentation_id must contain between 1 and {MAX_PRESENTATION_ID_BYTES} bytes"
+                    ),
+                });
+                continue;
+            }
+            if !wire_presentation_is_granted(granted_capabilities) {
+                enqueue_presentation_status(
+                    notifications,
+                    session_id,
+                    presentation_id,
+                    PresentationStatus::Rejected {
+                        code: "capability_denied".to_owned(),
+                        message: "presentation requires the scene and presentation capabilities"
+                            .to_owned(),
+                    },
+                );
+                continue;
+            }
+            if payload.len() > MAX_PRESENTATION_PACKET_BYTES {
+                enqueue_presentation_status(
+                    notifications,
+                    session_id,
+                    presentation_id,
+                    PresentationStatus::Rejected {
+                        code: "presentation_too_large".to_owned(),
+                        message: format!(
+                            "a presentation packet may not exceed {MAX_PRESENTATION_PACKET_BYTES} bytes"
+                        ),
+                    },
+                );
+                continue;
+            }
+            match presentation_packet_from_wire(presentation_id.clone(), updates) {
+                Ok(packet) => {
+                    if let Some(replaced) = broker.submit_presentation(session_id, packet) {
+                        enqueue_presentation_status(
+                            notifications,
+                            session_id,
+                            replaced.packet.presentation_id,
+                            PresentationStatus::Superseded,
+                        );
+                    }
+                }
+                Err(error) => enqueue_presentation_status(
+                    notifications,
+                    session_id,
+                    presentation_id,
+                    PresentationStatus::Rejected {
+                        code: "invalid_presentation".to_owned(),
+                        message: error.to_string(),
+                    },
+                ),
+            }
+            continue;
+        }
+
+        if let WireFrame::Json(payload) = &frame
             && let Ok(WireClientMessage::Subscribe { subscriptions }) =
                 serde_json::from_slice(payload)
         {
@@ -1637,6 +1895,9 @@ fn client_message_from_frame(frame: WireFrame) -> Result<ClientMessage> {
         }
         WireClientMessage::Close => Ok(ClientMessage::Close),
         WireClientMessage::Command { .. } => Err(anyhow!("a scene command was not handled")),
+        WireClientMessage::PresentScene { .. } => {
+            Err(anyhow!("a presentation packet was not handled"))
+        }
         WireClientMessage::Subscribe { .. } => {
             Err(anyhow!("a subscription update was not handled"))
         }
@@ -1820,6 +2081,10 @@ fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilityS
                     || capabilities.contains(Capability::ExternalDrop))
         }
     }
+}
+
+fn wire_presentation_is_granted(capabilities: CapabilitySet) -> bool {
+    capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Presentation)
 }
 
 fn write_error(stream: &mut LocalSocketStream, code: &str, message: &str) -> Result<()> {
@@ -2159,6 +2424,10 @@ enum WireClientMessage {
         request_id: String,
         command: Box<WireSceneCommand>,
     },
+    PresentScene {
+        presentation_id: String,
+        updates: Vec<WirePresentationUpdate>,
+    },
     Subscribe {
         subscriptions: Vec<WireSubscription>,
     },
@@ -2369,6 +2638,77 @@ impl WireNodePropertiesPatch {
             input_passthrough: self.input_passthrough,
         }
     }
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct WirePresentationPropertiesPatch {
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    width: Option<f64>,
+    #[serde(default)]
+    height: Option<f64>,
+}
+
+impl WirePresentationPropertiesPatch {
+    const fn into_patch(self) -> PresentationPropertiesPatch {
+        PresentationPropertiesPatch {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct WirePresentationUpdate {
+    node: String,
+    properties: WirePresentationPropertiesPatch,
+}
+
+impl WirePresentationUpdate {
+    fn into_update(self) -> Result<PresentationUpdate> {
+        Ok(PresentationUpdate {
+            node: parse_node_handle(&self.node)?,
+            properties: self.properties.into_patch(),
+        })
+    }
+}
+
+fn presentation_packet_from_wire(
+    presentation_id: String,
+    updates: Vec<WirePresentationUpdate>,
+) -> Result<PresentationPacket> {
+    if presentation_id.is_empty() {
+        return Err(anyhow!(
+            "a presentation packet requires a non-empty presentation_id"
+        ));
+    }
+    if presentation_id.len() > MAX_PRESENTATION_ID_BYTES {
+        return Err(anyhow!(
+            "a presentation_id may not exceed {MAX_PRESENTATION_ID_BYTES} bytes"
+        ));
+    }
+    if updates.is_empty() {
+        return Err(anyhow!(
+            "a presentation packet requires at least one update"
+        ));
+    }
+    if updates.len() > MAX_PRESENTATION_UPDATES {
+        return Err(anyhow!(
+            "a presentation packet may update at most {MAX_PRESENTATION_UPDATES} nodes"
+        ));
+    }
+    Ok(PresentationPacket {
+        presentation_id,
+        updates: updates
+            .into_iter()
+            .map(WirePresentationUpdate::into_update)
+            .collect::<Result<Vec<_>>>()?,
+    })
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2725,6 +3065,7 @@ enum WireCapability {
     Overlap,
     ExternalDrop,
     Text,
+    Presentation,
 }
 
 impl WireCapability {
@@ -2737,6 +3078,7 @@ impl WireCapability {
             Self::Overlap => Capability::Overlap,
             Self::ExternalDrop => Capability::ExternalDrop,
             Self::Text => Capability::Text,
+            Self::Presentation => Capability::Presentation,
         }
     }
 }
@@ -2751,6 +3093,7 @@ impl From<Capability> for WireCapability {
             Capability::Overlap => Self::Overlap,
             Capability::ExternalDrop => Self::ExternalDrop,
             Capability::Text => Self::Text,
+            Capability::Presentation => Self::Presentation,
         }
     }
 }
@@ -2860,6 +3203,15 @@ enum WireHostMessage {
         session_id: String,
         categories: Vec<WireDeliveryCategory>,
     },
+    PresentationStatus {
+        session_id: String,
+        presentation_id: String,
+        status: WirePresentationStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     Closing {
         session_id: String,
         reason: WireCloseReason,
@@ -2881,6 +3233,14 @@ enum WireHostMessage {
         code: String,
         message: String,
     },
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WirePresentationStatus {
+    Presented,
+    Rejected,
+    Superseded,
 }
 
 #[derive(Clone, Serialize)]
@@ -3645,6 +4005,29 @@ impl WireHostMessage {
                 logical_height,
                 scale_factor,
             },
+            HostNotification::PresentationStatus {
+                presentation_id,
+                status,
+            } => {
+                let (status, code, message) = match status {
+                    PresentationStatus::Presented => {
+                        (WirePresentationStatus::Presented, None, None)
+                    }
+                    PresentationStatus::Rejected { code, message } => {
+                        (WirePresentationStatus::Rejected, Some(code), Some(message))
+                    }
+                    PresentationStatus::Superseded => {
+                        (WirePresentationStatus::Superseded, None, None)
+                    }
+                };
+                Self::PresentationStatus {
+                    session_id,
+                    presentation_id,
+                    status,
+                    code,
+                    message,
+                }
+            }
             HostNotification::DeliveryGap { categories } => Self::DeliveryGap {
                 session_id,
                 categories: categories
@@ -3665,6 +4048,7 @@ fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
         Capability::Overlap,
         Capability::ExternalDrop,
         Capability::Text,
+        Capability::Presentation,
     ]
     .into_iter()
     .filter(|capability| capabilities.contains(*capability))
@@ -3821,13 +4205,7 @@ mod tests {
 
         assert_eq!(corpus.format, "chymeral-clp-fixture-corpus");
         assert_eq!(corpus.fixture_version, 1);
-        assert_eq!(
-            (corpus.protocol.major, corpus.protocol.minor),
-            (
-                crate::protocol::CLP_PROTOCOL_VERSION.major(),
-                crate::protocol::CLP_PROTOCOL_VERSION.minor()
-            )
-        );
+        assert_eq!((corpus.protocol.major, corpus.protocol.minor), (2, 0));
         assert_eq!(
             corpus.transport.length_prefix,
             "unsigned 32-bit big-endian payload length including the one-byte discriminator"
@@ -3966,6 +4344,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validates_the_canonical_clp_v2_1_presentation_fixture_corpus() {
+        let fixture_bytes = include_bytes!("../protocol/fixtures/v2.1/fixtures.json");
+        let expected_hash = include_str!("../protocol/fixtures/v2.1/SHA256SUMS")
+            .split_whitespace()
+            .next()
+            .expect("fixture SHA256SUMS must contain a checksum");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fixture_bytes)),
+            expected_hash
+        );
+
+        let corpus: FixtureCorpus =
+            serde_json::from_str(include_str!("../protocol/fixtures/v2.1/fixtures.json"))
+                .expect("the CLP v2.1 fixture corpus must be valid JSON");
+        assert_eq!(corpus.format, "chymeral-clp-fixture-corpus");
+        assert_eq!(corpus.fixture_version, 1);
+        assert_eq!((corpus.protocol.major, corpus.protocol.minor), (2, 1));
+        assert_eq!(
+            corpus.transport.length_prefix,
+            "unsigned 32-bit big-endian payload length including the one-byte discriminator"
+        );
+        assert_eq!(corpus.transport.json_discriminator, "J");
+        assert_eq!(corpus.transport.binary_discriminator, "B");
+        assert_eq!(corpus.transport.maximum_frame_bytes, MAX_FRAME_BYTES);
+
+        let mut vector_ids = BTreeSet::new();
+        let mut client_message_types = BTreeSet::new();
+        let mut host_message_types = BTreeSet::new();
+        for vector in corpus.vectors {
+            assert!(!vector.id.is_empty());
+            assert!(!vector.description.is_empty());
+            assert!(vector_ids.insert(vector.id));
+
+            let mut pending_upload_length = None;
+            for frame in vector.frames {
+                match (frame.direction, frame.kind) {
+                    (FixtureDirection::ClientToHost, FixtureFrameKind::Json) => {
+                        assert!(pending_upload_length.is_none());
+                        assert!(frame.bytes_hex.is_none());
+                        let message = frame.message.expect("JSON frames need a message");
+                        let message_type = fixture_message_type(&message);
+                        client_message_types.insert(message_type.to_owned());
+                        let message: WireClientMessage = serde_json::from_value(message)
+                            .expect("client fixture messages must match the CLP wire type");
+                        if let WireClientMessage::Command { command, .. } = message {
+                            pending_upload_length = command
+                                .upload_length()
+                                .expect("fixture image uploads must have valid dimensions");
+                        }
+                    }
+                    (FixtureDirection::ClientToHost, FixtureFrameKind::Binary) => {
+                        assert!(frame.message.is_none());
+                        let bytes = fixture_hex_bytes(
+                            &frame.bytes_hex.expect("binary frames need fixture bytes"),
+                        );
+                        assert_eq!(
+                            pending_upload_length.take(),
+                            Some(bytes.len()),
+                            "a binary fixture frame must immediately complete its image upload"
+                        );
+                    }
+                    (FixtureDirection::HostToClient, FixtureFrameKind::Json) => {
+                        assert!(pending_upload_length.is_none());
+                        assert!(frame.bytes_hex.is_none());
+                        let message = frame.message.expect("JSON frames need a message");
+                        let message_type = fixture_host_message_type(&message);
+                        host_message_types.insert(message_type.to_owned());
+                    }
+                    (FixtureDirection::HostToClient, FixtureFrameKind::Binary) => {
+                        panic!("CLP v2.1 does not send binary host frames")
+                    }
+                }
+            }
+            assert!(pending_upload_length.is_none());
+        }
+
+        assert_eq!(
+            vector_ids,
+            ["frame-presentation"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert_eq!(
+            client_message_types,
+            [
+                "close",
+                "hello",
+                "init_complete",
+                "present_scene",
+                "started"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+        assert_eq!(
+            host_message_types,
+            ["closed", "init", "presentation_status", "start"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
     fn fixture_message_type(message: &Value) -> &str {
         message
             .as_object()
@@ -3994,6 +4478,7 @@ mod tests {
             "tick" | "frame" => &["session_id", "dt_ns"],
             "event" => &["session_id", "event"],
             "delivery_gap" => &["session_id", "categories"],
+            "presentation_status" => &["session_id", "presentation_id", "status"],
             "result" => &["request_id", "result"],
             "command_error" => &["request_id", "code", "message"],
             "closed" => &["session_id", "reason"],
@@ -4046,6 +4531,7 @@ mod tests {
                     "overlap" => WireCapability::Overlap,
                     "external_drop" => WireCapability::ExternalDrop,
                     "text" => WireCapability::Text,
+                    "presentation" => WireCapability::Presentation,
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -4117,6 +4603,111 @@ mod tests {
         }
 
         assert_eq!(writer.bytes, expected);
+    }
+
+    #[test]
+    fn presentation_mailbox_retains_only_the_latest_packet_per_session() {
+        let mailbox = PresentationMailbox::default();
+        let mut sessions = SessionManager::new(CapabilitySet::ALL);
+        let first_session = sessions
+            .accept(
+                ClientHello {
+                    protocol_version: crate::protocol::CLP_PROTOCOL_VERSION,
+                    requested_capabilities: CapabilitySet::ALL,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap()
+            .0;
+        let second_session = sessions
+            .accept(
+                ClientHello {
+                    protocol_version: crate::protocol::CLP_PROTOCOL_VERSION,
+                    requested_capabilities: CapabilitySet::ALL,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap()
+            .0;
+        let packet = |presentation_id: &str| PresentationPacket {
+            presentation_id: presentation_id.to_owned(),
+            updates: vec![PresentationUpdate {
+                node: NodeHandle::new(1),
+                properties: PresentationPropertiesPatch {
+                    x: Some(1.0),
+                    ..PresentationPropertiesPatch::default()
+                },
+            }],
+        };
+
+        assert!(mailbox.submit(first_session, packet("first")).is_none());
+        let superseded = mailbox
+            .submit(first_session, packet("latest"))
+            .expect("the earlier packet is replaced");
+        assert_eq!(superseded.packet.presentation_id, "first");
+        assert!(mailbox.submit(second_session, packet("other")).is_none());
+
+        let packets = mailbox.take_all();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].session_id, first_session);
+        assert_eq!(packets[0].packet.presentation_id, "latest");
+        assert_eq!(packets[1].session_id, second_session);
+        assert_eq!(packets[1].packet.presentation_id, "other");
+    }
+
+    #[test]
+    fn accepts_frame_presentation_without_a_command_round_trip() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene", "presentation"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+        let session_id = wait_for_session_started(&server);
+        server.activate_session(session_id, 900, 600, 1.0);
+
+        send_client(
+            &mut client,
+            WireClientMessage::PresentScene {
+                presentation_id: "packet-1".to_owned(),
+                updates: vec![WirePresentationUpdate {
+                    node: "node-1".to_owned(),
+                    properties: WirePresentationPropertiesPatch {
+                        x: Some(48.0),
+                        y: Some(24.0),
+                        ..WirePresentationPropertiesPatch::default()
+                    },
+                }],
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let submission = loop {
+            let submissions = server.drain_presentation_packets();
+            if let Some(submission) = submissions.into_iter().next() {
+                break submission;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the presentation packet did not arrive"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(submission.session_id(), session_id);
+        assert_eq!(submission.packet().presentation_id, "packet-1");
+        assert_eq!(submission.packet().updates.len(), 1);
+        assert!(server.drain_host_actions().is_empty());
+
+        server.report_presentation_presented(session_id, "packet-1".to_owned());
+        let status = receive_host(&mut client);
+        assert_eq!(status["type"], "presentation_status");
+        assert_eq!(status["session_id"], session_id.to_string());
+        assert_eq!(status["presentation_id"], "packet-1");
+        assert_eq!(status["status"], "presented");
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
     }
 
     #[cfg(target_os = "windows")]
@@ -4345,6 +4936,51 @@ mod tests {
             ClpNotificationMetrics {
                 coalesced_notifications: 1,
                 delivery_gaps_emitted: 1,
+                ..ClpNotificationMetrics::default()
+            }
+        );
+    }
+
+    #[test]
+    fn coalesces_presentation_statuses_without_a_delivery_gap() {
+        let notifications = SessionNotifications::default();
+        let session_id = session_id();
+        let queue = notifications.register(
+            session_id,
+            CapabilitySet::from_capabilities(&[Capability::Presentation]),
+        );
+        assert!(notifications.activate(session_id, resize_notification(1, 1, 1.0)));
+
+        enqueue_presentation_status(
+            &notifications,
+            session_id,
+            "first".to_owned(),
+            PresentationStatus::Presented,
+        );
+        enqueue_presentation_status(
+            &notifications,
+            session_id,
+            "latest".to_owned(),
+            PresentationStatus::Rejected {
+                code: "invalid_node_change".to_owned(),
+                message: "a text node has intrinsic bounds".to_owned(),
+            },
+        );
+
+        assert!(matches!(
+            next_notification(&queue),
+            HostNotification::PresentationStatus {
+                presentation_id,
+                status: PresentationStatus::Rejected { code, message },
+            } if presentation_id == "latest"
+                && code == "invalid_node_change"
+                && message == "a text node has intrinsic bounds"
+        ));
+        assert!(matches!(queue.try_pop(), NotificationPoll::Empty));
+        assert_eq!(
+            notifications.metrics(),
+            ClpNotificationMetrics {
+                coalesced_notifications: 1,
                 ..ClpNotificationMetrics::default()
             }
         );

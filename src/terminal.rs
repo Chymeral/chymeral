@@ -580,6 +580,12 @@ impl Grid {
         }
     }
 
+    fn columns_for_cells(&self, cells: &[Cell]) -> u16 {
+        u16::try_from(cells.len())
+            .unwrap_or(u16::MAX)
+            .min(self.columns)
+    }
+
     fn soft_wrapped_for_global(&self, row: usize) -> Option<bool> {
         if row < self.scrollback.len() {
             self.scrollback.get(row).map(|row| row.soft_wrapped)
@@ -593,8 +599,9 @@ impl Grid {
         let Some(cells) = self.row_for_global(row) else {
             return column;
         };
-        let mut column = column.min(self.columns);
-        while column > 0 && column < self.columns && cells[usize::from(column)].continuation {
+        let columns = self.columns_for_cells(cells);
+        let mut column = column.min(columns);
+        while column > 0 && column < columns && cells[usize::from(column)].continuation {
             column -= 1;
         }
         column
@@ -604,9 +611,10 @@ impl Grid {
         let Some(cells) = self.row_for_global(row) else {
             return column;
         };
-        let column = column.min(self.columns);
-        if column < self.columns && cells[usize::from(column)].continuation {
-            (column + 1).min(self.columns)
+        let columns = self.columns_for_cells(cells);
+        let column = column.min(columns);
+        if column < columns && cells[usize::from(column)].continuation {
+            (column + 1).min(columns)
         } else {
             column
         }
@@ -652,7 +660,10 @@ impl Grid {
                 }
             }
             if row + 1 < self.rows {
-                let style = cells[usize::from(self.columns - 1)].style;
+                let style = cells
+                    .get(usize::from(columns.saturating_sub(1)))
+                    .map(|cell| cell.style)
+                    .unwrap_or(self.default_style);
                 Self::append_span(&mut spans, "\n", style);
             }
         }
@@ -667,11 +678,12 @@ impl Grid {
         include_cursor: bool,
         trim_trailing_blanks: bool,
     ) -> u16 {
+        let columns = self.columns_for_cells(cells);
         if !trim_trailing_blanks {
-            return self.columns;
+            return columns;
         }
 
-        (0..self.columns)
+        (0..columns)
             .rev()
             .find(|&column| {
                 let cell = &cells[usize::from(column)];
@@ -1206,15 +1218,17 @@ impl Terminal {
 
         (first..=last)
             .filter_map(|global_row| {
+                let cells = grid.row_for_global(global_row)?;
+                let columns = grid.columns_for_cells(cells);
                 let start_column = if global_row == start.row {
-                    start.column
+                    start.column.min(columns)
                 } else {
                     0
                 };
                 let end_column = if global_row == end.row {
-                    end.column
+                    end.column.min(columns)
                 } else {
-                    grid.columns
+                    columns
                 };
                 (start_column < end_column).then_some(SelectionRange {
                     row: u16::try_from(global_row - display_start).ok()?,
@@ -1231,11 +1245,16 @@ impl Terminal {
         let mut text = String::new();
         for row in start.row..=end.row {
             let cells = grid.row_for_global(row)?;
-            let start_column = if row == start.row { start.column } else { 0 };
-            let end_column = if row == end.row {
-                end.column
+            let columns = grid.columns_for_cells(cells);
+            let start_column = if row == start.row {
+                start.column.min(columns)
             } else {
-                grid.columns
+                0
+            };
+            let end_column = if row == end.row {
+                end.column.min(columns)
+            } else {
+                columns
             };
             let mut line = String::new();
             for cell in &cells[usize::from(start_column)..usize::from(end_column)] {
@@ -1533,6 +1552,48 @@ mod tests {
         assert!(terminal.extend_selection(1, 3));
 
         assert_eq!(terminal.selected_text(), Some("abcdef".to_owned()));
+    }
+
+    #[test]
+    fn renders_and_selects_narrow_scrollback_after_widening() {
+        let mut terminal = terminal(13, 1);
+        terminal.advance(b"first\r\nsecond\r\ncurrent");
+        terminal.resize(154, 3);
+        assert!(terminal.scroll_view_by(2));
+
+        let rendered: String = terminal
+            .render_spans()
+            .into_iter()
+            .map(|span| span.text)
+            .collect();
+        assert_eq!(rendered, "first\nsecond\ncurrent");
+
+        assert!(terminal.begin_selection(0, 0));
+        assert!(terminal.extend_selection(2, 7));
+        assert_eq!(
+            terminal.selection_ranges(),
+            vec![
+                super::SelectionRange {
+                    row: 0,
+                    start_column: 0,
+                    end_column: 13,
+                },
+                super::SelectionRange {
+                    row: 1,
+                    start_column: 0,
+                    end_column: 13,
+                },
+                super::SelectionRange {
+                    row: 2,
+                    start_column: 0,
+                    end_column: 7,
+                },
+            ]
+        );
+        assert_eq!(
+            terminal.selected_text(),
+            Some("first\nsecond\ncurrent".to_owned())
+        );
     }
 
     #[test]

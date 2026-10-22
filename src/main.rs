@@ -26,13 +26,13 @@ use chymeral::runtime::{
 use chymeral::{
     external_drop::{ExternalFile, TerminalQuoting, format_terminal_paths},
     program_scene::{ProgramSceneError, ProgramSceneResources},
-    protocol::{Capability, CapabilitySet},
+    protocol::{Capability, CapabilitySet, SessionId},
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
     scene::{
         ImageNode, NodeContent, NodeId, NodeProperties, Point, Rect, Scene, SceneLayer, Transform,
     },
     scene_text::{TextAlign, TextLayout, TextStyle, TextWeight, expand_tabs},
-    transport::{ClpServer, HostAction, HostCommandResponse},
+    transport::{ClpServer, HostAction, HostCommandResponse, PresentationSubmission},
 };
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -134,6 +134,95 @@ struct PendingExternalDrop {
     position: Vec2,
 }
 
+struct PendingPresentationConfirmation {
+    submission: PresentationSubmission,
+    committed_at: Instant,
+}
+
+struct PresentationTrace {
+    enabled: bool,
+    latest_input: Option<(&'static str, Instant)>,
+}
+
+impl PresentationTrace {
+    fn from_environment() -> Self {
+        Self {
+            enabled: std::env::var_os("CHYMERAL_PRESENTATION_TRACE").is_some(),
+            latest_input: None,
+        }
+    }
+
+    fn record_input(&mut self, kind: &'static str, now: Instant) {
+        if self.enabled {
+            self.latest_input = Some((kind, now));
+        }
+    }
+
+    fn record_commit(&self, submission: &PresentationSubmission, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        let received_to_commit = now.saturating_duration_since(submission.received_at());
+        let latest_input = self.latest_input.map(|(kind, input_at)| {
+            format!(
+                ", latest_host_{kind}_to_transport_ms={:.3}",
+                submission
+                    .received_at()
+                    .saturating_duration_since(input_at)
+                    .as_secs_f64()
+                    * 1_000.0
+            )
+        });
+        eprintln!(
+            "Chymeral: presentation trace id={} transport_to_commit_ms={:.3}{} client_delivery_ms=unavailable",
+            submission.packet().presentation_id,
+            received_to_commit.as_secs_f64() * 1_000.0,
+            latest_input.unwrap_or_default(),
+        );
+    }
+
+    fn record_rejected(&self, submission: &PresentationSubmission, now: Instant, code: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "Chymeral: presentation trace id={} transport_to_rejection_ms={:.3} code={code}",
+            submission.packet().presentation_id,
+            now.saturating_duration_since(submission.received_at())
+                .as_secs_f64()
+                * 1_000.0,
+        );
+    }
+
+    fn record_presented(&self, confirmation: &PendingPresentationConfirmation, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        let transport_to_present =
+            now.saturating_duration_since(confirmation.submission.received_at());
+        let commit_to_present = now.saturating_duration_since(confirmation.committed_at);
+        eprintln!(
+            "Chymeral: presentation trace id={} commit_to_present_call_ms={:.3} transport_to_present_call_ms={:.3} scanout_timing=unavailable",
+            confirmation.submission.packet().presentation_id,
+            commit_to_present.as_secs_f64() * 1_000.0,
+            transport_to_present.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    fn record_submitted(&self, confirmation: &PendingPresentationConfirmation, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "Chymeral: presentation trace id={} commit_to_submit_ms={:.3}",
+            confirmation.submission.packet().presentation_id,
+            now.saturating_duration_since(confirmation.committed_at)
+                .as_secs_f64()
+                * 1_000.0,
+        );
+    }
+}
+
 struct WindowStateOptions {
     appearance: Appearance,
     startup_splash: Option<StartupSplash>,
@@ -173,6 +262,8 @@ struct WindowState {
     program_scene_resources: ProgramSceneResources,
     image_renderer: ImageRenderer,
     active_splash: Option<ActiveSplash>,
+    pending_presentation_confirmations: Vec<PendingPresentationConfirmation>,
+    presentation_trace: PresentationTrace,
     pending_resize: Option<PhysicalSize<u32>>,
     next_resize_update: Option<Instant>,
     font_system: FontSystem,
@@ -364,6 +455,8 @@ impl WindowState {
                 .with_text_layout(text_layout),
             image_renderer,
             active_splash,
+            pending_presentation_confirmations: Vec::new(),
+            presentation_trace: PresentationTrace::from_environment(),
             pending_resize: None,
             next_resize_update: None,
             font_system,
@@ -616,6 +709,9 @@ impl WindowState {
     fn apply_clp_actions(&mut self) {
         let actions = self.clp_server.drain_host_actions();
         if actions.is_empty() {
+            if self.clp_server.has_pending_presentation_packets() {
+                self.window.request_redraw();
+            }
             return;
         }
         let mut scene_changed = false;
@@ -623,6 +719,7 @@ impl WindowState {
             match action {
                 HostAction::Command(request) => {
                     let (session_id, _, command, response_sender) = (*request).into_parts();
+                    let mutates_scene = command.is_mutating();
                     let response = match self.program_scene_resources.execute_clp(
                         session_id,
                         command,
@@ -630,6 +727,17 @@ impl WindowState {
                         &mut self.textures,
                     ) {
                         Ok(result) => {
+                            if mutates_scene {
+                                if let Some(superseded) =
+                                    self.clp_server.discard_pending_presentation(session_id)
+                                {
+                                    self.clp_server.report_presentation_superseded(
+                                        session_id,
+                                        superseded.packet().presentation_id.clone(),
+                                    );
+                                }
+                                self.supersede_unpresented_presentations(session_id);
+                            }
                             for event in self.program_scene_resources.drain_overlap_events() {
                                 self.enqueue_event(EngineEvent::Scene(event));
                             }
@@ -649,6 +757,8 @@ impl WindowState {
                         &mut self.scene,
                         &mut self.textures,
                     );
+                    self.pending_presentation_confirmations
+                        .retain(|confirmation| confirmation.submission.session_id() != session_id);
                     scene_changed = true;
                 }
                 HostAction::SessionStarted { session_id } => {
@@ -669,7 +779,85 @@ impl WindowState {
                 self.pointer_position
             };
             self.update_external_drop_target(position);
+        }
+        if scene_changed || self.clp_server.has_pending_presentation_packets() {
             self.window.request_redraw();
+        }
+    }
+
+    /// Commits the latest accepted visual packet for each session immediately
+    /// before preparing a render. The status remains pending until the surface
+    /// texture is actually presented below.
+    fn apply_pending_presentations(&mut self, now: Instant) {
+        let submissions = self.clp_server.drain_presentation_packets();
+        if submissions.is_empty() {
+            return;
+        }
+
+        let mut scene_changed = false;
+        for submission in submissions {
+            let session_id = submission.session_id();
+            let presentation_id = submission.packet().presentation_id.clone();
+            match self.program_scene_resources.present_clp(
+                session_id,
+                submission.packet(),
+                &mut self.scene,
+            ) {
+                Ok(()) => {
+                    self.supersede_unpresented_presentations(session_id);
+                    for event in self.program_scene_resources.drain_overlap_events() {
+                        self.enqueue_event(EngineEvent::Scene(event));
+                    }
+                    self.presentation_trace.record_commit(&submission, now);
+                    self.pending_presentation_confirmations
+                        .push(PendingPresentationConfirmation {
+                            submission,
+                            committed_at: now,
+                        });
+                    scene_changed = true;
+                }
+                Err(error) => {
+                    let code = program_scene_error_code(&error);
+                    self.presentation_trace
+                        .record_rejected(&submission, now, code);
+                    self.clp_server.report_presentation_rejected(
+                        session_id,
+                        presentation_id,
+                        code,
+                        error.to_string(),
+                    );
+                }
+            }
+        }
+        if scene_changed {
+            self.reconcile_scene_interaction();
+            let position = if self.external_drop_active {
+                self.external_drop_position
+            } else {
+                self.pointer_position
+            };
+            self.update_external_drop_target(position);
+        }
+    }
+
+    /// A surface can decline a frame after a presentation packet has been
+    /// committed but before `queue.present` is reached. A later visual packet
+    /// or reliable scene mutation then replaces that unobservable state rather
+    /// than allowing it to be confirmed as presented on a future frame.
+    fn supersede_unpresented_presentations(&mut self, session_id: SessionId) {
+        let mut superseded = Vec::new();
+        self.pending_presentation_confirmations
+            .retain(|confirmation| {
+                if confirmation.submission.session_id() == session_id {
+                    superseded.push(confirmation.submission.packet().presentation_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        for presentation_id in superseded {
+            self.clp_server
+                .report_presentation_superseded(session_id, presentation_id);
         }
     }
 
@@ -745,7 +933,15 @@ impl WindowState {
     }
 
     fn enqueue_event(&mut self, event: EngineEvent) {
-        self.diagnostics.record_event(&event, Instant::now());
+        let now = Instant::now();
+        self.diagnostics.record_event(&event, now);
+        match &event {
+            EngineEvent::Pointer(_) => self.presentation_trace.record_input("pointer", now),
+            EngineEvent::Scroll(_) => self.presentation_trace.record_input("scroll", now),
+            EngineEvent::Key(_) => self.presentation_trace.record_input("key", now),
+            EngineEvent::Focus(_) => self.presentation_trace.record_input("focus", now),
+            _ => {}
+        }
         match &event {
             EngineEvent::Scene(scene_event) => {
                 self.clp_server
@@ -1050,6 +1246,7 @@ impl WindowState {
             return;
         }
         if let Some(session_id) = self.focused_program_session() {
+            self.presentation_trace.record_input("key", Instant::now());
             self.diagnostics
                 .record_event(&EngineEvent::Key(event.clone()), Instant::now());
             self.clp_server.send_keyboard_event(session_id, &event);
@@ -1339,7 +1536,9 @@ impl WindowState {
         if self.pending_resize.is_some() {
             return Ok(());
         }
-        self.run_runtime_frame(Instant::now())?;
+        let redraw_started_at = Instant::now();
+        self.apply_pending_presentations(redraw_started_at);
+        self.run_runtime_frame(redraw_started_at)?;
         self.read_pty_output();
         if self.diagnostics.is_active() {
             self.sync_diagnostics_text();
@@ -1515,7 +1714,21 @@ impl WindowState {
         self.render_scene_layer(&mut encoder, &view, SceneLayer::Overlay)?;
 
         self.queue.submit(Some(encoder.finish()));
+        let submitted_at = Instant::now();
+        for confirmation in &self.pending_presentation_confirmations {
+            self.presentation_trace
+                .record_submitted(confirmation, submitted_at);
+        }
         self.queue.present(frame);
+        let presented_at = Instant::now();
+        for confirmation in std::mem::take(&mut self.pending_presentation_confirmations) {
+            self.presentation_trace
+                .record_presented(&confirmation, presented_at);
+            self.clp_server.report_presentation_presented(
+                confirmation.submission.session_id(),
+                confirmation.submission.packet().presentation_id.clone(),
+            );
+        }
         self.atlas.trim();
         Ok(())
     }
@@ -1828,7 +2041,8 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
         | ProgramSceneError::OverlapNodeLimitExceeded { .. }
         | ProgramSceneError::TextLimitExceeded { .. }
         | ProgramSceneError::SessionTextLimitExceeded { .. }
-        | ProgramSceneError::SessionTextNodeLimitExceeded { .. } => "resource_limit",
+        | ProgramSceneError::SessionTextNodeLimitExceeded { .. }
+        | ProgramSceneError::PresentationUpdateLimitExceeded { .. } => "resource_limit",
         ProgramSceneError::Geometry(_)
         | ProgramSceneError::Image(_)
         | ProgramSceneError::Texture(_)
@@ -1838,7 +2052,9 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
         | ProgramSceneError::IntrinsicTextBounds(_)
         | ProgramSceneError::TextContentRequiresTextCommands(_)
         | ProgramSceneError::NodeKindMismatch(_)
-        | ProgramSceneError::InvalidNodeChange(_) => "invalid_node_change",
+        | ProgramSceneError::InvalidNodeChange(_)
+        | ProgramSceneError::DuplicatePresentationNode(_)
+        | ProgramSceneError::InvalidPresentationUpdate(_) => "invalid_node_change",
         ProgramSceneError::Scene(_) => "invalid_node_change",
         ProgramSceneError::HandleExhausted => "host_capacity",
     }

@@ -1,7 +1,10 @@
 # Chymeral Main Manual
 
-This manual describes the public CLP v2.0 contract. It is written for terminal
-users, application authors, and SDK implementers.
+This manual describes the released CLP v2.0 contract. Sections explicitly
+marked **Unreleased CLP v2.1** document the development contract for the next
+Chymeral feature release; they are not part of the published `1.0.0` portable
+edition yet. It is written for terminal users, application authors, and SDK
+implementers.
 For the design and milestone history, see the [Technical Journal](Technical_Journal.md).
 
 ## 1. Product model
@@ -194,9 +197,10 @@ has `id`, optional `parent`, `x`, `y`, `width`, `height`, `color`, `opacity`,
 ## 5. CLP sessions
 
 **CLP** means *Chymeral Link Protocol*. It is a versioned, language-neutral
-contract between a Chymeral window and an application process. The public
-contract is **CLP v2.0**. It intentionally does not accept CLP v1.x clients or
-provide command aliases for their prior vocabulary.
+contract between a Chymeral window and an application process. The released
+contract is **CLP v2.0**. The source tree also contains the explicitly marked
+**unreleased CLP v2.1** presentation extension. Neither version accepts CLP
+v1.x clients or provides command aliases for their prior vocabulary.
 
 When Chymeral starts its shell, the shell and its descendants inherit two
 private variables:
@@ -251,6 +255,7 @@ intersection with its supported set:
 | `overlap` | Opt-in scene contact state, queries, and transitions; also requires `scene` for commands. |
 | `external_drop` | Incoming desktop-file drops targeted to opt-in scene nodes. |
 | `text` | Creating and changing intrinsic scene-text nodes; also requires `scene`. |
+| `presentation` | **Unreleased CLP v2.1:** bounded, coalesced geometry packets committed at a renderer frame; also requires `scene`. |
 
 After the lifecycle handshake, a client may replace its subscription set:
 
@@ -311,6 +316,7 @@ operations are:
 create_node       set_node           remove_node
 upload_image      remove_image
 is_overlapping    get_overlaps
+present_scene (unreleased CLP v2.1)
 ```
 
 Each session owns one implicit retained scene tree. `create_node` creates a
@@ -359,6 +365,68 @@ limits before applying a command. An individual static image is limited to
 64 MiB of RGBA8 data; the combined static-image and decoded-GIF total is
 limited to 128 MiB per session, in addition to GPU limits.
 
+### 6.1 Frame-paced presentation (unreleased CLP v2.1)
+
+`present_scene` is a separate, opt-in visual lane for continuous state such as
+dragging a viewport, scrolling a scene subtree, or moving a related control.
+It is **not** a replacement for `set_node`: structural work, resources,
+content, hierarchy, visibility, interaction flags, and styles stay on the
+ordered command path.
+
+The client must negotiate both `scene` and `presentation`, then sends a JSON
+message rather than a `command` envelope:
+
+```json
+{
+  "type": "present_scene",
+  "presentation_id": "drag-42",
+  "updates": [
+    { "node": "node-1", "properties": { "x": 128, "y": 72 } },
+    { "node": "node-9", "properties": { "x": 128 } }
+  ]
+}
+```
+
+Only `x`, `y`, `width`, and `height` are eligible. An intrinsic text node may
+change only `x` and `y`, because Chymeral continues to calculate its rectangle
+from its text and style. A packet has one through 256 distinct owned node
+handles; its identifier is non-empty UTF-8 of at most 128 bytes; and its JSON
+payload is at most 64 KiB. Every handle, ownership check, node kind, and
+geometry value is validated before any change applies, so a rejected packet
+does not partially alter the retained scene.
+
+Chymeral keeps one newest unpresented packet per session. A newer packet
+replaces stale visual state before the next renderer opportunity, and a later
+reliable scene mutation replaces still-unpresented visual state for that
+session. The selected packet applies atomically immediately before rendering.
+This intentionally favors the newest pointer or scroll position over a queue
+of historic positions.
+
+The host later sends a `presentation_status` notification:
+
+```json
+{
+  "type": "presentation_status",
+  "session_id": "session-1",
+  "presentation_id": "drag-42",
+  "status": "presented"
+}
+```
+
+The possible statuses are `presented`, `superseded`, and `rejected`; a rejected
+status also has `code` and `message`. Statuses are advisory and coalesced under
+pressure, not a reliable per-packet acknowledgement queue. `presented` means
+that Chymeral reached its host `queue.present` call, not that a compositor or
+display has reported physical scanout. Applications should submit the newest
+transient state without awaiting every status, while retaining `set_node` for
+work that must be ordered and acknowledged.
+
+Set `CHYMERAL_PRESENTATION_TRACE=1` before launching a development build to
+write host-stage diagnostics. The trace labels its contextual host
+input-to-transport, transport-to-commit, commit-to-submit, and
+transport-to-`present` timings. It explicitly labels application delivery and
+physical scanout as unavailable because neither has a portable host timestamp.
+
 Command rejection uses a stable machine-readable `code` plus a diagnostic
 message. The v2 codes are `unsupported_version`, `capability_denied`,
 `invalid_command`, `invalid_handle`, `not_owner`, `image_in_use`,
@@ -366,7 +434,7 @@ message. The v2 codes are `unsupported_version`, `capability_denied`,
 `host_unavailable`, and `protocol_violation`. Clients should branch only on the
 code; messages are for people and diagnostics.
 
-### 6.1 Intrinsic scene text
+### 6.2 Intrinsic scene text
 
 With `scene` and `text`, an application creates a `text` node through
 `create_node`. Its origin is the upper-left corner of the first cell, not the
@@ -392,7 +460,7 @@ A session retains at most 16 MiB of text, 1 Mi terminal cells, and 1,024 text
 nodes. These limits prevent a client from exhausting host memory or rendering
 resources.
 
-### 6.2 Animated scene images
+### 6.3 Animated scene images
 
 With `images`, a client uploads encoded GIF bytes through the same
 `upload_image` operation used for RGBA8 images. It declares
@@ -481,6 +549,11 @@ only that session with `host_overloaded`; the terminal and other sessions stay
 alive. Transient operating-system backpressure is retried through the running
 session writer instead of being treated as an immediate protocol failure.
 
+**Unreleased CLP v2.1:** `presentation_status` is intentionally an advisory
+continuous notification. It can coalesce to the latest host outcome and is not
+included in `DeliveryGap`; do not use it as a required per-packet completion
+queue. Use it for diagnostics and keep the newest presentational state locally.
+
 ## 9. Official SDK quick starts
 
 Chymeral currently has two stable external client SDKs:
@@ -506,6 +579,10 @@ should pin a reviewed Chymeral revision when copying those vectors into their
 own test harnesses rather than downloading them during ordinary CI. The Rust
 and Node SDKs vendor a byte-checked snapshot with `SHA256SUMS` and replay it
 through their public APIs and own fake hosts in their Linux/Windows CI matrices.
+
+The source-tree [CLP v2.1 presentation fixture corpus](protocol/fixtures/v2.1/README.md)
+extends that method for the unreleased `presentation` capability. It includes
+the accepted frame packet and a rejected intrinsic-text bounds update.
 
 ### Rust
 
@@ -584,6 +661,18 @@ repository. For Rust:
 ```text
 cargo run --locked --example clp_conformance
 ```
+
+For the unreleased M23 presentation path, build Chymeral with
+`CHYMERAL_PRESENTATION_TRACE=1`, then run the Node probe from its SDK checkout:
+
+```text
+npm run example:presentation
+```
+
+Click the blue panel once to focus the probe, move the pointer, scroll, resize
+the window, then press `b` for its 180-update 60 Hz burst and `q` to print the
+observed application-submit-to-host-status summary. Compare the probe output
+with the host trace; neither is physical input-to-photon timing.
 
 For Node.js and TypeScript:
 

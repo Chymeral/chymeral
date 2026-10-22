@@ -4,7 +4,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
+pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion {
@@ -41,10 +41,11 @@ pub enum Capability {
     Overlap,
     ExternalDrop,
     Text,
+    Presentation,
 }
 
 impl Capability {
-    const fn bit(self) -> u8 {
+    const fn bit(self) -> u16 {
         match self {
             Self::Scene => 1 << 0,
             Self::Images => 1 << 1,
@@ -53,12 +54,13 @@ impl Capability {
             Self::Overlap => 1 << 4,
             Self::ExternalDrop => 1 << 5,
             Self::Text => 1 << 6,
+            Self::Presentation => 1 << 7,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct CapabilitySet(u8);
+pub struct CapabilitySet(u16);
 
 impl CapabilitySet {
     pub const NONE: Self = Self(0);
@@ -69,7 +71,8 @@ impl CapabilitySet {
             | Capability::Timing.bit()
             | Capability::Overlap.bit()
             | Capability::ExternalDrop.bit()
-            | Capability::Text.bit(),
+            | Capability::Text.bit()
+            | Capability::Presentation.bit(),
     );
 
     pub const fn from_capabilities(capabilities: &[Capability]) -> Self {
@@ -397,9 +400,16 @@ impl SessionManager {
         }
 
         let session_id = self.allocate_session_id()?;
-        let capabilities = hello
-            .requested_capabilities
-            .intersection(self.available_capabilities);
+        let requested_capabilities = if hello.protocol_version.minor() < 1 {
+            // CLP v2.0 intentionally has no presentation lane even if a
+            // malformed or hand-written client includes its newer name.
+            hello
+                .requested_capabilities
+                .without(Capability::Presentation)
+        } else {
+            hello.requested_capabilities
+        };
+        let capabilities = requested_capabilities.intersection(self.available_capabilities);
         self.sessions.insert(
             session_id,
             Session {
@@ -680,6 +690,42 @@ mod tests {
                 ]),
                 context: ProgramInitContext::default(),
             })
+        );
+    }
+
+    #[test]
+    fn accepts_a_v2_0_client_without_granting_the_new_presentation_capability() {
+        let mut manager = SessionManager::default();
+        let requested = CapabilitySet::from_capabilities(&[
+            Capability::Scene,
+            Capability::Images,
+            Capability::Text,
+            Capability::Presentation,
+        ]);
+        let (session_id, message) = manager
+            .accept(
+                ClientHello {
+                    protocol_version: ProtocolVersion::new(2, 0),
+                    requested_capabilities: requested,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            message,
+            HostMessage::Init(ProgramInit {
+                protocol_version: ProtocolVersion::new(2, 0),
+                session_id,
+                granted_capabilities: requested.without(Capability::Presentation),
+                context: ProgramInitContext::default(),
+            })
+        );
+        assert!(
+            !manager
+                .session_capabilities(session_id)
+                .unwrap()
+                .contains(Capability::Presentation)
         );
     }
 

@@ -24,6 +24,7 @@ pub const MAX_SESSION_OVERLAP_NODES: usize = 1024;
 pub const MAX_SESSION_TEXT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SESSION_TEXT_CELLS: usize = 1024 * 1024;
 pub const MAX_SESSION_TEXT_NODES: usize = 1024;
+pub const MAX_PRESENTATION_UPDATES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeHandle(u64);
@@ -195,6 +196,63 @@ impl NodePropertiesPatch {
     }
 }
 
+/// Geometry that may be applied through CLP's frame-paced presentation lane.
+///
+/// Presentation deliberately excludes visibility, clipping, stacking,
+/// interaction flags, content, and hierarchy. Those changes retain the
+/// ordered `set_node` command semantics.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PresentationPropertiesPatch {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+}
+
+impl PresentationPropertiesPatch {
+    pub const fn is_empty(self) -> bool {
+        self.x.is_none() && self.y.is_none() && self.width.is_none() && self.height.is_none()
+    }
+
+    fn apply(self, properties: NodeProperties) -> Result<NodeProperties, ProgramSceneError> {
+        if self.is_empty() {
+            return Err(ProgramSceneError::InvalidPresentationUpdate(
+                "a presentation update must change at least one geometry property",
+            ));
+        }
+        NodePropertiesInput {
+            x: self.x.unwrap_or(properties.transform.x()),
+            y: self.y.unwrap_or(properties.transform.y()),
+            width: self.width.unwrap_or(properties.bounds.width()),
+            height: self.height.unwrap_or(properties.bounds.height()),
+            visible: properties.visible,
+            clip_children: properties.clip_children,
+            z_index: properties.z_index,
+            overlap_enabled: properties.overlap_enabled,
+            external_drop_enabled: properties.external_drop_enabled,
+            input_passthrough: properties.input_passthrough,
+        }
+        .into_scene()
+    }
+}
+
+/// One node geometry update in a frame-paced presentation packet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresentationUpdate {
+    pub node: NodeHandle,
+    pub properties: PresentationPropertiesPatch,
+}
+
+/// A bounded, atomic visual-state packet submitted through CLP's presentation
+/// lane. The client assigns the presentation identifier so asynchronous host
+/// status notifications can be correlated without a request/response round
+/// trip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresentationPacket {
+    pub presentation_id: String,
+    pub updates: Vec<PresentationUpdate>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ContentInput {
     Empty,
@@ -302,6 +360,24 @@ pub enum ClpSceneCommand {
     GetOverlaps {
         node: NodeHandle,
     },
+}
+
+impl ClpSceneCommand {
+    /// Whether this command changes retained session state.
+    ///
+    /// A reliable mutation supersedes a packet that was still waiting in the
+    /// frame-presentation mailbox. Queries intentionally observe the last
+    /// committed scene and do not discard that pending visual state.
+    pub const fn is_mutating(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateNode { .. }
+                | Self::SetNode { .. }
+                | Self::RemoveNode { .. }
+                | Self::UploadImage { .. }
+                | Self::RemoveImage { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -428,6 +504,9 @@ pub enum ProgramSceneError {
     SessionTextLimitExceeded { limit: usize },
     SessionTextNodeLimitExceeded { limit: usize },
     OverlapNodeLimitExceeded { limit: usize },
+    PresentationUpdateLimitExceeded { limit: usize },
+    DuplicatePresentationNode(NodeHandle),
+    InvalidPresentationUpdate(&'static str),
     HandleExhausted,
 }
 
@@ -507,6 +586,19 @@ impl Display for ProgramSceneError {
                     "a session may enable overlap on at most {limit} nodes"
                 )
             }
+            Self::PresentationUpdateLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "a presentation packet may update at most {limit} nodes"
+                )
+            }
+            Self::DuplicatePresentationNode(handle) => {
+                write!(
+                    formatter,
+                    "a presentation packet updates {handle} more than once"
+                )
+            }
+            Self::InvalidPresentationUpdate(message) => formatter.write_str(message),
             Self::HandleExhausted => {
                 formatter.write_str("could not allocate another resource handle")
             }
@@ -532,6 +624,15 @@ pub struct ProgramSceneResources {
     text_layout: TextLayout,
     overlap_pairs: BTreeSet<OverlapPair>,
     pending_overlap_events: Vec<SceneEvent>,
+}
+
+fn restore_presentation_properties(
+    scene: &mut Scene,
+    changes: &[(NodeId, NodeProperties, NodeProperties)],
+) {
+    for (node, previous, _) in changes {
+        let _ = scene.set_properties(*node, *previous);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -725,6 +826,61 @@ impl ProgramSceneResources {
                 self.overlaps_for(session, node, scene)?,
             )),
         }
+    }
+
+    /// Applies a complete geometry packet only after every owned node and
+    /// proposed geometry value has been validated. This preserves a single
+    /// observable scene transition at the renderer frame boundary.
+    pub fn present_clp(
+        &mut self,
+        session: SessionId,
+        packet: &PresentationPacket,
+        scene: &mut Scene,
+    ) -> Result<(), ProgramSceneError> {
+        if packet.updates.is_empty() {
+            return Err(ProgramSceneError::InvalidPresentationUpdate(
+                "a presentation packet must contain at least one node update",
+            ));
+        }
+        if packet.updates.len() > MAX_PRESENTATION_UPDATES {
+            return Err(ProgramSceneError::PresentationUpdateLimitExceeded {
+                limit: MAX_PRESENTATION_UPDATES,
+            });
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut property_changes = Vec::with_capacity(packet.updates.len());
+        for update in &packet.updates {
+            if !seen.insert(update.node) {
+                return Err(ProgramSceneError::DuplicatePresentationNode(update.node));
+            }
+            let node = self.node_for(session, update.node)?;
+            let current = scene
+                .node(node)
+                .ok_or(ProgramSceneError::InvalidNodeHandle(update.node))?;
+            if matches!(current.content(), NodeContent::Text(_))
+                && (update.properties.width.is_some() || update.properties.height.is_some())
+            {
+                return Err(ProgramSceneError::IntrinsicTextBounds(update.node));
+            }
+            property_changes.push((
+                node,
+                current.properties(),
+                update.properties.apply(current.properties())?,
+            ));
+        }
+
+        for (node, _, properties) in &property_changes {
+            if let Err(error) = scene.set_properties(*node, *properties) {
+                restore_presentation_properties(scene, &property_changes);
+                return Err(ProgramSceneError::Scene(error));
+            }
+        }
+        if let Err(error) = self.reconcile_overlaps(session, scene) {
+            restore_presentation_properties(scene, &property_changes);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn create_clp_node(
@@ -3501,7 +3657,6 @@ mod tests {
             ClpSceneCommandResult::Node { node, .. } => node,
             _ => unreachable!(),
         };
-
         assert_eq!(
             resources.execute_clp(
                 session,
@@ -3580,6 +3735,211 @@ mod tests {
                 )
                 .unwrap(),
             ClpSceneCommandResult::Acknowledged
+        );
+    }
+
+    #[test]
+    fn presentation_packets_validate_atomically_before_changing_geometry() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let node = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: NodeInput::Rectangle {
+                        properties: properties(),
+                        color: [255, 127, 0, 255],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+        let second_node = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: NodeInput::Rectangle {
+                        properties: properties(),
+                        color: [0, 127, 255, 255],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+
+        let duplicate = PresentationPacket {
+            presentation_id: "duplicate".to_owned(),
+            updates: vec![
+                PresentationUpdate {
+                    node,
+                    properties: PresentationPropertiesPatch {
+                        x: Some(99.0),
+                        ..PresentationPropertiesPatch::default()
+                    },
+                },
+                PresentationUpdate {
+                    node,
+                    properties: PresentationPropertiesPatch {
+                        y: Some(77.0),
+                        ..PresentationPropertiesPatch::default()
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            resources.present_clp(session, &duplicate, &mut scene),
+            Err(ProgramSceneError::DuplicatePresentationNode(node))
+        );
+        let scene_node = resources.node_for(session, node).unwrap();
+        assert_eq!(
+            scene.node(scene_node).unwrap().properties().transform.x(),
+            1.0
+        );
+        assert_eq!(
+            scene.node(scene_node).unwrap().properties().transform.y(),
+            2.0
+        );
+
+        let invalid_geometry = PresentationPacket {
+            presentation_id: "invalid-geometry".to_owned(),
+            updates: vec![
+                PresentationUpdate {
+                    node,
+                    properties: PresentationPropertiesPatch {
+                        x: Some(55.0),
+                        ..PresentationPropertiesPatch::default()
+                    },
+                },
+                PresentationUpdate {
+                    node: second_node,
+                    properties: PresentationPropertiesPatch {
+                        y: Some(f64::NAN),
+                        ..PresentationPropertiesPatch::default()
+                    },
+                },
+            ],
+        };
+        assert!(matches!(
+            resources.present_clp(session, &invalid_geometry, &mut scene),
+            Err(ProgramSceneError::Geometry(_))
+        ));
+        let second_scene_node = resources.node_for(session, second_node).unwrap();
+        assert_eq!(
+            scene.node(scene_node).unwrap().properties().transform.x(),
+            1.0
+        );
+        assert_eq!(
+            scene
+                .node(second_scene_node)
+                .unwrap()
+                .properties()
+                .transform
+                .y(),
+            2.0
+        );
+
+        let valid = PresentationPacket {
+            presentation_id: "valid".to_owned(),
+            updates: vec![PresentationUpdate {
+                node,
+                properties: PresentationPropertiesPatch {
+                    x: Some(99.0),
+                    y: Some(77.0),
+                    ..PresentationPropertiesPatch::default()
+                },
+            }],
+        };
+        resources.present_clp(session, &valid, &mut scene).unwrap();
+        assert_eq!(
+            scene.node(scene_node).unwrap().properties().transform.x(),
+            99.0
+        );
+        assert_eq!(
+            scene.node(scene_node).unwrap().properties().transform.y(),
+            77.0
+        );
+    }
+
+    #[test]
+    fn presentation_packets_preserve_text_intrinsic_bounds_and_session_ownership() {
+        let (owner, other) = session_pair();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let text = match resources
+            .execute_clp(
+                owner,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: NodeInput::Text {
+                        properties: text_properties(4.0, 5.0),
+                        text: "text".to_owned(),
+                        style: TextStyle::default(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+        let text_node = resources.node_for(owner, text).unwrap();
+
+        let bounds = PresentationPacket {
+            presentation_id: "text-bounds".to_owned(),
+            updates: vec![PresentationUpdate {
+                node: text,
+                properties: PresentationPropertiesPatch {
+                    width: Some(99.0),
+                    ..PresentationPropertiesPatch::default()
+                },
+            }],
+        };
+        assert_eq!(
+            resources.present_clp(owner, &bounds, &mut scene),
+            Err(ProgramSceneError::IntrinsicTextBounds(text))
+        );
+        assert_eq!(
+            scene.node(text_node).unwrap().properties().transform.x(),
+            4.0
+        );
+
+        let foreign = PresentationPacket {
+            presentation_id: "foreign".to_owned(),
+            updates: vec![PresentationUpdate {
+                node: text,
+                properties: PresentationPropertiesPatch {
+                    x: Some(60.0),
+                    ..PresentationPropertiesPatch::default()
+                },
+            }],
+        };
+        assert_eq!(
+            resources.present_clp(other, &foreign, &mut scene),
+            Err(ProgramSceneError::HandleNotOwned)
+        );
+        assert_eq!(
+            scene.node(text_node).unwrap().properties().transform.x(),
+            4.0
         );
     }
 
