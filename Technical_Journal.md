@@ -51,16 +51,18 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 | M21 | Public Chymeral `v1.0.0` portable Linux and Windows releases. | The host is distributed as an application; CLP and language SDKs remain the application-development boundary. |
 | M22 | Shared CLP v2.0 fixture corpus and stable Rust and Node SDKs. | A portable contract corpus lets independently maintained clients validate wire compatibility without changing the host or privileging a runtime. |
 | M23 | Frame-paced scene presentation and CLP v2.1 fixtures. | Reliable structural commands remain ordered; bounded transient geometry is a newest-state mailbox committed at a renderer frame. |
+| M24 | CLP application window metadata. | Every session retains a bounded title/icon claim; newest live claim is visible and restores deterministically without granting desktop-window control. |
+| M25 | Chymeral `1.5.0` release integration. | CLP v2.1 and its two official SDK release lines are validated as a compatible feature release; Linux and Windows portable artifacts remain x86_64-only. |
 
 ## CLP evolution
 
 CLP began as an internal lifecycle contract and became an actual local transport
 without exposing host memory, Rust types, graphics backend types, or a global
-socket. The released protocol is **v2.0**. The current source-tree development
-contract is **v2.1**, which retains v2.0 compatibility and adds the opt-in
+socket. The released protocol is **v2.1**, which retains v2.0 compatibility and adds the opt-in
 `presentation` capability. CLP v2.0 has seven opt-in capabilities: `scene`,
 `images`, `input`, `timing`, `overlap`, `external_drop`, and `text`; v2.1 adds
-`presentation` for bounded transient geometry. M19 deliberately removed the
+`presentation` for bounded transient geometry and `window_metadata` for
+session-owned native titles plus bounded static icons. M19 deliberately removed the
 v1.x and provisional v1.4 wire vocabularies before public SDK stability; the
 host provides no compatibility aliases.
 
@@ -91,6 +93,21 @@ retains only the newest unpresented packet per session. Its `presented`,
 means that Chymeral called `queue.present`, never that a compositor reported
 physical scanout. `CHYMERAL_PRESENTATION_TRACE=1` makes the same boundary
 honest by labelling client delivery and scanout as unavailable.
+
+M24 keeps window identity deliberately narrower than desktop-window management.
+`set_window_metadata` is an ordered session-owned patch: omission preserves a
+field, JSON `null` clears it, and the newest successful nonempty claim wins.
+All live claims remain retained, so clearing or closing the active session
+restores the newest remaining claim, then the terminal-derived Chymeral title
+and bundled icon when none remains. Titles are verbatim, control-free Unicode
+up to 256 UTF-8 bytes. Icons reuse only a session-owned static RGBA8 image,
+bounded to 256 × 256 and 256 KiB; GIFs, paths, URLs, and removable referenced
+icons are rejected. Native Wayland reports icon support honestly as unavailable
+while still applying titles; Chymeral does not force X11 for this feature.
+Automated core and SDK validation, exact v2.1 fixture-mirror checks, and manual
+Node SDK probe acceptance cover Windows, Linux/X11, and native Wayland. Windows
+and X11 update both native title and icon; Wayland updates the title and reports
+`icon_supported: false` before the client attempts to rely on an icon.
 
 ## Scene and interaction policy
 
@@ -177,6 +194,34 @@ rejections and clean CLP closure, but is intentionally not a performance
 reference. Manual stress testing also found and fixed a terminal scrollback
 resize defect: retained rows are now rendered, selected, and copied using their
 own historical cell width rather than a newer widened terminal grid.
+
+## M25 release integration
+
+M25 consolidates the accepted M23 and M24 work as Chymeral `1.5.0`, the
+`chymeral-rust-sdk` `1.5.0`, and `@chymeral/node-sdk` `1.5.0`, all over CLP
+v2.1. The independent version lines deliberately retain one-time v2.0 fallback:
+a v2.0 client can still connect to a v2.1 host, but cannot obtain
+`presentation` or `window_metadata`.
+
+Locked formatting, test, warnings-denied lint, documentation, package, and
+release-build gates passed in the core and both SDK repositories. The v2.1
+fixture corpus and its SHA-256 manifest are byte-identical in the core, Rust,
+and Node repositories. The final portable archives were cleanly inspected and
+manually launched on their supported targets:
+
+- `chymeral-1.5.0-linux-x86_64-portable.zip` — SHA-256
+  `04bab1749a77e60b66a2b803b9e70868afe4d2852e6a70df6300062a2cf39e65`.
+- `chymeral-1.5.0-windows-x86_64-portable.zip` — SHA-256
+  `52d64ec1b944b80683147828004cb86484fd4043d7b427af72e2a30cb66640c6`.
+
+The Node presentation and window-metadata probes passed on the Windows VM,
+Linux forced to X11/Xwayland, and Linux native Wayland. Windows and X11 apply
+both title and dynamic icon updates. Native Wayland applies titles and reports
+`icon_supported: false`; its existing incoming-external-drop limitation remains
+explicit. The portable Linux launcher intentionally selects X11/Xwayland;
+native Wayland remains available when the binary is launched directly. ARM64,
+native-Wayland DnD, outgoing desktop DnD, and a stable `winit` upgrade remain
+out of scope until M26.
 
 ## Intentional boundaries
 

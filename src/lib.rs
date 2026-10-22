@@ -16,3 +16,4 @@ pub mod runtime;
 pub mod scene;
 pub mod scene_text;
 pub mod transport;
+pub mod window_metadata;

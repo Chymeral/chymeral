@@ -39,6 +39,7 @@ use crate::{
     resources::rgba8_byte_len,
     scene::{ImageContactShape, NodeId, SceneLayer},
     scene_text::{TextAlign, TextMetrics, TextStyle, TextWeight},
+    window_metadata::{MetadataField, WindowMetadataPatch},
 };
 
 pub const CLP_ENDPOINT_ENV: &str = "CHYMERAL_CLP_ENDPOINT";
@@ -629,11 +630,27 @@ fn enqueue_presentation_status(
 
 impl ClpServer {
     pub fn start(available_capabilities: CapabilitySet) -> Result<Self> {
-        Self::start_with_wake(available_capabilities, || {})
+        Self::start_with_context_and_wake(
+            available_capabilities,
+            ProgramInitContext::default(),
+            || {},
+        )
     }
 
     pub fn start_with_wake(
         available_capabilities: CapabilitySet,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::start_with_context_and_wake(
+            available_capabilities,
+            ProgramInitContext::default(),
+            wake,
+        )
+    }
+
+    pub fn start_with_context_and_wake(
+        available_capabilities: CapabilitySet,
+        init_context: ProgramInitContext,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self> {
         let (environment, listener) = bind_listener()?;
@@ -654,6 +671,7 @@ impl ClpServer {
         let listener_control = Arc::clone(&control);
         let listener_manager = Arc::clone(&manager);
         let listener_environment = environment.clone();
+        let listener_init_context = init_context;
         let listener_broker = broker.clone();
         let listener_notifications = Arc::clone(&notifications);
         let listener_thread = thread::Builder::new()
@@ -662,6 +680,7 @@ impl ClpServer {
                 serve_connections(
                     listener,
                     listener_environment,
+                    listener_init_context,
                     listener_manager,
                     listener_control,
                     listener_broker,
@@ -1104,6 +1123,7 @@ fn random_hex(byte_count: usize) -> Result<String> {
 fn serve_connections(
     listener: LocalSocketListener,
     environment: SessionEnvironment,
+    init_context: ProgramInitContext,
     manager: Arc<Mutex<SessionManager>>,
     control: Arc<ServerControl>,
     broker: HostActionBroker,
@@ -1116,23 +1136,18 @@ fn serve_connections(
                     drop(stream);
                     continue;
                 };
-                let connection_environment = environment.clone();
-                let connection_manager = Arc::clone(&manager);
-                let connection_control = Arc::clone(&control);
-                let connection_broker = broker.clone();
-                let connection_notifications = Arc::clone(&notifications);
+                let connection = ConnectionContext {
+                    environment: environment.clone(),
+                    init_context: init_context.clone(),
+                    manager: Arc::clone(&manager),
+                    control: Arc::clone(&control),
+                    broker: broker.clone(),
+                    notifications: Arc::clone(&notifications),
+                };
                 if let Err(error) = thread::Builder::new()
                     .name("chymeral-clp-client".to_owned())
                     .spawn(move || {
-                        handle_connection(
-                            stream,
-                            connection_environment,
-                            connection_manager,
-                            connection_control,
-                            connection_broker,
-                            connection_notifications,
-                            connection_guard,
-                        );
+                        handle_connection(stream, connection, connection_guard);
                     })
                 {
                     eprintln!("Chymeral: could not serve a CLP client: {error}");
@@ -1152,15 +1167,28 @@ fn serve_connections(
     }
 }
 
-fn handle_connection(
-    mut stream: LocalSocketStream,
+struct ConnectionContext {
     environment: SessionEnvironment,
+    init_context: ProgramInitContext,
     manager: Arc<Mutex<SessionManager>>,
     control: Arc<ServerControl>,
     broker: HostActionBroker,
     notifications: Arc<SessionNotifications>,
+}
+
+fn handle_connection(
+    mut stream: LocalSocketStream,
+    connection: ConnectionContext,
     mut connection_guard: ConnectionGuard,
 ) {
+    let ConnectionContext {
+        environment,
+        init_context,
+        manager,
+        control,
+        broker,
+        notifications,
+    } = connection;
     if let Err(error) = stream.set_nonblocking(true) {
         eprintln!("Chymeral: could not configure nonblocking CLP handshake I/O: {error}");
         return;
@@ -1213,7 +1241,7 @@ fn handle_connection(
         requested_capabilities: capabilities_from_wire(&hello.capabilities),
     };
     let accepted = match manager.lock() {
-        Ok(mut manager) => manager.accept(client_hello, ProgramInitContext::default()),
+        Ok(mut manager) => manager.accept(client_hello, init_context),
         Err(_) => {
             let _ = write_error(
                 &mut stream,
@@ -2064,6 +2092,9 @@ fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilityS
         WireSceneCommand::IsOverlapping { .. } | WireSceneCommand::GetOverlaps { .. } => {
             capabilities.contains(Capability::Scene) && capabilities.contains(Capability::Overlap)
         }
+        WireSceneCommand::SetWindowMetadata { .. } => {
+            capabilities.contains(Capability::WindowMetadata)
+        }
         WireSceneCommand::RemoveNode { .. } => capabilities.contains(Capability::Scene),
         WireSceneCommand::CreateNode { node, .. } => {
             capabilities.contains(Capability::Scene)
@@ -2462,6 +2493,56 @@ enum WireSceneCommand {
     GetOverlaps {
         node: String,
     },
+    SetWindowMetadata {
+        #[serde(default, skip_serializing_if = "WireMetadataField::is_preserve")]
+        title: WireMetadataField<String>,
+        #[serde(default, skip_serializing_if = "WireMetadataField::is_preserve")]
+        icon: WireMetadataField<String>,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum WireMetadataField<T> {
+    #[default]
+    Preserve,
+    Clear,
+    Set(T),
+}
+
+impl<T> WireMetadataField<T> {
+    const fn is_preserve(&self) -> bool {
+        matches!(self, Self::Preserve)
+    }
+}
+
+impl<T> Serialize for WireMetadataField<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Preserve | Self::Clear => serializer.serialize_none(),
+            Self::Set(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for WireMetadataField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Set(value),
+            None => Self::Clear,
+        })
+    }
 }
 
 impl WireSceneCommand {
@@ -2503,6 +2584,22 @@ impl WireSceneCommand {
             }),
             Self::GetOverlaps { node } => Ok(ClpSceneCommand::GetOverlaps {
                 node: parse_node_handle(&node)?,
+            }),
+            Self::SetWindowMetadata { title, icon } => Ok(ClpSceneCommand::SetWindowMetadata {
+                metadata: WindowMetadataPatch {
+                    title: match title {
+                        WireMetadataField::Preserve => MetadataField::Preserve,
+                        WireMetadataField::Clear => MetadataField::Clear,
+                        WireMetadataField::Set(title) => MetadataField::Set(title),
+                    },
+                    icon: match icon {
+                        WireMetadataField::Preserve => MetadataField::Preserve,
+                        WireMetadataField::Clear => MetadataField::Clear,
+                        WireMetadataField::Set(icon) => {
+                            MetadataField::Set(parse_image_handle(&icon)?)
+                        }
+                    },
+                },
             }),
         }
     }
@@ -3066,6 +3163,7 @@ enum WireCapability {
     ExternalDrop,
     Text,
     Presentation,
+    WindowMetadata,
 }
 
 impl WireCapability {
@@ -3079,6 +3177,7 @@ impl WireCapability {
             Self::ExternalDrop => Capability::ExternalDrop,
             Self::Text => Capability::Text,
             Self::Presentation => Capability::Presentation,
+            Self::WindowMetadata => Capability::WindowMetadata,
         }
     }
 }
@@ -3094,6 +3193,7 @@ impl From<Capability> for WireCapability {
             Capability::ExternalDrop => Self::ExternalDrop,
             Capability::Text => Self::Text,
             Capability::Presentation => Self::Presentation,
+            Capability::WindowMetadata => Self::WindowMetadata,
         }
     }
 }
@@ -3918,6 +4018,9 @@ enum WireCommandResult {
     Overlaps {
         nodes: Vec<String>,
     },
+    WindowMetadata {
+        icon_supported: bool,
+    },
     Acknowledged,
 }
 
@@ -3940,6 +4043,9 @@ impl From<ClpSceneCommandResult> for WireCommandResult {
             ClpSceneCommandResult::Overlaps(nodes) => Self::Overlaps {
                 nodes: nodes.into_iter().map(|node| node.to_string()).collect(),
             },
+            ClpSceneCommandResult::WindowMetadata { icon_supported } => {
+                Self::WindowMetadata { icon_supported }
+            }
             ClpSceneCommandResult::Acknowledged => Self::Acknowledged,
         }
     }
@@ -3971,7 +4077,7 @@ impl From<HostMessage> for WireHostMessage {
                 protocol: init.protocol_version.into(),
                 session_id: init.session_id.to_string(),
                 capabilities: capabilities_to_wire(init.granted_capabilities),
-                context: WireInitContext::from(init.context),
+                context: WireInitContext::from_context(init.context, init.granted_capabilities),
             },
             HostMessage::Start { session_id } => Self::Start {
                 session_id: session_id.to_string(),
@@ -4049,6 +4155,7 @@ fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
         Capability::ExternalDrop,
         Capability::Text,
         Capability::Presentation,
+        Capability::WindowMetadata,
     ]
     .into_iter()
     .filter(|capability| capabilities.contains(*capability))
@@ -4060,10 +4167,17 @@ fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
 struct WireInitContext {
     arguments: Vec<String>,
     initial_commands: Vec<WireStartupCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_metadata: Option<WireWindowMetadataSupport>,
 }
 
-impl From<ProgramInitContext> for WireInitContext {
-    fn from(context: ProgramInitContext) -> Self {
+#[derive(Serialize)]
+struct WireWindowMetadataSupport {
+    icon_supported: bool,
+}
+
+impl WireInitContext {
+    fn from_context(context: ProgramInitContext, capabilities: CapabilitySet) -> Self {
         Self {
             arguments: context.arguments,
             initial_commands: context
@@ -4074,6 +4188,13 @@ impl From<ProgramInitContext> for WireInitContext {
                     arguments: command.arguments,
                 })
                 .collect(),
+            window_metadata: capabilities
+                .contains(Capability::WindowMetadata)
+                .then_some(context.window_metadata)
+                .flatten()
+                .map(|support| WireWindowMetadataSupport {
+                    icon_supported: support.icon_supported,
+                }),
         }
     }
 }
@@ -4423,7 +4544,7 @@ mod tests {
 
         assert_eq!(
             vector_ids,
-            ["frame-presentation"]
+            ["application-window-metadata", "frame-presentation"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect()
@@ -4432,6 +4553,7 @@ mod tests {
             client_message_types,
             [
                 "close",
+                "command",
                 "hello",
                 "init_complete",
                 "present_scene",
@@ -4443,7 +4565,7 @@ mod tests {
         );
         assert_eq!(
             host_message_types,
-            ["closed", "init", "presentation_status", "start"]
+            ["closed", "init", "presentation_status", "result", "start"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect()
@@ -4532,6 +4654,7 @@ mod tests {
                     "external_drop" => WireCapability::ExternalDrop,
                     "text" => WireCapability::Text,
                     "presentation" => WireCapability::Presentation,
+                    "window_metadata" => WireCapability::WindowMetadata,
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -4697,7 +4820,12 @@ mod tests {
         assert_eq!(submission.session_id(), session_id);
         assert_eq!(submission.packet().presentation_id, "packet-1");
         assert_eq!(submission.packet().updates.len(), 1);
-        assert!(server.drain_host_actions().is_empty());
+        assert!(
+            !server
+                .drain_host_actions()
+                .into_iter()
+                .any(|action| matches!(action, HostAction::Command(_)))
+        );
 
         server.report_presentation_presented(session_id, "packet-1".to_owned());
         let status = receive_host(&mut client);
@@ -5923,6 +6051,152 @@ mod tests {
         ));
         let result = receive_host(&mut client);
         assert_eq!(result["result"], json!({ "kind": "node_updated" }));
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn forwards_window_metadata_with_tristate_fields_and_support_context() {
+        let server = ClpServer::start_with_context_and_wake(
+            CapabilitySet::ALL,
+            ProgramInitContext::default().with_window_metadata_support(
+                crate::protocol::WindowMetadataSupport {
+                    icon_supported: true,
+                },
+            ),
+            || {},
+        )
+        .unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["window_metadata"]));
+        let init = receive_host(&mut client);
+        assert_eq!(init["capabilities"], json!(["window_metadata"]));
+        assert_eq!(
+            init["context"]["window_metadata"],
+            json!({ "icon_supported": true })
+        );
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "window-title".to_owned(),
+                command: Box::new(WireSceneCommand::SetWindowMetadata {
+                    title: WireMetadataField::Set("CLP metadata probe".to_owned()),
+                    icon: WireMetadataField::Clear,
+                }),
+            },
+        );
+        let request = wait_for_host_command(&server);
+        assert_eq!(
+            request.command,
+            ClpSceneCommand::SetWindowMetadata {
+                metadata: WindowMetadataPatch {
+                    title: MetadataField::Set("CLP metadata probe".to_owned()),
+                    icon: MetadataField::Clear,
+                },
+            }
+        );
+        request.respond(HostCommandResponse::Success(
+            ClpSceneCommandResult::WindowMetadata {
+                icon_supported: true,
+            },
+        ));
+        let result = receive_host(&mut client);
+        assert_eq!(
+            result["result"],
+            json!({ "kind": "window_metadata", "icon_supported": true })
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn withholds_window_metadata_context_from_a_v2_0_client() {
+        let server = ClpServer::start_with_context_and_wake(
+            CapabilitySet::ALL,
+            ProgramInitContext::default().with_window_metadata_support(
+                crate::protocol::WindowMetadataSupport {
+                    icon_supported: true,
+                },
+            ),
+            || {},
+        )
+        .unwrap();
+        let mut client = connect(&server);
+        send_client(
+            &mut client,
+            WireClientMessage::Hello {
+                protocol: WireProtocolVersion { major: 2, minor: 0 },
+                token: server.environment().authentication_token().to_owned(),
+                capabilities: vec![WireCapability::WindowMetadata],
+            },
+        );
+
+        let init = receive_host(&mut client);
+        assert_eq!(init["capabilities"], json!([]));
+        assert!(init["context"].get("window_metadata").is_none());
+    }
+
+    #[test]
+    fn distinguishes_omitted_and_null_window_metadata_fields() {
+        let preserve_icon: WireSceneCommand = serde_json::from_value(json!({
+            "op": "set_window_metadata",
+            "title": "Title only"
+        }))
+        .unwrap();
+        let WireSceneCommand::SetWindowMetadata { title, icon } = preserve_icon else {
+            unreachable!();
+        };
+        assert!(matches!(title, WireMetadataField::Set(value) if value == "Title only"));
+        assert!(matches!(icon, WireMetadataField::Preserve));
+
+        let clear: WireSceneCommand = serde_json::from_value(json!({
+            "op": "set_window_metadata",
+            "title": null,
+            "icon": null
+        }))
+        .unwrap();
+        let WireSceneCommand::SetWindowMetadata { title, icon } = clear else {
+            unreachable!();
+        };
+        assert!(matches!(title, WireMetadataField::Clear));
+        assert!(matches!(icon, WireMetadataField::Clear));
+    }
+
+    #[test]
+    fn rejects_window_metadata_without_its_negotiated_capability() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec![]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "denied-window-metadata".to_owned(),
+                command: Box::new(WireSceneCommand::SetWindowMetadata {
+                    title: WireMetadataField::Set("Denied".to_owned()),
+                    icon: WireMetadataField::Preserve,
+                }),
+            },
+        );
+        let error = receive_host(&mut client);
+        assert_eq!(error["type"], "command_error");
+        assert_eq!(error["code"], "capability_denied");
+        assert!(
+            !server
+                .drain_host_actions()
+                .into_iter()
+                .any(|action| matches!(action, HostAction::Command(_)))
+        );
 
         send_client(&mut client, WireClientMessage::Close);
         let _ = receive_host(&mut client);

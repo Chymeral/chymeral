@@ -34,7 +34,8 @@
               "overlap",
               "external_drop",
               "text",
-              "presentation"
+              "presentation",
+              "window_metadata"
             ]
           }
         },
@@ -56,11 +57,15 @@
               "overlap",
               "external_drop",
               "text",
-              "presentation"
+              "presentation",
+              "window_metadata"
             ],
             "context": {
               "arguments": ["--fixture-presentation"],
-              "initial_commands": []
+              "initial_commands": [],
+              "window_metadata": {
+                "icon_supported": true
+              }
             }
           }
         },
@@ -161,6 +166,198 @@
           "message": {
             "type": "closed",
             "session_id": "session-1",
+            "reason": {
+              "kind": "client_requested"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "application-window-metadata",
+      "description": "A v2.1 application negotiates window metadata, uploads a bounded static icon, replaces its title while preserving that icon, clears both fields, and closes cleanly.",
+      "frames": [
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "hello",
+            "protocol": {
+              "major": 2,
+              "minor": 1
+            },
+            "token": "fixture-token-not-a-secret",
+            "capabilities": [
+              "images",
+              "window_metadata"
+            ]
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "init",
+            "protocol": {
+              "major": 2,
+              "minor": 1
+            },
+            "session_id": "session-2",
+            "capabilities": [
+              "images",
+              "window_metadata"
+            ],
+            "context": {
+              "arguments": [],
+              "initial_commands": [],
+              "window_metadata": {
+                "icon_supported": true
+              }
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "init_complete"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "start",
+            "session_id": "session-2"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "started"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-icon-upload",
+            "command": {
+              "op": "upload_image",
+              "source": {
+                "kind": "rgba8",
+                "width": 1,
+                "height": 1
+              }
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "binary",
+          "bytes_hex": "ff7f00ff"
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-icon-upload",
+            "result": {
+              "kind": "image",
+              "image": "image-1"
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-metadata-set",
+            "command": {
+              "op": "set_window_metadata",
+              "title": "Fixture metadata",
+              "icon": "image-1"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-metadata-set",
+            "result": {
+              "kind": "window_metadata",
+              "icon_supported": true
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-metadata-title-only",
+            "command": {
+              "op": "set_window_metadata",
+              "title": "Refreshed fixture metadata"
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-metadata-title-only",
+            "result": {
+              "kind": "window_metadata",
+              "icon_supported": true
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-metadata-clear",
+            "command": {
+              "op": "set_window_metadata",
+              "title": null,
+              "icon": null
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-metadata-clear",
+            "result": {
+              "kind": "window_metadata",
+              "icon_supported": true
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "close"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "closed",
+            "session_id": "session-2",
             "reason": {
               "kind": "client_requested"
             }

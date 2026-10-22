@@ -1,10 +1,9 @@
 # Chymeral Main Manual
 
-This manual describes the released CLP v2.0 contract. Sections explicitly
-marked **Unreleased CLP v2.1** document the development contract for the next
-Chymeral feature release; they are not part of the published `1.0.0` portable
-edition yet. It is written for terminal users, application authors, and SDK
-implementers.
+This manual describes CLP v2.1 as delivered in Chymeral `1.5.0`. A v2.1 host
+continues to accept CLP v2.0 clients, which retain their existing behavior
+without the v2.1-only capabilities. It is written for terminal users,
+application authors, and SDK implementers.
 For the design and milestone history, see the [Technical Journal](Technical_Journal.md).
 
 ## 1. Product model
@@ -51,8 +50,9 @@ must be available. On Windows, run `Launch Chymeral.cmd`.
 
 ### 2.2 Build from source
 
-Building from source requires Rust `1.90` or newer. The repository pins
-`1.90.0` for reproducible development. Build and run it with:
+Building from source requires Rust `1.90` or newer. The repository follows the
+current Rust `stable` channel for development and verifies `1.90` separately
+in CI. Build and run it with:
 
 ```text
 cargo run --locked --release
@@ -198,9 +198,10 @@ has `id`, optional `parent`, `x`, `y`, `width`, `height`, `color`, `opacity`,
 
 **CLP** means *Chymeral Link Protocol*. It is a versioned, language-neutral
 contract between a Chymeral window and an application process. The released
-contract is **CLP v2.0**. The source tree also contains the explicitly marked
-**unreleased CLP v2.1** presentation extension. Neither version accepts CLP
-v1.x clients or provides command aliases for their prior vocabulary.
+contract is **CLP v2.1**, including presentation and application-window-
+metadata extensions. A v2.1 host accepts v2.0 clients without granting those
+two additional capabilities. Neither version accepts CLP v1.x clients or
+provides command aliases for their prior vocabulary.
 
 When Chymeral starts its shell, the shell and its descendants inherit two
 private variables:
@@ -255,7 +256,8 @@ intersection with its supported set:
 | `overlap` | Opt-in scene contact state, queries, and transitions; also requires `scene` for commands. |
 | `external_drop` | Incoming desktop-file drops targeted to opt-in scene nodes. |
 | `text` | Creating and changing intrinsic scene-text nodes; also requires `scene`. |
-| `presentation` | **Unreleased CLP v2.1:** bounded, coalesced geometry packets committed at a renderer frame; also requires `scene`. |
+| `presentation` | CLP v2.1 bounded, coalesced geometry packets committed at a renderer frame; also requires `scene`. |
+| `window_metadata` | CLP v2.1 session-owned native title and bounded static RGBA8 icon claim. |
 
 After the lifecycle handshake, a client may replace its subscription set:
 
@@ -316,7 +318,8 @@ operations are:
 create_node       set_node           remove_node
 upload_image      remove_image
 is_overlapping    get_overlaps
-present_scene (unreleased CLP v2.1)
+present_scene (CLP v2.1)
+set_window_metadata (CLP v2.1)
 ```
 
 Each session owns one implicit retained scene tree. `create_node` creates a
@@ -356,16 +359,16 @@ source is either `{ "kind": "rgba8", "width": W, "height": H }`, requiring
 exactly `W × H × 4` RGBA8 bytes, or `{ "kind": "gif", "byte_length": N }`,
 requiring exactly `N` encoded GIF bytes. Chymeral does not read client paths or
 accept base64 image data. It returns one opaque, session-owned `image-N` handle
-for either source. `remove_image` rejects an image that a node still references.
-Nodes and images are safely cleaned up when a session closes, faults, or
-disconnects.
+for either source. `remove_image` rejects an image that a node or its session's
+window-icon metadata still references. Nodes and images are safely cleaned up
+when a session closes, faults, or disconnects.
 
 The host validates dimensions, ownership, capabilities, image use, and resource
 limits before applying a command. An individual static image is limited to
 64 MiB of RGBA8 data; the combined static-image and decoded-GIF total is
 limited to 128 MiB per session, in addition to GPU limits.
 
-### 6.1 Frame-paced presentation (unreleased CLP v2.1)
+### 6.1 Frame-paced presentation (CLP v2.1)
 
 `present_scene` is a separate, opt-in visual lane for continuous state such as
 dragging a viewport, scrolling a scene subtree, or moving a related control.
@@ -434,7 +437,55 @@ message. The v2 codes are `unsupported_version`, `capability_denied`,
 `host_unavailable`, and `protocol_violation`. Clients should branch only on the
 code; messages are for people and diagnostics.
 
-### 6.2 Intrinsic scene text
+### 6.2 Application window metadata (CLP v2.1)
+
+With `window_metadata`, a session may supply the title and icon identifying its
+ordinary program inside the native Chymeral window. This is intentionally not
+desktop-window management: it cannot move, resize, decorate, persist, or open
+another window. A client uses the ordered command lane:
+
+```json
+{
+  "op": "set_window_metadata",
+  "title": "Example editor",
+  "icon": "image-3"
+}
+```
+
+Both fields are an independent patch. Omit a field to preserve it; write JSON
+`null` to clear it. At least one field must be present. A nonempty successful
+update refreshes that session's claim recency; clearing both fields removes its
+claim. A title is presented verbatim without a `Chymeral —` prefix. It must be
+nonempty, have no Unicode control character, and occupy at most 256 UTF-8
+bytes.
+
+`icon` reuses an image handle previously uploaded by the same session. It must
+be static RGBA8, at most 256 × 256 pixels and 256 KiB. GIF handles, paths,
+URLs, base64 payloads, foreign handles, and images above those limits are
+rejected. A selected icon remains referenced until it is cleared or its session
+ends, so `remove_image` rejects it meanwhile.
+
+Every session retains its own claim. The newest live nonempty claim is visible;
+clearing or closing that session restores the newest remaining claim. When no
+claim remains, Chymeral restores its terminal-derived title and bundled icon.
+Terminal OSC title updates do not override an active application title. Host
+diagnostics temporarily use `Chymeral — Diagnostics`, then resume this same
+arbitration rule when they close.
+
+The `init.context.window_metadata.icon_supported` value and the successful
+command result both report whether the active backend can apply a dynamic icon:
+
+```json
+{ "kind": "window_metadata", "icon_supported": true }
+```
+
+Windows and supported Linux backends return `true`. Native Wayland can apply
+the title but reports `false` for dynamic icons; it keeps the bundled Chymeral
+icon instead. Chymeral does not force X11 for this feature. CLP v2.0 clients
+cannot request `window_metadata` and retain ordinary terminal title/icon
+behavior.
+
+### 6.3 Intrinsic scene text
 
 With `scene` and `text`, an application creates a `text` node through
 `create_node`. Its origin is the upper-left corner of the first cell, not the
@@ -460,7 +511,7 @@ A session retains at most 16 MiB of text, 1 Mi terminal cells, and 1,024 text
 nodes. These limits prevent a client from exhausting host memory or rendering
 resources.
 
-### 6.3 Animated scene images
+### 6.4 Animated scene images
 
 With `images`, a client uploads encoded GIF bytes through the same
 `upload_image` operation used for RGBA8 images. It declares
@@ -549,10 +600,10 @@ only that session with `host_overloaded`; the terminal and other sessions stay
 alive. Transient operating-system backpressure is retried through the running
 session writer instead of being treated as an immediate protocol failure.
 
-**Unreleased CLP v2.1:** `presentation_status` is intentionally an advisory
-continuous notification. It can coalesce to the latest host outcome and is not
-included in `DeliveryGap`; do not use it as a required per-packet completion
-queue. Use it for diagnostics and keep the newest presentational state locally.
+In CLP v2.1, `presentation_status` is intentionally an advisory continuous
+notification. It can coalesce to the latest host outcome and is not included
+in `DeliveryGap`; do not use it as a required per-packet completion queue. Use
+it for diagnostics and keep the newest presentational state locally.
 
 ## 9. Official SDK quick starts
 
@@ -580,9 +631,10 @@ own test harnesses rather than downloading them during ordinary CI. The Rust
 and Node SDKs vendor a byte-checked snapshot with `SHA256SUMS` and replay it
 through their public APIs and own fake hosts in their Linux/Windows CI matrices.
 
-The source-tree [CLP v2.1 presentation fixture corpus](protocol/fixtures/v2.1/README.md)
-extends that method for the unreleased `presentation` capability. It includes
-the accepted frame packet and a rejected intrinsic-text bounds update.
+The versioned [CLP v2.1 fixture corpus](protocol/fixtures/v2.1/README.md)
+extends that method for `presentation` and `window_metadata`. It includes an
+accepted frame packet, a rejected intrinsic-text bounds update, and title/icon
+patch preservation and clearing.
 
 ### Rust
 
@@ -591,7 +643,7 @@ project:
 
 ```toml
 [dependencies]
-chymeral-rust-sdk = "1.0"
+chymeral-rust-sdk = "1.5"
 ```
 
 For local development, add a path dependency to an application project:
@@ -627,12 +679,13 @@ fn main() -> chymeral_rust_sdk::Result<()> {
 }
 ```
 
-The stable `1.0.0` SDK exposes typed CLP v2.0 capabilities, session and
+The stable `1.5.0` SDK exposes typed CLP v2.1 capabilities, session and
 opaque-handle types, nodes, atomic node changes, unified images, subscriptions,
-notifications, close reasons, client errors, alpha image contact, and generic
-node input passthrough. `clp_conformance` exercises lifecycle, timing, images,
-text, scene mutation, and overlap against a live Chymeral endpoint, including
-both RGBA8 and GIF image uploads.
+notifications, close reasons, client errors, alpha image contact, generic node
+input passthrough, frame-paced presentation, and application window metadata.
+`clp_conformance` exercises lifecycle, timing, images, text, scene mutation,
+and overlap against a live Chymeral endpoint, including both RGBA8 and GIF
+image uploads.
 
 ### Node.js and TypeScript
 
@@ -662,7 +715,7 @@ repository. For Rust:
 cargo run --locked --example clp_conformance
 ```
 
-For the unreleased M23 presentation path, build Chymeral with
+For the CLP v2.1 presentation path, launch Chymeral with
 `CHYMERAL_PRESENTATION_TRACE=1`, then run the Node probe from its SDK checkout:
 
 ```text
@@ -673,6 +726,21 @@ Click the blue panel once to focus the probe, move the pointer, scroll, resize
 the window, then press `b` for its 180-update 60 Hz burst and `q` to print the
 observed application-submit-to-host-status summary. Compare the probe output
 with the host trace; neither is physical input-to-photon timing.
+
+For CLP v2.1 application window metadata, run the Node SDK probe from a
+Chymeral terminal:
+
+```text
+npm run example:window-metadata
+```
+
+Click its blue panel to focus the session. Its initial static icon and verbatim
+title should replace Chymeral's fallback on Windows and supported Linux
+backends. Press `t` to replace only the title while preserving the icon, `c` to
+clear both fields and restore the terminal-derived title plus bundled icon,
+`r` to restore the claim, then `q` to close only that CLP session. Native
+Wayland must still update the title while the probe reports dynamic icon support
+as unavailable.
 
 For Node.js and TypeScript:
 
@@ -706,8 +774,8 @@ conformance suite without changing the ordinary-program model at the center of
 Chymeral. An IDL remains deferred until it removes real duplication that the
 fixtures and independent SDKs cannot address.
 
-The first stable source baseline is Chymeral `1.0.0`, which implements CLP
-v2.0. The separate Rust reference binding and Node binding are both `1.0.0`;
+The current stable source baseline is Chymeral `1.5.0`, which implements CLP
+v2.1. The separate Rust reference binding and Node binding are both `1.5.0`;
 their package versions do not version the protocol or the terminal application.
 The host Rust crate exists to share implementation between the executable and
 its tests. It is not a supported application-development API: programs should

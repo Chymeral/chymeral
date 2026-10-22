@@ -16,6 +16,10 @@ use crate::{
         NodeProperties, Rect, Scene, SceneLayer, SolidNode, Transform,
     },
     scene_text::{TextLayout, TextLayoutError, TextMetrics, TextNode, TextStyle},
+    window_metadata::{
+        MAX_WINDOW_ICON_BYTES, MAX_WINDOW_ICON_DIMENSION, WindowMetadata, WindowMetadataClaims,
+        WindowMetadataError, WindowMetadataPatch,
+    },
 };
 
 pub const MAX_TEXTURE_BYTES: usize = 64 * 1024 * 1024;
@@ -334,6 +338,13 @@ pub enum ImageUpload {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowIcon {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClpSceneCommand {
     CreateNode {
@@ -359,6 +370,9 @@ pub enum ClpSceneCommand {
     },
     GetOverlaps {
         node: NodeHandle,
+    },
+    SetWindowMetadata {
+        metadata: WindowMetadataPatch,
     },
 }
 
@@ -392,6 +406,9 @@ pub enum ClpSceneCommandResult {
     Image(ImageHandle),
     IsOverlapping(bool),
     Overlaps(Vec<NodeHandle>),
+    WindowMetadata {
+        icon_supported: bool,
+    },
     Acknowledged,
 }
 
@@ -484,6 +501,10 @@ pub enum ProgramSceneError {
     InvalidAnimatedImageHandle(AnimatedImageHandle),
     HandleNotOwned,
     ImageInUse(ImageHandle),
+    WindowIconMustBeStaticRgba8(ImageHandle),
+    WindowIconDimensionLimitExceeded { limit: u32 },
+    WindowIconByteLimitExceeded { limit: usize },
+    WindowMetadata(WindowMetadataError),
     TextureInUse(TextureHandle),
     AnimatedImageInUse(AnimatedImageHandle),
     TextureDimensionLimitExceeded { limit: u32 },
@@ -521,8 +542,27 @@ impl Display for ProgramSceneError {
                 formatter.write_str("the resource handle is not owned by this session")
             }
             Self::ImageInUse(handle) => {
-                write!(formatter, "{handle} is still referenced by a scene node")
+                write!(
+                    formatter,
+                    "{handle} is still referenced by a scene node or window metadata"
+                )
             }
+            Self::WindowIconMustBeStaticRgba8(handle) => {
+                write!(
+                    formatter,
+                    "{handle} must reference a static RGBA8 image for window metadata"
+                )
+            }
+            Self::WindowIconDimensionLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "a window icon may not exceed {limit} pixels in either dimension"
+                )
+            }
+            Self::WindowIconByteLimitExceeded { limit } => {
+                write!(formatter, "a window icon may not exceed {limit} bytes")
+            }
+            Self::WindowMetadata(error) => Display::fmt(error, formatter),
             Self::TextureInUse(handle) => {
                 write!(formatter, "{handle} is still referenced by a scene node")
             }
@@ -624,6 +664,7 @@ pub struct ProgramSceneResources {
     text_layout: TextLayout,
     overlap_pairs: BTreeSet<OverlapPair>,
     pending_overlap_events: Vec<SceneEvent>,
+    window_metadata: WindowMetadataClaims,
 }
 
 fn restore_presentation_properties(
@@ -731,6 +772,17 @@ impl ProgramSceneResources {
         scene: &mut Scene,
         textures: &mut TextureStore,
     ) -> Result<ClpSceneCommandResult, ProgramSceneError> {
+        self.execute_clp_with_window_icon_support(session, command, scene, textures, false)
+    }
+
+    pub fn execute_clp_with_window_icon_support(
+        &mut self,
+        session: SessionId,
+        command: ClpSceneCommand,
+        scene: &mut Scene,
+        textures: &mut TextureStore,
+        window_icon_supported: bool,
+    ) -> Result<ClpSceneCommandResult, ProgramSceneError> {
         match command {
             ClpSceneCommand::CreateNode {
                 parent,
@@ -783,6 +835,9 @@ impl ProgramSceneResources {
                 Ok(ClpSceneCommandResult::Image(handle))
             }
             ClpSceneCommand::RemoveImage { image } => {
+                if self.window_metadata.references_image(image) {
+                    return Err(ProgramSceneError::ImageInUse(image));
+                }
                 let owned = self.image_for(session, image)?;
                 match owned.resource {
                     ImageResource::Texture(texture) => {
@@ -825,7 +880,65 @@ impl ProgramSceneResources {
             ClpSceneCommand::GetOverlaps { node } => Ok(ClpSceneCommandResult::Overlaps(
                 self.overlaps_for(session, node, scene)?,
             )),
+            ClpSceneCommand::SetWindowMetadata { metadata } => {
+                self.set_window_metadata(session, metadata, textures)?;
+                Ok(ClpSceneCommandResult::WindowMetadata {
+                    icon_supported: window_icon_supported,
+                })
+            }
         }
+    }
+
+    pub fn set_window_metadata(
+        &mut self,
+        session: SessionId,
+        metadata: WindowMetadataPatch,
+        textures: &TextureStore,
+    ) -> Result<(), ProgramSceneError> {
+        if let crate::window_metadata::MetadataField::Set(image) = &metadata.icon {
+            let owned = self.image_for(session, *image)?;
+            let ImageResource::Texture(texture) = owned.resource else {
+                return Err(ProgramSceneError::WindowIconMustBeStaticRgba8(*image));
+            };
+            let texture = self.texture_for(session, texture)?;
+            let texture = textures
+                .texture(texture)
+                .ok_or(ProgramSceneError::InvalidImageHandle(*image))?;
+            if texture.width() > MAX_WINDOW_ICON_DIMENSION
+                || texture.height() > MAX_WINDOW_ICON_DIMENSION
+            {
+                return Err(ProgramSceneError::WindowIconDimensionLimitExceeded {
+                    limit: MAX_WINDOW_ICON_DIMENSION,
+                });
+            }
+            if texture.pixels().len() > MAX_WINDOW_ICON_BYTES {
+                return Err(ProgramSceneError::WindowIconByteLimitExceeded {
+                    limit: MAX_WINDOW_ICON_BYTES,
+                });
+            }
+        }
+        self.window_metadata
+            .apply(session, metadata)
+            .map_err(ProgramSceneError::WindowMetadata)
+    }
+
+    pub fn active_window_metadata(&self) -> Option<&WindowMetadata> {
+        self.window_metadata.active()
+    }
+
+    pub fn active_window_icon(&self, textures: &TextureStore) -> Option<WindowIcon> {
+        let image = self.window_metadata.active()?.icon()?;
+        let owned = self.images.get(&image)?;
+        let ImageResource::Texture(texture) = owned.resource else {
+            return None;
+        };
+        let texture = self.textures.get(&texture)?;
+        let texture = textures.texture(texture.texture)?;
+        Some(WindowIcon {
+            width: texture.width(),
+            height: texture.height(),
+            pixels: texture.pixels().to_vec(),
+        })
     }
 
     /// Applies a complete geometry packet only after every owned node and
@@ -1414,7 +1527,8 @@ impl ProgramSceneResources {
         session: SessionId,
         scene: &mut Scene,
         textures: &mut TextureStore,
-    ) {
+    ) -> bool {
+        let metadata_changed = self.window_metadata.remove_session(session);
         let roots = self
             .nodes
             .values()
@@ -1454,6 +1568,7 @@ impl ProgramSceneResources {
         self.session_texture_bytes.remove(&session);
         self.images.retain(|_, owned| owned.session != session);
         self.discard_missing_overlap_pairs();
+        metadata_changed
     }
 
     pub fn node_handle_for_session(&self, session: SessionId, node: NodeId) -> Option<NodeHandle> {
@@ -4008,6 +4123,179 @@ mod tests {
                 )
                 .unwrap(),
             ClpSceneCommandResult::Overlaps(vec![second])
+        );
+    }
+
+    #[test]
+    fn clp_window_metadata_uses_owned_static_icons_and_keeps_them_alive() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let image = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::UploadImage {
+                    image: ImageUpload::Rgba8 {
+                        width: 2,
+                        height: 2,
+                        pixels: vec![
+                            255, 127, 0, 255, 255, 127, 0, 255, 255, 127, 0, 255, 255, 127, 0, 255,
+                        ],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Image(image) => image,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            resources
+                .execute_clp_with_window_icon_support(
+                    session,
+                    ClpSceneCommand::SetWindowMetadata {
+                        metadata: WindowMetadataPatch {
+                            title: crate::window_metadata::MetadataField::Set(
+                                "Metadata probe".to_owned(),
+                            ),
+                            icon: crate::window_metadata::MetadataField::Set(image),
+                        },
+                    },
+                    &mut scene,
+                    &mut textures,
+                    true,
+                )
+                .unwrap(),
+            ClpSceneCommandResult::WindowMetadata {
+                icon_supported: true
+            }
+        );
+        assert_eq!(
+            resources
+                .active_window_metadata()
+                .and_then(WindowMetadata::title),
+            Some("Metadata probe")
+        );
+        assert_eq!(
+            resources.active_window_icon(&textures).map(|icon| (
+                icon.width,
+                icon.height,
+                icon.pixels.len()
+            )),
+            Some((2, 2, 16))
+        );
+        assert_eq!(
+            resources.execute_clp(
+                session,
+                ClpSceneCommand::RemoveImage { image },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::ImageInUse(image))
+        );
+
+        resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SetWindowMetadata {
+                    metadata: WindowMetadataPatch {
+                        title: crate::window_metadata::MetadataField::Clear,
+                        icon: crate::window_metadata::MetadataField::Clear,
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(resources.active_window_metadata().is_none());
+        assert_eq!(
+            resources
+                .execute_clp(
+                    session,
+                    ClpSceneCommand::RemoveImage { image },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            ClpSceneCommandResult::Acknowledged
+        );
+    }
+
+    #[test]
+    fn clp_window_metadata_rejects_foreign_animated_and_oversized_icons() {
+        let (owner, other) = session_pair();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let image = match resources
+            .execute_clp(
+                owner,
+                ClpSceneCommand::UploadImage {
+                    image: ImageUpload::Rgba8 {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0, 255],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Image(image) => image,
+            _ => unreachable!(),
+        };
+        let metadata_for = |icon| ClpSceneCommand::SetWindowMetadata {
+            metadata: WindowMetadataPatch {
+                icon: crate::window_metadata::MetadataField::Set(icon),
+                ..WindowMetadataPatch::default()
+            },
+        };
+        assert_eq!(
+            resources.execute_clp(other, metadata_for(image), &mut scene, &mut textures),
+            Err(ProgramSceneError::HandleNotOwned)
+        );
+
+        let animated = ImageHandle::new(99);
+        resources.images.insert(
+            animated,
+            OwnedImage {
+                session: owner,
+                resource: ImageResource::AnimatedImage(AnimatedImageHandle::new(1)),
+            },
+        );
+        assert_eq!(
+            resources.execute_clp(owner, metadata_for(animated), &mut scene, &mut textures),
+            Err(ProgramSceneError::WindowIconMustBeStaticRgba8(animated))
+        );
+
+        let oversized = match resources
+            .execute_clp(
+                owner,
+                ClpSceneCommand::UploadImage {
+                    image: ImageUpload::Rgba8 {
+                        width: MAX_WINDOW_ICON_DIMENSION + 1,
+                        height: 1,
+                        pixels: vec![0; (MAX_WINDOW_ICON_DIMENSION as usize + 1) * 4],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Image(image) => image,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            resources.execute_clp(owner, metadata_for(oversized), &mut scene, &mut textures),
+            Err(ProgramSceneError::WindowIconDimensionLimitExceeded {
+                limit: MAX_WINDOW_ICON_DIMENSION
+            })
         );
     }
 }

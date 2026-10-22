@@ -6,6 +6,8 @@ the CLP protocol and language SDKs have independent version numbers.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-22
+
 ### Added
 
 - A CLP v2.1 `presentation` capability for bounded, atomic
@@ -15,6 +17,12 @@ the CLP protocol and language SDKs have independent version numbers.
   `rejected`) and `CHYMERAL_PRESENTATION_TRACE=1` host-stage diagnostics.
 - A versioned CLP v2.1 presentation fixture corpus with exact byte checks for
   SDK conformance work.
+- A CLP v2.1 `window_metadata` capability with the ordered
+  `set_window_metadata` command for session-owned native titles and bounded
+  static RGBA8 icons.
+- Deterministic newest-claim arbitration, title/icon restoration after clearing
+  or closure, backend icon-support feedback, and byte-checked v2.1 metadata
+  fixture coverage.
 
 ### Changed
 
@@ -25,10 +33,10 @@ the CLP protocol and language SDKs have independent version numbers.
 
 ### Compatibility
 
-- These source-tree changes target Chymeral `1.1.0` and CLP v2.1. The released
-  `1.0.x` portable editions remain CLP v2.0 releases.
+- Chymeral `1.5.0` implements CLP v2.1. The earlier `1.0.x` portable editions
+  implement CLP v2.0.
 - A CLP v2.1 host continues to accept CLP v2.0 clients without granting the
-  new `presentation` capability.
+  new `presentation` or `window_metadata` capabilities.
 
 ## [1.0.0] - 2026-10-17
 

@@ -7,27 +7,29 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M23 are complete; M24 remains planned follow-up work.
-- CLP v2.0 is frozen and publicly released. M23 and M24 target the compatible
-  CLP v2.1 update; v2.0 clients must retain their existing behavior on an
-  updated host.
-- `chymeral-rust-sdk` `1.0.0` and `@chymeral/node-sdk` `1.0.1` are accepted
-  stable public APIs. Later SDK and protocol publications belong to their
-  respective feature milestones.
+- M1–M25 are complete; M25 is release-ready after Linux and Windows acceptance.
+- CLP v2.1 is frozen for the `1.5.0` release line. A v2.1 host continues to
+  accept v2.0 clients without its additional capabilities.
+- `chymeral-rust-sdk` `1.5.0` and `@chymeral/node-sdk` `1.5.0` are the
+  accepted release lines for the public CLP v2.1 APIs. Later protocol and SDK
+  publications belong to their respective feature milestones.
 - No phase below has started unless its status explicitly says otherwise.
 
-### M23–M24 release target
+### M25 release record
 
-- **Chymeral:** the coordinated public feature release is `v1.1.0`.
+- **Chymeral:** M25 integrates the accepted M23–M24 capabilities as `v1.5.0`.
 - **CLP:** the protocol advances from `v2.0` to `v2.1`. A v2.1 host continues
   to accept v2.0 clients, which simply cannot request the new capabilities.
-- **Supported SDKs:** the Rust and Node.js/TypeScript SDKs advance from `1.0.0`
-  to `2.0.0` and expose the finalized CLP v2.1 APIs. Their release notes must
-  state their behavior against a v2.0-only host and the migration path from the
-  `1.0.0` bindings.
-- These are separate version lines: Chymeral `1.1.0` denotes the next official
-  feature release, CLP `2.1` denotes a backward-compatible wire expansion, and
-  SDK `2.0.0` denotes the corresponding application-facing API generation.
+- **Supported SDKs:** the Rust and Node.js/TypeScript SDKs advance to `1.5.0`
+  with their finalized CLP v2.1 APIs. Their release notes state their behavior
+  against a v2.0-only host and the migration path from their `1.0.x` lines.
+- **Distribution:** M25 prepares portable Linux `x86_64` and Windows `x86_64`
+  editions only. ARM64 is deliberately outside M25 because no native ARM test
+  hardware or reproducible validation matrix is available.
+- These remain independent version lines: Chymeral and both supported SDKs use
+  `1.5.0` for this coordinated feature release, while CLP `v2.1` is the
+  compatible wire expansion. The future SDK `2.0.0` line is reserved for M26
+  rather than being implied by the v2.1 additions.
 
 ## How to maintain this record
 
@@ -1275,9 +1277,10 @@ M20 must be complete and the v2.0 protocol contract must be stable.
    command events never take the lossy path or change relative order.
 6. **Version and expose deliberately.** Freeze the capability, packet limits,
    eligible properties, completion semantics, and SDK APIs only after the host
-   prototype and trace show the required behavior. Release the result with
-   Chymeral `1.1.0`, CLP v2.1, and the `2.0.0` SDK line; CLP v2.0 clients remain
-   on the reliable path unchanged.
+   prototype and trace show the required behavior. M25 releases the result as
+   Chymeral and supported SDK `1.5.0` lines over CLP v2.1; CLP v2.0 clients
+   remain on the reliable path unchanged. The next SDK `2.0.0` line is reserved
+   for M26's separately validated platform expansion.
 
 ### Performance quality bar
 
@@ -1350,7 +1353,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 
 ## M24 — CLP Application Window Metadata
 
-**Status:** Planned
+**Status:** Complete (accepted 2026-10-22)
 
 ### Scope
 
@@ -1372,7 +1375,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
   or host filesystem paths supplied by an application.
 - Animated window icons or metadata ownership shared across sessions.
 
-### Planned protocol direction
+### Frozen protocol direction
 
 - The capability will provide a session-owned metadata update operation
   (candidate name: `set_window_metadata`) with optional title/name and icon
@@ -1390,6 +1393,27 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 - CLP v2.0 clients neither request nor depend on this capability and continue
   to receive Chymeral's existing title and icon behavior on an updated host.
 
+### Accepted implementation decisions
+
+- **Arbitration:** Every session retains its own metadata claim. The newest
+  successful nonempty claim is visible. Clearing or closing the active claim
+  restores the newest live remaining claim; when none remains, Chymeral uses
+  the terminal-derived title and bundled icon.
+- **Patch semantics:** `set_window_metadata` is an ordered CLP v2.1 command.
+  An omitted `title` or `icon` preserves that field, JSON `null` clears it,
+  and a successful nonempty update refreshes the claim's recency. Both fields
+  cleared remove the session claim. Titles are verbatim, nonempty Unicode of
+  at most 256 UTF-8 bytes and cannot contain control characters.
+- **Icon input:** `icon` is a session-owned static RGBA8 `image-N` handle, not
+  a path, URL, GIF, or standalone payload. It is limited to 256 × 256 pixels
+  and 256 KiB. A referenced icon cannot be removed until it is cleared or its
+  session ends.
+- **Backend feedback:** Native Wayland retains application titles but reports
+  `icon_supported: false`; Chymeral does not force X11. Windows and supported
+  Linux backends apply the dynamic icon and expose `icon_supported: true`.
+- **Diagnostics:** A host diagnostics title temporarily wins while diagnostics
+  are open, then normal active-claim arbitration resumes.
+
 ### Acceptance criteria
 
 - Capability negotiation, title/icon validation, limits, session ownership,
@@ -1405,3 +1429,140 @@ M20 must be complete and the v2.0 protocol contract must be stable.
   later sessions.
 - SDK examples demonstrate title-only metadata and title-plus-icon metadata
   without relying on platform-specific file paths.
+
+### Acceptance record
+
+- The core, Rust SDK, and Node SDK validation suites passed on the stable Rust
+  toolchain; the canonical CLP v2.1 fixture mirrors and SHA-256 checks match
+  byte-for-byte across all three repositories.
+- Manual Node SDK probe acceptance confirmed native title and dynamic icon
+  updates on Windows and on Linux forced to X11/Xwayland.
+- Manual native-Wayland acceptance confirmed title updates and deterministic
+  metadata restoration while reporting `icon_supported: false`, as documented.
+
+## M25 — v1.5.0 Release Integration
+
+**Status:** Complete — release-ready (validated 2026-10-22)
+
+### Scope
+
+- Publish the already accepted M23 frame-paced presentation and M24 application
+  window metadata capabilities; M25 is a user-visible feature release, not a
+  no-op packaging pass.
+- Align the Chymeral application, `chymeral-rust-sdk`, and
+  `@chymeral/node-sdk` on their respective `1.5.0` release lines while keeping
+  CLP at the compatible `v2.1` wire revision.
+- Finalize public manuals, changelogs, migration notes, release notes,
+  versioned fixture provenance, and reproducible portable artifacts.
+- Publish and verify Linux `x86_64` and Windows `x86_64` portable editions,
+  the Rust crate, and the Node package only after their independent release
+  quality gates pass.
+
+### Exclusions
+
+- No new CLP operations or behavior beyond the accepted M23/M24 contract.
+- No `winit` beta, local windowing fork, native-Wayland DnD implementation, or
+  outgoing desktop DnD. Those remain M26 work behind an upstream-stable gate.
+- No ARM64 artifact or support claim. Native ARM validation requires actual
+  hardware and is a future, separately scoped effort.
+- No SDK `2.0.0` release: that coordinated API generation is deliberately
+  deferred to M26.
+
+### Accepted release decisions
+
+- **Version matrix:** Chymeral `v1.5.0`, `chymeral-rust-sdk` `1.5.0`, and
+  `@chymeral/node-sdk` `1.5.0` expose CLP `v2.1`. The independently versioned
+  protocol does not change again during M25.
+- **Compatibility:** A v2.1 host continues to accept v2.0 clients without
+  granting `presentation` or `window_metadata`; v2.1 SDK capability feedback
+  remains the application-facing way to select the enhanced path.
+- **Artifact matrix:** The public binary release consists of Linux `x86_64`
+  and Windows `x86_64` portable ZIPs, their hashes, launchers, bundled icon,
+  and default configuration. The Linux launcher keeps the established X11/
+  Xwayland default; native Wayland remains usable when launched directly.
+- **Publication boundary:** Version bumps, tags, registry publication, GitHub
+  releases, and portable archives are executed only after all local and
+  cross-platform validation evidence is recorded. Credentials and publication
+  actions remain user-controlled.
+
+### Execution checklist
+
+1. Update application and SDK manifests, lockfiles where required, public
+   version references, changelogs, migration notes, and release descriptions.
+2. Run each repository's locked format, test, lint, documentation, package,
+   and release-build gates; verify the mirrored v2.1 fixture corpus and its
+   SHA-256 files remain byte-identical.
+3. Rebuild and manually validate the release candidates on Linux native
+   Wayland and forced X11/Xwayland, plus the Windows VM. Exercise a v2.0 client
+   fallback and both v2.1 capabilities on every applicable backend.
+4. Create the two portable `x86_64` archives from the validated binaries,
+   inspect their launchers/configuration/icons, generate hashes, and perform
+   a clean-directory smoke test for each platform.
+5. Publish core artifacts and release notes, then the matching Rust and Node
+   SDK `1.5.0` packages and releases; finally verify the public install and
+   compatibility instructions from a clean consumer environment.
+
+### Acceptance criteria
+
+- Public documentation describes `presentation` and `window_metadata` as
+  released CLP v2.1 features rather than development-preview behavior.
+- The three `1.5.0` releases agree on their required host/protocol versions,
+  capabilities, limits, fallback behavior, and migration guidance.
+- Linux and Windows portable ZIPs are self-contained, branded, hash-verified,
+  and successfully launch on their documented `x86_64` targets.
+- Core and both SDKs pass their release quality gates, conformance checks, and
+  the existing M23/M24 manual validation matrix without a regression.
+- The technical journal records the final versions, validation evidence,
+  artifact hashes, and any documented backend limitation before M25 is marked
+  complete.
+
+### Completion record
+
+- Locked formatting, test, lint, Rustdoc, package, and release-build gates
+  passed for the core and both SDKs. The three v2.1 fixture snapshots and their
+  SHA-256 manifests were byte-identical.
+- The final portable archives passed clean ZIP inspection and manual launch:
+  `chymeral-1.5.0-linux-x86_64-portable.zip` has SHA-256
+  `04bab1749a77e60b66a2b803b9e70868afe4d2852e6a70df6300062a2cf39e65`;
+  `chymeral-1.5.0-windows-x86_64-portable.zip` has SHA-256
+  `52d64ec1b944b80683147828004cb86484fd4043d7b427af72e2a30cb66640c6`.
+- Manual Node SDK probes accepted presentation and window metadata on Windows,
+  Linux forced to X11/Xwayland, and Linux native Wayland. Native Wayland
+  updates titles and explicitly reports dynamic icons unsupported; incoming
+  external file drops remain unavailable there by the existing M16 boundary.
+- Credential use, tags, registry publication, and GitHub release creation were
+  intentionally left to the repository owner after this release-ready state.
+
+## M26 — Stable Wayland Capability Upgrade and SDK 2.0
+
+**Status:** Deferred pending an upstream stable `winit` API
+
+### Entry gate
+
+- Begin only after a non-prerelease `winit` release provides the public,
+  maintained Wayland interfaces needed for the intended desktop-data-transfer
+  work and can be evaluated on real native-Wayland sessions.
+- Do not use a beta dependency, private API, forced Xwayland workaround, or
+  local `winit` fork merely to advance this milestone.
+
+### Intended scope after the gate is met
+
+- Upgrade the windowing stack deliberately and revalidate every existing
+  Linux, Windows, X11/Xwayland, and native-Wayland behavior.
+- Evaluate native-Wayland incoming external file drops, outgoing external DnD,
+  and dynamic application-icon support against the actual stable upstream API.
+  Only capabilities proven available and portable enough for a clear contract
+  become CLP features.
+- Freeze any resulting protocol/SDK changes with new fixtures, limits,
+  ownership rules, fallback feedback, and real-desktop validation.
+- Use that coherent capability expansion, rather than M25's compatible v2.1
+  release alone, as the trigger for the future Rust and Node SDK `2.0.0` line.
+
+### Non-commitments
+
+- M26 does not promise that every compositor will display a dynamic icon or
+  accept every desktop DnD form; those outcomes depend on the verified stable
+  API and compositor behavior.
+- Its protocol revision, exact SDK surface, release date, and ARM support are
+  intentionally undecided until the entry gate and implementation evidence
+  exist.

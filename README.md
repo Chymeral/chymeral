@@ -60,16 +60,16 @@ not become a host-loaded plugin.
   [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) for
   Node.js and TypeScript applications.
 
-## Development preview
+## Chymeral 1.5.0
 
-The released `1.0.0` line implements CLP `v2.0`. The current source tree also
-contains the in-progress M23 implementation for **CLP `v2.1`**: an opt-in
-`presentation` capability that coalesces bounded transient geometry packets at
-the renderer frame boundary. It leaves the acknowledged `set_node` control
-plane intact, accepts CLP v2.0 clients without the new capability, and is not
-yet part of a published portable edition. See the marked v2.1 section in the
-[Main Manual](Main_Manual.md#61-frame-paced-presentation-unreleased-clp-v21)
-and the [v2.1 fixture corpus](protocol/fixtures/v2.1/README.md).
+Chymeral `1.5.0` implements **CLP `v2.1`**, including an opt-in
+`presentation` capability for bounded transient geometry at the renderer frame
+boundary, plus session-owned `window_metadata` for native application titles
+and bounded static icons. Both leave the acknowledged `set_node` control plane
+intact. A v2.1 host continues to accept v2.0 clients without granting those
+new capabilities. See the v2.1 sections in the [Main Manual](Main_Manual.md)
+and the
+[v2.1 fixture corpus](protocol/fixtures/v2.1/README.md).
 
 ## Downloads
 
@@ -88,8 +88,9 @@ configuration and platform behavior.
 
 ## Build from source
 
-Building from source requires Rust `1.90` or newer. The repository pins
-`1.90.0` for reproducible local development. Build and launch with:
+Building from source requires Rust `1.90` or newer. The repository follows the
+current Rust `stable` channel for local development and verifies `1.90`
+separately in CI. Build and launch with:
 
 ```text
 cargo run --locked --release
@@ -125,8 +126,8 @@ may be relative to the configuration file.
   [npm](https://www.npmjs.com/package/@chymeral/node-sdk).
 - [CLP v2.0 fixture corpus](protocol/fixtures/v2.0/README.md) — portable,
   language-neutral framed-message vectors for SDK conformance work.
-- [CLP v2.1 presentation fixture corpus](protocol/fixtures/v2.1/README.md) —
-  development vectors for the M23 frame-presentation capability.
+- [CLP v2.1 fixture corpus](protocol/fixtures/v2.1/README.md) — versioned
+  conformance vectors for frame presentation and application window metadata.
 - [Contributing guide](CONTRIBUTING.md) — setup, checks, and protocol-change
   expectations for collaborators.
 - [Changelog](CHANGELOG.md) — released behavior and compatibility notes.
@@ -134,13 +135,15 @@ may be relative to the configuration file.
 
 ## Project state
 
-Chymeral `1.0.0` is the first stable release. It implements CLP v2.0 and is
-paired with two separate stable SDKs: the `chymeral-rust-sdk` `1.0.0` reference
-binding and the `@chymeral/node-sdk` `1.0.1` Node.js and TypeScript binding.
-These version lines are independent: the application is distributed as a
-terminal program, CLP is the language-neutral contract, and each SDK is one
-client implementation. Linux and Windows manual acceptance has passed, and
-portable editions are available from [GitHub Releases](https://github.com/Chymeral/chymeral/releases/latest).
+Chymeral `1.5.0` is the current stable release. It implements CLP v2.1 and is
+paired with the `chymeral-rust-sdk` `1.5.0` reference binding and the
+`@chymeral/node-sdk` `1.5.0` Node.js and TypeScript binding. These version
+lines are independent: the application is distributed as a terminal program,
+CLP is the language-neutral contract, and each SDK is one client
+implementation. Linux and Windows manual acceptance has passed, including
+native-Wayland title behavior and its documented dynamic-icon limitation.
+Portable editions are available from
+[GitHub Releases](https://github.com/Chymeral/chymeral/releases/latest).
 
 ## License
 

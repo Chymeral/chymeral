@@ -42,6 +42,7 @@ pub enum Capability {
     ExternalDrop,
     Text,
     Presentation,
+    WindowMetadata,
 }
 
 impl Capability {
@@ -55,6 +56,7 @@ impl Capability {
             Self::ExternalDrop => 1 << 5,
             Self::Text => 1 << 6,
             Self::Presentation => 1 << 7,
+            Self::WindowMetadata => 1 << 8,
         }
     }
 }
@@ -72,7 +74,8 @@ impl CapabilitySet {
             | Capability::Overlap.bit()
             | Capability::ExternalDrop.bit()
             | Capability::Text.bit()
-            | Capability::Presentation.bit(),
+            | Capability::Presentation.bit()
+            | Capability::WindowMetadata.bit(),
     );
 
     pub const fn from_capabilities(capabilities: &[Capability]) -> Self {
@@ -123,6 +126,17 @@ impl StartupCommand {
 pub struct ProgramInitContext {
     pub arguments: Vec<String>,
     pub initial_commands: Vec<StartupCommand>,
+    pub window_metadata: Option<WindowMetadataSupport>,
+}
+
+/// Host support details for the optional CLP window metadata capability.
+///
+/// Native Wayland backends can apply a program title but generally cannot set
+/// a taskbar icon through the portable window API, so icon support is reported
+/// separately rather than inferred from capability negotiation alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowMetadataSupport {
+    pub icon_supported: bool,
 }
 
 impl ProgramInitContext {
@@ -133,12 +147,28 @@ impl ProgramInitContext {
         Self {
             arguments: arguments.into_iter().collect(),
             initial_commands: initial_commands.into_iter().collect(),
+            window_metadata: None,
         }
+    }
+
+    pub const fn with_window_metadata_support(
+        mut self,
+        window_metadata: WindowMetadataSupport,
+    ) -> Self {
+        self.window_metadata = Some(window_metadata);
+        self
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(u64);
+
+impl SessionId {
+    #[cfg(test)]
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
 
 impl Display for SessionId {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -401,11 +431,13 @@ impl SessionManager {
 
         let session_id = self.allocate_session_id()?;
         let requested_capabilities = if hello.protocol_version.minor() < 1 {
-            // CLP v2.0 intentionally has no presentation lane even if a
-            // malformed or hand-written client includes its newer name.
+            // CLP v2.0 intentionally has neither the presentation lane nor
+            // window metadata, even if a malformed or hand-written client
+            // includes their newer names.
             hello
                 .requested_capabilities
                 .without(Capability::Presentation)
+                .without(Capability::WindowMetadata)
         } else {
             hello.requested_capabilities
         };
@@ -701,6 +733,7 @@ mod tests {
             Capability::Images,
             Capability::Text,
             Capability::Presentation,
+            Capability::WindowMetadata,
         ]);
         let (session_id, message) = manager
             .accept(
@@ -717,7 +750,9 @@ mod tests {
             HostMessage::Init(ProgramInit {
                 protocol_version: ProtocolVersion::new(2, 0),
                 session_id,
-                granted_capabilities: requested.without(Capability::Presentation),
+                granted_capabilities: requested
+                    .without(Capability::Presentation)
+                    .without(Capability::WindowMetadata),
                 context: ProgramInitContext::default(),
             })
         );
@@ -726,6 +761,12 @@ mod tests {
                 .session_capabilities(session_id)
                 .unwrap()
                 .contains(Capability::Presentation)
+        );
+        assert!(
+            !manager
+                .session_capabilities(session_id)
+                .unwrap()
+                .contains(Capability::WindowMetadata)
         );
     }
 

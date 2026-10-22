@@ -11,12 +11,16 @@ in other languages may speak CLP directly or use a conforming SDK.
 
 ## Development setup
 
-Chymeral supports Linux and Windows. The repository pins Rust `1.90.0` through
-`rust-toolchain.toml`; install it with Rustup if it is not already available:
+Chymeral supports Linux and Windows. The repository follows the current Rust
+`stable` channel through `rust-toolchain.toml`; install it with Rustup if it is
+not already available:
 
 ```text
-rustup toolchain install 1.90.0 --component rustfmt --component clippy
+rustup toolchain install stable --component rustfmt --component clippy --component rust-analyzer --component rust-src
 ```
+
+The minimum supported Rust version remains `1.90` and is verified separately
+in CI alongside the current stable compiler.
 
 Build and run the terminal with:
 

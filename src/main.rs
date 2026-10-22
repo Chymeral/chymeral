@@ -25,8 +25,8 @@ use chymeral::runtime::{
 };
 use chymeral::{
     external_drop::{ExternalFile, TerminalQuoting, format_terminal_paths},
-    program_scene::{ProgramSceneError, ProgramSceneResources},
-    protocol::{Capability, CapabilitySet, SessionId},
+    program_scene::{ImageHandle, ProgramSceneError, ProgramSceneResources, WindowIcon},
+    protocol::{Capability, CapabilitySet, ProgramInitContext, SessionId, WindowMetadataSupport},
     resources::{Texture as ResourceTexture, TextureId, TextureStore},
     scene::{
         ImageNode, NodeContent, NodeId, NodeProperties, Point, Rect, Scene, SceneLayer, Transform,
@@ -229,6 +229,8 @@ struct WindowStateOptions {
     testing_scene: Option<TestingScene>,
     diagnostics_shortcuts: DiagnosticsShortcuts,
     available_capabilities: CapabilitySet,
+    fallback_window_icon: Option<Icon>,
+    window_icon_supported: bool,
 }
 
 struct WindowState {
@@ -274,6 +276,10 @@ struct WindowState {
     text_buffer: Buffer,
     scene_text_renderers: HashMap<NodeId, TextRenderer>,
     scene_text_buffer: Buffer,
+    fallback_window_icon: Option<Icon>,
+    applied_window_title: String,
+    applied_window_icon: Option<ImageHandle>,
+    window_icon_supported: bool,
     window: Arc<Window>,
 }
 
@@ -290,6 +296,8 @@ impl WindowState {
             testing_scene,
             diagnostics_shortcuts,
             available_capabilities,
+            fallback_window_icon,
+            window_icon_supported,
         } = options;
         let physical_size = window.inner_size();
         let scale_factor = window.scale_factor();
@@ -304,9 +312,15 @@ impl WindowState {
             },
         );
         let clp_event_proxy = event_proxy.clone();
-        let clp_server = ClpServer::start_with_wake(available_capabilities, move || {
-            let _ = clp_event_proxy.send_event(UserEvent::ClpAction);
-        })?;
+        let clp_server = ClpServer::start_with_context_and_wake(
+            available_capabilities,
+            ProgramInitContext::default().with_window_metadata_support(WindowMetadataSupport {
+                icon_supported: window_icon_supported,
+            }),
+            move || {
+                let _ = clp_event_proxy.send_event(UserEvent::ClpAction);
+            },
+        )?;
         let pty = Pty::spawn(
             pty_size(columns, rows, physical_size),
             event_proxy,
@@ -467,6 +481,10 @@ impl WindowState {
             text_buffer,
             scene_text_renderers: HashMap::new(),
             scene_text_buffer,
+            fallback_window_icon,
+            applied_window_title: "Chymeral".to_owned(),
+            applied_window_icon: None,
+            window_icon_supported,
             window,
         };
         state
@@ -537,12 +555,62 @@ impl WindowState {
         self.text_buffer
             .shape_until_scroll(&mut self.font_system, false);
 
-        if self.terminal.title().is_empty() {
-            self.window.set_title("Chymeral");
+        self.sync_window_metadata();
+    }
+
+    fn sync_window_metadata(&mut self) {
+        let title = if self.diagnostics.is_active() {
+            "Chymeral — Diagnostics".to_owned()
+        } else if let Some(title) = self
+            .program_scene_resources
+            .active_window_metadata()
+            .and_then(|metadata| metadata.title())
+        {
+            title.to_owned()
         } else {
-            self.window
-                .set_title(&format!("Chymeral — {}", self.terminal.title()));
+            self.terminal_window_title()
+        };
+        if self.applied_window_title != title {
+            self.window.set_title(&title);
+            self.applied_window_title = title;
         }
+        self.sync_window_icon();
+    }
+
+    fn terminal_window_title(&self) -> String {
+        if self.terminal.title().is_empty() {
+            "Chymeral".to_owned()
+        } else {
+            format!("Chymeral — {}", self.terminal.title())
+        }
+    }
+
+    fn sync_window_icon(&mut self) {
+        if !self.window_icon_supported {
+            return;
+        }
+        let active_icon = self
+            .program_scene_resources
+            .active_window_metadata()
+            .and_then(|metadata| metadata.icon());
+        if self.applied_window_icon == active_icon {
+            return;
+        }
+        let icon = active_icon
+            .and_then(|_| {
+                self.program_scene_resources
+                    .active_window_icon(&self.textures)
+            })
+            .and_then(window_icon_from_metadata)
+            .or_else(|| self.fallback_window_icon.clone());
+        self.window.set_window_icon(icon.clone());
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::WindowExtWindows;
+
+            self.window.set_taskbar_icon(icon);
+        }
+        self.applied_window_icon = active_icon;
     }
 
     fn terminal_selection_rectangles(&self) -> Vec<Rect> {
@@ -603,7 +671,7 @@ impl WindowState {
         );
         self.text_buffer
             .shape_until_scroll(&mut self.font_system, false);
-        self.window.set_title("Chymeral — Diagnostics");
+        self.sync_window_metadata();
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -720,12 +788,19 @@ impl WindowState {
                 HostAction::Command(request) => {
                     let (session_id, _, command, response_sender) = (*request).into_parts();
                     let mutates_scene = command.is_mutating();
-                    let response = match self.program_scene_resources.execute_clp(
-                        session_id,
+                    let updates_window_metadata = matches!(
                         command,
-                        &mut self.scene,
-                        &mut self.textures,
-                    ) {
+                        chymeral::program_scene::ClpSceneCommand::SetWindowMetadata { .. }
+                    );
+                    let response = match self
+                        .program_scene_resources
+                        .execute_clp_with_window_icon_support(
+                            session_id,
+                            command,
+                            &mut self.scene,
+                            &mut self.textures,
+                            self.window_icon_supported,
+                        ) {
                         Ok(result) => {
                             if mutates_scene {
                                 if let Some(superseded) =
@@ -741,7 +816,10 @@ impl WindowState {
                             for event in self.program_scene_resources.drain_overlap_events() {
                                 self.enqueue_event(EngineEvent::Scene(event));
                             }
-                            scene_changed = true;
+                            if updates_window_metadata {
+                                self.sync_window_metadata();
+                            }
+                            scene_changed |= mutates_scene;
                             HostCommandResponse::Success(result)
                         }
                         Err(error) => HostCommandResponse::Error {
@@ -752,11 +830,14 @@ impl WindowState {
                     let _ = response_sender.send(response);
                 }
                 HostAction::Cleanup { session_id } => {
-                    self.program_scene_resources.cleanup_session(
+                    let metadata_changed = self.program_scene_resources.cleanup_session(
                         session_id,
                         &mut self.scene,
                         &mut self.textures,
                     );
+                    if metadata_changed {
+                        self.sync_window_metadata();
+                    }
                     self.pending_presentation_confirmations
                         .retain(|confirmation| confirmation.submission.session_id() != session_id);
                     scene_changed = true;
@@ -1743,6 +1824,7 @@ struct ChymeralApp {
     testing_scene: Option<TestingScene>,
     diagnostics_shortcuts: DiagnosticsShortcuts,
     available_capabilities: CapabilitySet,
+    window_icon_supported: bool,
 }
 
 impl ChymeralApp {
@@ -1753,6 +1835,7 @@ impl ChymeralApp {
         testing_scene: Option<TestingScene>,
         diagnostics_shortcuts: DiagnosticsShortcuts,
         available_capabilities: CapabilitySet,
+        window_icon_supported: bool,
     ) -> Self {
         Self {
             state: None,
@@ -1763,6 +1846,7 @@ impl ChymeralApp {
             testing_scene,
             diagnostics_shortcuts,
             available_capabilities,
+            window_icon_supported,
         }
     }
 
@@ -1780,6 +1864,7 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
         }
 
         let window_icon = bundled_window_icon();
+        let fallback_window_icon = window_icon.clone();
         let window_attributes = Window::default_attributes()
             .with_title("Chymeral")
             .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
@@ -1811,6 +1896,8 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
                 testing_scene: self.testing_scene.clone(),
                 diagnostics_shortcuts: self.diagnostics_shortcuts.clone(),
                 available_capabilities: self.available_capabilities,
+                fallback_window_icon,
+                window_icon_supported: self.window_icon_supported,
             },
         )) {
             Ok(state) => {
@@ -2035,9 +2122,13 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
         ProgramSceneError::ImageInUse(_)
         | ProgramSceneError::TextureInUse(_)
         | ProgramSceneError::AnimatedImageInUse(_) => "image_in_use",
+        ProgramSceneError::WindowIconMustBeStaticRgba8(_)
+        | ProgramSceneError::WindowMetadata(_) => "invalid_argument",
         ProgramSceneError::TextureLimitExceeded { .. }
         | ProgramSceneError::SessionTextureLimitExceeded { .. }
         | ProgramSceneError::TextureDimensionLimitExceeded { .. }
+        | ProgramSceneError::WindowIconDimensionLimitExceeded { .. }
+        | ProgramSceneError::WindowIconByteLimitExceeded { .. }
         | ProgramSceneError::OverlapNodeLimitExceeded { .. }
         | ProgramSceneError::TextLimitExceeded { .. }
         | ProgramSceneError::SessionTextLimitExceeded { .. }
@@ -2562,6 +2653,8 @@ fn main() -> Result<()> {
     let event_loop = create_event_loop()?;
     let external_drop_supported = platform_supports_external_drop(&event_loop);
     report_platform_external_drop_support(external_drop_supported);
+    let window_icon_supported = platform_supports_window_icon(&event_loop);
+    report_platform_window_icon_support(window_icon_supported);
     let mut app = ChymeralApp::new(
         event_loop.create_proxy(),
         loaded_config.appearance,
@@ -2569,6 +2662,7 @@ fn main() -> Result<()> {
         loaded_config.testing_scene,
         loaded_config.diagnostics,
         available_clp_capabilities(external_drop_supported),
+        window_icon_supported,
     );
     event_loop
         .run_app(&mut app)
@@ -2616,6 +2710,16 @@ fn bundled_window_icon() -> Option<Icon> {
     }
 }
 
+fn window_icon_from_metadata(icon: WindowIcon) -> Option<Icon> {
+    match Icon::from_rgba(icon.pixels, icon.width, icon.height) {
+        Ok(icon) => Some(icon),
+        Err(error) => {
+            eprintln!("Chymeral: could not create the CLP application icon: {error}");
+            None
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn force_x11_backend() -> bool {
     matches!(std::env::var(FORCE_X11_ENV).as_deref(), Ok("1"))
@@ -2628,8 +2732,20 @@ fn platform_supports_external_drop(event_loop: &EventLoop<UserEvent>) -> bool {
     !event_loop.is_wayland()
 }
 
+#[cfg(target_os = "linux")]
+fn platform_supports_window_icon(event_loop: &EventLoop<UserEvent>) -> bool {
+    use winit::platform::wayland::EventLoopExtWayland;
+
+    !event_loop.is_wayland()
+}
+
 #[cfg(target_os = "windows")]
 fn platform_supports_external_drop(_: &EventLoop<UserEvent>) -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn platform_supports_window_icon(_: &EventLoop<UserEvent>) -> bool {
     true
 }
 
@@ -2642,8 +2758,20 @@ fn report_platform_external_drop_support(external_drop_supported: bool) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn report_platform_window_icon_support(window_icon_supported: bool) {
+    if !window_icon_supported {
+        eprintln!(
+            "Chymeral: CLP application icons are unavailable on the active Wayland backend; application titles remain available"
+        );
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn report_platform_external_drop_support(_: bool) {}
+
+#[cfg(target_os = "windows")]
+fn report_platform_window_icon_support(_: bool) {}
 
 fn available_clp_capabilities(external_drop_supported: bool) -> CapabilitySet {
     if external_drop_supported {
