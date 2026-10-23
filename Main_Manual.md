@@ -72,10 +72,7 @@ cargo build --locked --release --all-targets
 
 On Linux, Chymeral starts the executable named by `CHYMERAL_SHELL`; otherwise it
 uses `$SHELL`, then `/bin/sh`. On Windows it uses `CHYMERAL_SHELL`, then
-`COMSPEC`, then `cmd.exe`. A `CHYMERAL_SHELL` path ending in `.cmd` or `.bat`
-is started through `COMSPEC /d /s /c`, allowing a conventional Windows launcher
-to be the direct shell of an application window. When that shell exits, Chymeral
-closes its window.
+`COMSPEC`, then `cmd.exe`. When that shell exits, Chymeral closes its window.
 
 The terminal provides a PTY-backed ANSI/VT grid with UTF-8 input, common
 control and navigation keys, terminal resizing, OSC 0/2 titles, alternate

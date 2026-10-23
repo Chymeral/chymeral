@@ -5,9 +5,6 @@ use std::{
     thread,
 };
 
-#[cfg(target_os = "windows")]
-use std::{ffi::OsStr, path::Path};
-
 use anyhow::{Context, Result};
 use chymeral::transport::SessionEnvironment;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -115,15 +112,7 @@ impl Pty {
 
 fn default_shell_command() -> CommandBuilder {
     if let Some(shell) = env::var_os("CHYMERAL_SHELL") {
-        #[cfg(target_os = "windows")]
-        {
-            return windows_shell_command(shell);
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            return CommandBuilder::new(shell);
-        }
+        return CommandBuilder::new(shell);
     }
 
     #[cfg(target_os = "windows")]
@@ -140,53 +129,8 @@ fn default_shell_command() -> CommandBuilder {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn windows_shell_command(shell: std::ffi::OsString) -> CommandBuilder {
-    if is_windows_command_script(&shell) {
-        let mut command =
-            CommandBuilder::new(env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()));
-        command.arg("/d");
-        command.arg("/s");
-        command.arg("/c");
-        command.arg(shell);
-        return command;
-    }
-
-    CommandBuilder::new(shell)
-}
-
-#[cfg(target_os = "windows")]
-fn is_windows_command_script(shell: &OsStr) -> bool {
-    Path::new(shell)
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-        })
-}
-
 impl Drop for Pty {
     fn drop(&mut self) {
         let _ = self.child_killer.kill();
-    }
-}
-
-#[cfg(all(test, target_os = "windows"))]
-mod tests {
-    use std::ffi::OsStr;
-
-    use super::is_windows_command_script;
-
-    #[test]
-    fn recognizes_conventional_windows_command_launchers() {
-        assert!(is_windows_command_script(OsStr::new(
-            r"C:\apps\foregit-session.cmd"
-        )));
-        assert!(is_windows_command_script(OsStr::new(
-            r"C:\apps\FOREgit.BAT"
-        )));
-        assert!(!is_windows_command_script(OsStr::new(
-            r"C:\apps\foregit.exe"
-        )));
     }
 }

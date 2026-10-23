@@ -98,9 +98,6 @@ cargo run --locked --release
 
 On Linux, Chymeral launches `CHYMERAL_SHELL`, then `$SHELL`, then `/bin/sh`.
 On Windows, it launches `CHYMERAL_SHELL`, then `COMSPEC`, then `cmd.exe`.
-When `CHYMERAL_SHELL` names a conventional `.cmd` or `.bat` launcher, Chymeral
-starts it through `COMSPEC /d /s /c` so it can serve as the direct shell of an
-application window.
 Normal terminal programs work without modification. A program launched *inside*
 that terminal can opt into CLP through an SDK or its own conforming client.
 
