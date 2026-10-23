@@ -6,6 +6,12 @@ the CLP protocol and language SDKs have independent version numbers.
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows `CHYMERAL_SHELL` values ending in `.cmd` or `.bat` now start through
+  `COMSPEC /d /s /c`, so conventional application launchers can serve as the
+  direct PTY shell instead of failing under `CreateProcessW`.
+
 ## [1.5.0] - 2026-10-22
 
 ### Added
