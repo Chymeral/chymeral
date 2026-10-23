@@ -13,6 +13,10 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 - `chymeral-rust-sdk` `1.5.0` and `@chymeral/node-sdk` `1.5.0` are the
   accepted release lines for the public CLP v2.1 APIs. Later protocol and SDK
   publications belong to their respective feature milestones.
+- M26 is the next unblocked milestone. Its batching capability necessarily
+  extends CLP and both supported SDKs, so its accepted publication target is
+  Chymeral `v1.7.0`, both SDKs `1.7.0`, and CLP `v2.4`; manifests remain at
+  their released versions until M26 is implemented and accepted.
 - No phase below has started unless its status explicitly says otherwise.
 
 ### M25 release record
@@ -29,7 +33,7 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 - These remain independent version lines: Chymeral and both supported SDKs use
   `1.5.0` for this coordinated feature release, while CLP `v2.1` is the
   compatible wire expansion. The coordinated Chymeral and SDK `2.0.0` release
-  belongs to M28, after the M26 platform work and M27 presentation work have
+  belongs to M28, after the M26 presentation work and M27 platform work have
   been independently accepted.
 
 ## How to maintain this record
@@ -1280,8 +1284,10 @@ M20 must be complete and the v2.0 protocol contract must be stable.
    eligible properties, completion semantics, and SDK APIs only after the host
    prototype and trace show the required behavior. M25 releases the result as
    Chymeral and supported SDK `1.5.0` lines over CLP v2.1; CLP v2.0 clients
-   remain on the reliable path unchanged. M26 and M27 may extend that baseline,
-   but their coordinated SDK `2.0.0` publication is reserved for M28.
+   remain on the reliable path unchanged. M26 is planned as the additive CLP
+   `v2.4` and coordinated `1.7.0` release, while M27 remains an independently
+   gated platform milestone. Their coordinated SDK `2.0.0` publication is
+   reserved for M28.
 
 ### Performance quality bar
 
@@ -1463,7 +1469,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 
 - No new CLP operations or behavior beyond the accepted M23/M24 contract.
 - No `winit` beta, local windowing fork, native-Wayland DnD implementation, or
-  outgoing desktop DnD. Those remain M26 work behind an upstream-stable gate.
+  outgoing desktop DnD. Those remain M27 work behind an upstream-stable gate.
 - No ARM64 artifact or support claim. Native ARM validation requires actual
   hardware and is a future, separately scoped effort.
 - No SDK `2.0.0` release: that coordinated API generation is deliberately
@@ -1534,45 +1540,9 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 - Credential use, tags, registry publication, and GitHub release creation were
   intentionally left to the repository owner after this release-ready state.
 
-## M26 — Stable Wayland Capability Upgrade
+## M26 — Batched Scene Construction and Atomic First Presentation
 
-**Status:** Deferred pending an upstream stable `winit` API
-
-### Entry gate
-
-- Begin only after a non-prerelease `winit` release provides the public,
-  maintained Wayland interfaces needed for the intended desktop-data-transfer
-  work and can be evaluated on real native-Wayland sessions.
-- Do not use a beta dependency, private API, forced Xwayland workaround, or
-  local `winit` fork merely to advance this milestone.
-
-### Intended scope after the gate is met
-
-- Upgrade the windowing stack deliberately and revalidate every existing
-  Linux, Windows, X11/Xwayland, and native-Wayland behavior.
-- Evaluate native-Wayland incoming external file drops, outgoing external DnD,
-  and dynamic application-icon support against the actual stable upstream API.
-  Only capabilities proven available and portable enough for a clear contract
-  become CLP features.
-- Freeze any resulting protocol/SDK changes with new fixtures, limits,
-  ownership rules, fallback feedback, and real-desktop validation.
-- Deliver accepted platform behavior as an independently validated capability
-  baseline for the later M28 coordinated release; M26 itself does not publish
-  Chymeral or the SDKs as `2.0.0`.
-
-### Non-commitments
-
-- M26 does not promise that every compositor will display a dynamic icon or
-  accept every desktop DnD form; those outcomes depend on the verified stable
-  API and compositor behavior.
-- Its protocol revision, exact SDK surface, release date, and ARM support are
-  intentionally undecided until the entry gate and implementation evidence
-  exist. Its accepted outcome informs M28 but does not by itself force a
-  product-major version bump.
-
-## M27 — Batched Scene Construction and Atomic First Presentation
-
-**Status:** Planned
+**Status:** Planned — next unblocked development milestone
 
 ### Scope
 
@@ -1592,11 +1562,24 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 
 M23's `presentation` mailbox is intentionally geometry-only and addresses
 continuous updates to an already retained scene. It does not create nodes and
-must not be widened implicitly to carry arbitrary structural work. M27 is a
+must not be widened implicitly to carry arbitrary structural work. M26 is a
 separate experience modernization: it targets the visible progressive assembly
 of a large client scene caused by serial, acknowledged node creation. It is not
 a correction to Chymeral's retained renderer or a substitute for the current
 robustness and conformance work.
+
+### Accepted release decision
+
+- M26 necessarily adds a negotiated CLP capability, wire fixtures, and public
+  Rust and Node.js/TypeScript helpers. Once its implementation and validation
+  are accepted, publish Chymeral `v1.7.0`, `chymeral-rust-sdk` `1.7.0`, and
+  `@chymeral/node-sdk` `1.7.0` over CLP `v2.4`.
+- The capability is additive: a v2.4 host continues to accept v2.1 clients,
+  and a client without the new capability retains the ordered sequential path.
+  No released manifest, package, or fixture version changes merely because this
+  roadmap decision exists.
+- M26 is intentionally independent of the stable-Wayland entry gate. It may
+  proceed now to support early application adoption without waiting for M27.
 
 ### Required guarantees
 
@@ -1639,6 +1622,48 @@ robustness and conformance work.
 - Documentation records that batching improves first-paint experience by
   reducing serial IPC round trips; it does not promise a fixed render time or
   hide slow application logic.
+
+## M27 — Stable Wayland Capability Upgrade
+
+**Status:** Deferred pending an upstream stable `winit` API
+
+### Entry gate
+
+- Begin only after a non-prerelease `winit` release provides the public,
+  maintained Wayland interfaces needed for the intended desktop-data-transfer
+  work and can be evaluated on real native-Wayland sessions.
+- Do not use a beta dependency, private API, forced Xwayland workaround, or
+  local `winit` fork merely to advance this milestone.
+
+### Intended scope after the gate is met
+
+- Upgrade the windowing stack deliberately and revalidate every existing
+  Linux, Windows, X11/Xwayland, and native-Wayland behavior.
+- Evaluate native-Wayland incoming external file drops, outgoing external DnD,
+  and dynamic application-icon support against the actual stable upstream API.
+  Only capabilities proven available and portable enough for a clear contract
+  become CLP features.
+- Freeze any resulting protocol/SDK changes with new fixtures, limits,
+  ownership rules, fallback feedback, and real-desktop validation.
+- Deliver accepted platform behavior as an independently validated capability
+  baseline for the later M28 coordinated release; M27 itself does not publish
+  Chymeral or the SDKs as `2.0.0`.
+
+### Release boundary
+
+- M27 follows M26 and does not implicitly revise the accepted M26 `1.7.0` /
+  CLP `v2.4` contract. Any later protocol or SDK version is decided only after
+  the stable upstream API and real-desktop behavior are known.
+
+### Non-commitments
+
+- M27 does not promise that every compositor will display a dynamic icon or
+  accept every desktop DnD form; those outcomes depend on the verified stable
+  API and compositor behavior.
+- Its protocol revision, exact SDK surface, release date, and ARM support are
+  intentionally undecided until the entry gate and implementation evidence
+  exist. Its accepted outcome informs M28 but does not by itself force a
+  product-major version bump.
 
 ## M28 — Chymeral 2.0 and SDK 2.0 Consolidation
 
