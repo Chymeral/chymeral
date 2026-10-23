@@ -28,8 +28,9 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
   hardware or reproducible validation matrix is available.
 - These remain independent version lines: Chymeral and both supported SDKs use
   `1.5.0` for this coordinated feature release, while CLP `v2.1` is the
-  compatible wire expansion. The future SDK `2.0.0` line is reserved for M26
-  rather than being implied by the v2.1 additions.
+  compatible wire expansion. The coordinated Chymeral and SDK `2.0.0` release
+  belongs to M28, after the M26 platform work and M27 presentation work have
+  been independently accepted.
 
 ## How to maintain this record
 
@@ -1279,8 +1280,8 @@ M20 must be complete and the v2.0 protocol contract must be stable.
    eligible properties, completion semantics, and SDK APIs only after the host
    prototype and trace show the required behavior. M25 releases the result as
    Chymeral and supported SDK `1.5.0` lines over CLP v2.1; CLP v2.0 clients
-   remain on the reliable path unchanged. The next SDK `2.0.0` line is reserved
-   for M26's separately validated platform expansion.
+   remain on the reliable path unchanged. M26 and M27 may extend that baseline,
+   but their coordinated SDK `2.0.0` publication is reserved for M28.
 
 ### Performance quality bar
 
@@ -1466,7 +1467,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 - No ARM64 artifact or support claim. Native ARM validation requires actual
   hardware and is a future, separately scoped effort.
 - No SDK `2.0.0` release: that coordinated API generation is deliberately
-  deferred to M26.
+  deferred to M28 after the separately validated M26 and M27 work.
 
 ### Accepted release decisions
 
@@ -1533,7 +1534,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 - Credential use, tags, registry publication, and GitHub release creation were
   intentionally left to the repository owner after this release-ready state.
 
-## M26 — Stable Wayland Capability Upgrade and SDK 2.0
+## M26 — Stable Wayland Capability Upgrade
 
 **Status:** Deferred pending an upstream stable `winit` API
 
@@ -1555,8 +1556,9 @@ M20 must be complete and the v2.0 protocol contract must be stable.
   become CLP features.
 - Freeze any resulting protocol/SDK changes with new fixtures, limits,
   ownership rules, fallback feedback, and real-desktop validation.
-- Use that coherent capability expansion, rather than M25's compatible v2.1
-  release alone, as the trigger for the future Rust and Node SDK `2.0.0` line.
+- Deliver accepted platform behavior as an independently validated capability
+  baseline for the later M28 coordinated release; M26 itself does not publish
+  Chymeral or the SDKs as `2.0.0`.
 
 ### Non-commitments
 
@@ -1565,4 +1567,163 @@ M20 must be complete and the v2.0 protocol contract must be stable.
   API and compositor behavior.
 - Its protocol revision, exact SDK surface, release date, and ARM support are
   intentionally undecided until the entry gate and implementation evidence
-  exist.
+  exist. Its accepted outcome informs M28 but does not by itself force a
+  product-major version bump.
+
+## M27 — Batched Scene Construction and Atomic First Presentation
+
+**Status:** Planned
+
+### Scope
+
+- Add a bounded, reliable way for a CLP client to describe an initial retained
+  scene or a structural scene revision as one validated unit.
+- Commit an accepted unit without exposing its intermediate node-by-node
+  construction to the user, then request one coherent first presentation.
+- Preserve the existing ordered `create_node` and `set_node` path as the
+  compatible, incremental control-plane fallback.
+- Expose an ergonomic helper through supported SDKs so applications do not
+  need to hand-roll a transport batch merely to avoid progressive first paint.
+- Measure application-to-host construction time separately from renderer
+  submission and physical scanout, using a representative multi-control CLP
+  application such as Foregit.
+
+### Rationale and boundary
+
+M23's `presentation` mailbox is intentionally geometry-only and addresses
+continuous updates to an already retained scene. It does not create nodes and
+must not be widened implicitly to carry arbitrary structural work. M27 is a
+separate experience modernization: it targets the visible progressive assembly
+of a large client scene caused by serial, acknowledged node creation. It is not
+a correction to Chymeral's retained renderer or a substitute for the current
+robustness and conformance work.
+
+### Required guarantees
+
+- Every staged operation is validated for capability, session ownership,
+  hierarchy, resource limits, and handle references before any part becomes
+  visible.
+- An invalid unit leaves the live scene unchanged; no partial tree, leaked
+  resource, or half-applied metadata may survive rejection.
+- A valid unit preserves deterministic parent/child paint order, sibling
+  ordering, clipping, alpha hit testing, overlap state, focus, and cleanup
+  semantics.
+- The host never weakens the existing ordered command guarantees for ordinary
+  mutations, discrete input, or session teardown.
+- Clients without the future capability remain fully functional through the
+  existing sequential CLP v2.1 path.
+
+### Decisions deferred to implementation
+
+- The wire operation name, protocol revision, maximum operation count, byte
+  limit, resource-accounting model, and whether a unit may include only
+  creation or also structural removals/reparenting.
+- Whether the host commits directly at the next renderer opportunity or stages
+  an accepted unit until an explicit present request; the resulting observable
+  status vocabulary must be precise and must not claim physical scanout.
+- The SDK surface: a declarative scene-tree builder, an explicit transaction,
+  or both. It must remain a client-library convenience rather than a host
+  widget or plugin system.
+
+### Acceptance criteria
+
+- A representative application can create its complete first scene without a
+  user-visible partial assembly of labels, controls, images, or decorative
+  layers.
+- Automated host tests prove all-or-nothing visibility, ownership isolation,
+  resource cleanup, malformed-unit rejection, and compatibility fallback.
+- Rust and Node SDK conformance suites exercise the same fixture corpus and
+  expose clear capability feedback when the host lacks the feature.
+- Linux X11/Xwayland, native Wayland, and Windows manual tests distinguish
+  initial construction latency from steady-state interaction latency.
+- Documentation records that batching improves first-paint experience by
+  reducing serial IPC round trips; it does not promise a fixed render time or
+  hide slow application logic.
+
+## M28 — Chymeral 2.0 and SDK 2.0 Consolidation
+
+**Status:** Planned; begins only after M26 and M27 are accepted
+
+### Scope
+
+- Consolidate the accepted platform and first-presentation work into the mature
+  retained-2D runtime baseline for Chymeral `2.0`.
+- Publish coordinated `2.0.0` releases of the supported Rust and Node SDKs,
+  with fixtures, documentation, examples, migration notes, and capability
+  feedback aligned to the accepted host contract.
+- Define a long-lived compatibility policy for the stable 2D runtime,
+  including how later optional capabilities can evolve without turning the
+  host into a widget toolkit or breaking existing CLP applications.
+- Revalidate the complete Linux and Windows matrix, including supported
+  Wayland, X11/Xwayland, and fallback behavior, before any public major
+  release claim.
+
+### Product boundary
+
+M28 establishes the definitive Chymeral 2D form: a conventional terminal with
+a reusable local graphical runtime, retained scene graph, resources, input,
+metadata, and explicit performance behavior. It does not claim that graphical
+work ends forever. Future technologies such as specialized visualization,
+shader, or three-dimensional capabilities must arrive as separately negotiated
+and versioned extensions rather than a rewrite of this baseline.
+
+### Acceptance criteria
+
+- Chymeral, the Rust SDK, and the Node SDK agree on the final version matrix,
+  supported CLP revisions, capability fallback, error vocabulary, limits, and
+  migration path from the `1.x` release lines.
+- The public contract is complete enough for third-party client libraries and
+  optional toolkits to build sophisticated compositions above SDK structures
+  without requiring host plugins or new core widget abstractions.
+- Release-quality conformance, security, regression, performance, packaging,
+  documentation, and real-desktop validation pass on the declared platforms.
+- The release notes distinguish the stable 2D baseline from later optional
+  graphical technologies and from terminal-experience work.
+
+## M29 — Terminal Sessions and Tabs
+
+**Status:** Planned after M28; intentionally a terminal-product milestone
+
+### Scope
+
+- Add host-managed tabs for convenient use of multiple conventional terminal
+  sessions within one Chymeral window.
+- Give each tab its own PTY, shell/process lifetime, terminal state, scrollback,
+  and associated CLP session when that session's process elects to use the
+  runtime.
+- Show the active tab's terminal and scene surface while preserving the existing
+  ability for its CLP application to cover the full Chymeral window and control
+  its title and icon where the platform permits.
+- Keep ordinary separate Chymeral windows as the simple answer when unrelated
+  processes should not be grouped in one terminal window.
+
+### Explicit non-goals
+
+- No nested application windows, host widget framework, client-controlled tab
+  manager, or new inter-session composition system.
+- No artificial containment that prevents an active CLP application from using
+  the full window surface or window metadata already granted to its session.
+- No promise of split panes, session orchestration, process supervision, or
+  workspace semantics; those require separate product decisions if ever needed.
+
+### Decisions deferred to implementation
+
+- Tab creation and close affordances, default shell/profile behavior, inactive
+  tab redraw policy, and whether closing a window with live sessions requires
+  confirmation.
+- The exact handoff rules for terminal-derived versus active-CLP window
+  metadata when changing tabs, including platform-specific icon fallbacks.
+- Whether M29 changes CLP at all; the default direction is to keep it a host
+  terminal feature rather than a new application-facing window-management API.
+
+### Acceptance criteria
+
+- Multiple tabs run independent conventional shell sessions without mixing
+  stdin, stdout, stderr, scrollback, resize state, CLP tokens, or scene
+  ownership.
+- Switching tabs reliably reveals the active terminal/scene surface and restores
+  terminal-derived or active-session branding deterministically.
+- Closing one tab cleans only its owned PTY, process, CLP session, scene nodes,
+  and resources; existing single-window close semantics remain predictable.
+- Linux and Windows manual tests cover ordinary shells, a full-window CLP
+  application, tab switching, background process behavior, and teardown.
