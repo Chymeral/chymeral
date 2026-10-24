@@ -1753,6 +1753,10 @@ src/
   `transport/framing.rs` owns bounded local-socket framing, while
   `program_scene/batch.rs` owns the M26 snapshot, rollback, alias validation,
   and commit path.
+- `transport/notifications.rs` owns per-session subscriptions, bounded queue
+  coalescing, delivery gaps, and metrics. The transport facade retains the
+  listener/session lifecycle and re-exports `ClpNotificationMetrics` at its
+  established path.
 - `program_scene/model.rs` is a real private module for scene handles,
   command/input types, patches, and errors. `program_scene.rs` re-exports the
   established public paths unchanged while retaining resource ownership and
