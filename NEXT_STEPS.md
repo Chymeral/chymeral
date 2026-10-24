@@ -1753,6 +1753,10 @@ src/
   `transport/framing.rs` owns bounded local-socket framing, while
   `program_scene/batch.rs` owns the M26 snapshot, rollback, alias validation,
   and commit path.
+- `program_scene/model.rs` is a real private module for scene handles,
+  command/input types, patches, and errors. `program_scene.rs` re-exports the
+  established public paths unchanged while retaining resource ownership and
+  execution in its facade.
 - The Rust SDK root remains its documented public surface. Its client, wire
   schema, framing, and private tests are source-separated while retaining the
   crate-root API and Rustdoc paths.

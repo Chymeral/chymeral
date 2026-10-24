@@ -10,6 +10,7 @@
 
     use super::*;
     use crate::protocol::SessionManager;
+    use crate::scene::Transform;
 
     fn session() -> SessionId {
         let mut manager = SessionManager::default();
