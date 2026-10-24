@@ -1761,6 +1761,10 @@ src/
   command/input types, patches, and errors. `program_scene.rs` re-exports the
   established public paths unchanged while retaining resource ownership and
   execution in its facade.
+- `program_scene/execution.rs` owns ordered CLP and legacy command execution
+  plus presentation commits. Batch execution reaches only its two retained
+  node helpers through parent-private visibility; resource ownership remains
+  outside the command-facing module.
 - The Rust SDK root remains its documented public surface. Its client, wire
   schema, framing, and private tests are source-separated while retaining the
   crate-root API and Rustdoc paths.
