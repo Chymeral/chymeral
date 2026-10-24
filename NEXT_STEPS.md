@@ -18,6 +18,9 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
   `v1.7.0`, both SDKs `1.7.0`, and CLP `v2.4`. The released `main` line remains
   at Chymeral and SDK `1.5.0` over CLP `v2.1` until a separately approved M26
   release is prepared.
+- M26.1 is the active internal maintainability pass after M26. It preserves
+  the accepted Chymeral `1.7.0`, SDK `1.7.0`, and CLP `v2.4` behavior while
+  improving source navigation, module boundaries, and rationale documentation.
 - No phase below has started unless its status explicitly says otherwise.
 
 ### M25 release record
@@ -1655,6 +1658,192 @@ robustness and conformance work.
   emits every queued CLP frame in bounded 512-byte chunks. The wire frame and
   its atomic result remain unchanged; a regression test verifies a large frame
   completes through a bounded transport.
+
+## M26.1 — Internal Maintainability Structure
+
+**Status:** In progress; internal-only, no protocol or public API change
+
+**Progress:** Baseline validation and the first core/SDK source extractions are
+complete. The remaining work continues through small mechanical moves only.
+
+### Purpose
+
+Make the core and supported SDKs easier to navigate, review, extend, and
+maintain without changing what a terminal user or CLP application observes.
+This is a structural maintenance pass, not a feature milestone and not a
+release-version change.
+
+### Non-negotiable invariants
+
+- Preserve the accepted CLP v2.4 wire form, capability negotiation, limits,
+  fixture bytes, SHA-256 manifests, and all current error semantics.
+- Preserve every public Rust and Node.js/TypeScript SDK export, method name,
+  type shape, validation rule, and documented fallback behavior.
+- Preserve terminal, scene, rendering, ownership, interaction, timing, and
+  platform behavior. No visual redesign, performance feature, dependency
+  upgrade, or new configuration setting belongs here.
+- Keep every extraction mechanical and independently reviewable. A commit may
+  move or clarify code, but it must not combine a refactor with a behavioral
+  change.
+- Retain current benchmark and regression coverage, including the real local
+  transport large-frame test introduced during M26.
+
+### Target source map
+
+The following is an intended ownership map, not a requirement to make every
+file equally small. A facade may remain where it improves discoverability.
+
+#### Chymeral core
+
+```text
+src/
+  transport.rs                 public host facade and narrow re-exports
+  transport/
+    framing.rs                 CLP length framing, nonblocking reads and writes
+    wire.rs                    private serde wire schema and conversions
+    notifications.rs           subscriptions, coalescing, delivery metrics
+    server.rs                  listener, lifecycle, session-running loop
+    tests.rs                   private transport unit and integration tests
+  program_scene.rs             public retained-scene facade and re-exports
+  program_scene/
+    model.rs                   handles, inputs, patches, commands, results
+    resources.rs               session ownership, quotas, images and cleanup
+    batch.rs                   validation snapshot, rollback and commit logic
+    execution.rs               ordinary command dispatch and presentation path
+    tests.rs                   private scene-resource and batch tests
+```
+
+`src/main.rs` remains intact during the initial pass. Its `winit` lifecycle,
+renderer setup, terminal integration, and platform hooks are closely coupled;
+it is reconsidered only after the two high-value core facades are stable.
+
+#### Rust SDK
+
+```text
+src/
+  lib.rs                       documented public facade and re-exports
+  types.rs                     public CLP model, handles and notifications
+  client.rs                    public Client lifecycle and command methods
+  wire.rs                      private serde wire schema and decoding
+  framing.rs                   local-socket framing and I/O resilience
+  tests.rs                     private unit tests
+```
+
+#### Node.js/TypeScript SDK
+
+```text
+src/
+  index.ts                     stable public export facade
+  types.ts                     public TypeScript contracts and limits
+  client.ts                    connection state, command scheduling and events
+  codec.ts                     CLP serialization and host-message decoding
+  validation.ts                input, handle and capability validation
+  transport.ts                 local-socket framing and I/O
+  scene-batch.ts               focused SceneBatch builder
+```
+
+### Current implementation record
+
+- The initial core extraction keeps the private wire schemas and exhaustive
+  unit suites as separately navigable source files without widening their
+  visibility. They are textually included by their existing private parent
+  module, so malformed-frame and ownership tests retain the same access they
+  had before the split.
+- Narrow runtime units with stable internal contracts are real private modules:
+  `transport/framing.rs` owns bounded local-socket framing, while
+  `program_scene/batch.rs` owns the M26 snapshot, rollback, alias validation,
+  and commit path.
+- The Rust SDK root remains its documented public surface. Its client, wire
+  schema, framing, and private tests are source-separated while retaining the
+  crate-root API and Rustdoc paths.
+- The Node.js SDK keeps `index.ts` as its only package entry point. The
+  `Client` now owns lifecycle and scheduling, while `codec.ts` owns private
+  CLP serialization, decoding, and validation. A later mechanical pass may
+  split validation further only if it produces a clearer dependency direction.
+- No extracted file is a newly supported import path or an addition to either
+  SDK's public API.
+
+### Execution order
+
+1. **Baseline and boundaries**
+   - Record the accepted validation commands and benchmark/probe baselines.
+   - Add concise module-level responsibility maps and invariant comments where
+     a subsystem boundary is non-obvious.
+   - Do not add explanatory comments that merely restate local code.
+
+2. **Private test extraction in the core**
+   - Move the `#[cfg(test)]` bodies from `transport.rs` and
+     `program_scene.rs` into sibling private test modules.
+   - Preserve private access through `use super::*`; do not convert unit tests
+     into weaker black-box tests merely to move files.
+   - Validate the full core suite before and after each extraction.
+
+3. **Core transport extraction**
+   - Extract framing first, then notification delivery, then the private wire
+     schema, and finally server/session execution.
+   - Keep `transport.rs` as the stable internal entry point for `ClpServer`,
+     `SessionEnvironment`, host actions, and notification metrics.
+   - Make queue bounds, ordering, close behavior, and Windows named-pipe
+     progress guarantees explicit at module boundaries.
+
+4. **Core retained-scene extraction**
+   - Extract public scene model types before resource ownership and execution.
+   - Isolate scene-batch transaction/rollback logic as a named internal unit.
+   - Keep ordinary command execution and presentation submission distinct;
+     neither becomes a hidden batch or renderer abstraction.
+
+5. **SDK internal extraction**
+   - Split the Rust SDK without altering its crate-root public API or Rustdoc
+     links.
+   - Split the Node SDK codec and validation code from client orchestration
+     without altering its package exports, generated declarations, or runtime
+     wire validation.
+   - Retain the vendored fixture corpus in each SDK so a checkout remains
+     independently testable offline.
+
+6. **Documentation and final review**
+   - Add English comments only for rationale: concurrency, ownership,
+     transaction boundaries, negotiated compatibility, platform constraints,
+     and deliberately bounded queues.
+   - Review naming, remove redundant helpers exposed by the extraction, and
+     ensure modules depend inward rather than forming circular responsibilities.
+   - Update `Technical_Journal.md` only with the final structural decisions,
+     not a transcription of every file move.
+
+### Review and validation gates
+
+Each extraction step must pass its repository's normal format, test, lint,
+documentation, and release-build/package checks. Before M26.1 is accepted:
+
+- The core CLP v2.4 fixtures and both SDK copies remain byte-identical with
+  matching SHA-256 manifests.
+- The complete core, Rust SDK, and Node SDK conformance suites pass without
+  changing expected wire transcripts.
+- Existing M23 presentation, M26 scene-batch, and large-frame transport
+  regressions remain covered and pass on Linux and Windows.
+- A reviewer can follow a request from public SDK method to wire frame, host
+  dispatch, scene mutation, and response without crossing unrelated concerns.
+- `git diff --check` is clean and commits are grouped by one structural move
+  rather than by broad rewrites.
+
+### Accepted documentation policy
+
+- Source comments and module docs are English, concise, and explain **why** an
+  invariant or platform rule exists.
+- Self-evident statements, line-by-line narration, and duplicated manual text
+  are not added to source files.
+- Public SDK documentation remains the source of API usage guidance;
+  `Main_Manual.md` remains the source of terminal and host behavior guidance.
+
+### Exclusions
+
+- No CLP revision, SDK version bump, release, migration guide, or portable
+  distribution change.
+- No M27 Wayland capability work, dependency upgrade, or workaround.
+- No M28 product consolidation, toolkit, widget abstraction, or new client
+  language support.
+- No Foregit changes; it is an independent application and may adopt the
+  resulting source conventions later.
 
 ## M27 — Stable Wayland Capability Upgrade
 
