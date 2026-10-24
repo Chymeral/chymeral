@@ -831,7 +831,7 @@
             name: "backpressure".to_owned(),
             payload: payload.clone(),
         }));
-        thread::sleep(WRITE_STALL_TIMEOUT + Duration::from_millis(250));
+        thread::sleep(framing::WRITE_STALL_TIMEOUT + Duration::from_millis(250));
 
         assert_eq!(server.session_count().unwrap(), 1);
         let event = receive_host(&mut client);

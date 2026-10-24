@@ -16,7 +16,7 @@ use serde::Serialize;
 use super::MAX_FRAME_BYTES;
 
 const WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
-const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) fn read_would_block(error: &io::Error) -> bool {
     if error.kind() == io::ErrorKind::WouldBlock {
