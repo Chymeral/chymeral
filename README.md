@@ -49,9 +49,9 @@ not become a host-loaded plugin.
   stacking, rectangles, unified RGBA8/GIF images, and intrinsic text nodes.
 - Alpha-aware image hit testing, hover, focus, drag-and-drop, passthrough
   overlays, and opt-in scene overlap detection.
-- CLP v2.0 over Unix-domain sockets on Linux and named pipes on Windows, with
-  per-window random tokens, capability negotiation, session ownership, and
-  bounded image and text resource use.
+- CLP v2.4 over Unix-domain sockets on Linux and named pipes on Windows, with
+  per-window random tokens, capability negotiation, session ownership, bounded
+  image and text resource use, and reliable atomic scene batches.
 - Program delivery for events, resize, tick, frame, lifecycle, closing, and
   overload recovery notifications.
 - Separate official client libraries: the
@@ -60,16 +60,19 @@ not become a host-loaded plugin.
   [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) for
   Node.js and TypeScript applications.
 
-## Chymeral 1.5.0
+## Development target: Chymeral 1.7.0
 
-Chymeral `1.5.0` implements **CLP `v2.1`**, including an opt-in
+The `current-dev` branch prepares Chymeral `1.7.0` with **CLP `v2.4`**. It
+retains the opt-in
 `presentation` capability for bounded transient geometry at the renderer frame
 boundary, plus session-owned `window_metadata` for native application titles
-and bounded static icons. Both leave the acknowledged `set_node` control plane
-intact. A v2.1 host continues to accept v2.0 clients without granting those
-new capabilities. See the v2.1 sections in the [Main Manual](Main_Manual.md)
-and the
-[v2.1 fixture corpus](protocol/fixtures/v2.1/README.md).
+and bounded static icons. The new `scene_batch` capability applies a bounded
+create/update/remove revision as one retained-scene state and requests one
+redraw; it does not promise display scanout timing. All three capabilities
+leave the acknowledged incremental `set_node` control plane intact. A v2.4
+host continues to accept v2.0 and v2.1 clients without granting later
+capabilities. See the v2.4 sections in the [Main Manual](Main_Manual.md) and
+the [v2.4 fixture corpus](protocol/fixtures/v2.4/README.md).
 
 ## Downloads
 
@@ -128,6 +131,8 @@ may be relative to the configuration file.
   language-neutral framed-message vectors for SDK conformance work.
 - [CLP v2.1 fixture corpus](protocol/fixtures/v2.1/README.md) — versioned
   conformance vectors for frame presentation and application window metadata.
+- [CLP v2.4 fixture corpus](protocol/fixtures/v2.4/README.md) — versioned
+  conformance vectors for reliable atomic scene batches.
 - [Contributing guide](CONTRIBUTING.md) — setup, checks, and protocol-change
   expectations for collaborators.
 - [Changelog](CHANGELOG.md) — released behavior and compatibility notes.
@@ -135,14 +140,13 @@ may be relative to the configuration file.
 
 ## Project state
 
-Chymeral `1.5.0` is the current stable release. It implements CLP v2.1 and is
-paired with the `chymeral-rust-sdk` `1.5.0` reference binding and the
-`@chymeral/node-sdk` `1.5.0` Node.js and TypeScript binding. These version
-lines are independent: the application is distributed as a terminal program,
+Chymeral `1.5.0` remains the current stable release on `main`. The
+`current-dev` branch prepares the independent `1.7.0` application and SDK
+lines over CLP v2.4. The application is distributed as a terminal program,
 CLP is the language-neutral contract, and each SDK is one client
-implementation. Linux and Windows manual acceptance has passed, including
-native-Wayland title behavior and its documented dynamic-icon limitation.
-Portable editions are available from
+implementation. Linux and Windows manual acceptance has passed for the stable
+line, including native-Wayland title behavior and its documented dynamic-icon
+limitation. Portable editions are available from
 [GitHub Releases](https://github.com/Chymeral/chymeral/releases/latest).
 
 ## License

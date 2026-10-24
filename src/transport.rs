@@ -32,9 +32,11 @@ use crate::{
     animated_image::MAX_ANIMATED_IMAGE_ENCODED_BYTES,
     program_scene::{
         ClpSceneCommand, ClpSceneCommandResult, ImageHandle, ImageUpload, MAX_PRESENTATION_UPDATES,
-        MAX_TEXTURE_BYTES, NodeChanges, NodeHandle, NodeInput, NodeParent, NodePropertiesInput,
-        NodePropertiesPatch, NodeVisualInput, PresentationPacket, PresentationPropertiesPatch,
-        PresentationUpdate, TextNodePropertiesInput,
+        MAX_SCENE_BATCH_BYTES, MAX_TEXTURE_BYTES, NodeChanges, NodeHandle, NodeInput, NodeParent,
+        NodePropertiesInput, NodePropertiesPatch, NodeVisualInput, PresentationPacket,
+        PresentationPropertiesPatch, PresentationUpdate, SceneBatchCreatedNode,
+        SceneBatchNodeChanges, SceneBatchNodeParent, SceneBatchNodeRef, SceneBatchOperation,
+        SceneBatchOperationResult, TextNodePropertiesInput,
     },
     resources::rgba8_byte_len,
     scene::{ImageContactShape, NodeId, SceneLayer},
@@ -57,6 +59,9 @@ const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ENDPOINT_BIND_ATTEMPTS: usize = 8;
 const MAX_HOST_NOTIFICATIONS_PER_ITERATION: usize = 4;
 const MAX_PENDING_RUNNING_OUTPUT_FRAMES: usize = MAX_HOST_NOTIFICATIONS_PER_ITERATION + 1;
+// Windows local named pipes use a 512-byte default output buffer. Capping each
+// nonblocking write preserves forward progress for larger CLP frames.
+const MAX_RUNNING_FRAME_WRITE_CHUNK_BYTES: usize = 512;
 const WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -1448,7 +1453,9 @@ impl RunningFrameWriter {
                     return Ok(());
                 };
                 while frame.written < frame.bytes.len() {
-                    match stream.write(&frame.bytes[frame.written..]) {
+                    let remaining = &frame.bytes[frame.written..];
+                    let chunk_len = remaining.len().min(MAX_RUNNING_FRAME_WRITE_CHUNK_BYTES);
+                    match stream.write(&remaining[..chunk_len]) {
                         Ok(0) => return Ok(()),
                         Ok(count) => frame.written += count,
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1583,6 +1590,18 @@ fn run_running_session(
                     code: "invalid_command".to_owned(),
                     message: "a scene command requires a non-empty request_id".to_owned(),
                 });
+                continue;
+            }
+            if command.is_scene_batch() && payload.len() > MAX_SCENE_BATCH_BYTES {
+                let _ = writer.queue(&command_response_message(
+                    &request_id,
+                    HostCommandResponse::Error {
+                        code: "resource_limit",
+                        message: format!(
+                            "a scene batch may not exceed {MAX_SCENE_BATCH_BYTES} bytes"
+                        ),
+                    },
+                ));
                 continue;
             }
             if !wire_command_is_granted(&command, granted_capabilities) {
@@ -2086,6 +2105,17 @@ fn read_binary_upload(
 
 fn wire_command_is_granted(command: &WireSceneCommand, capabilities: CapabilitySet) -> bool {
     match command {
+        WireSceneCommand::SceneBatch { operations } => {
+            capabilities.contains(Capability::Scene)
+                && capabilities.contains(Capability::SceneBatch)
+                && operations.iter().all(|operation| {
+                    (!operation.uses_image() || capabilities.contains(Capability::Images))
+                        && (!operation.uses_text() || capabilities.contains(Capability::Text))
+                        && (!operation.uses_overlap() || capabilities.contains(Capability::Overlap))
+                        && (!operation.uses_external_drop()
+                            || capabilities.contains(Capability::ExternalDrop))
+                })
+        }
         WireSceneCommand::UploadImage { .. } | WireSceneCommand::RemoveImage { .. } => {
             capabilities.contains(Capability::Images)
         }
@@ -2467,6 +2497,9 @@ enum WireClientMessage {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum WireSceneCommand {
+    SceneBatch {
+        operations: Vec<WireSceneBatchOperation>,
+    },
     CreateNode {
         #[serde(default)]
         parent: Option<String>,
@@ -2546,6 +2579,10 @@ where
 }
 
 impl WireSceneCommand {
+    const fn is_scene_batch(&self) -> bool {
+        matches!(self, Self::SceneBatch { .. })
+    }
+
     fn upload_length(&self) -> Result<Option<usize>> {
         match self {
             Self::UploadImage { source } => source.upload_length().map(Some),
@@ -2555,6 +2592,12 @@ impl WireSceneCommand {
 
     fn into_clp_scene_command(self, pixels: Option<Vec<u8>>) -> Result<ClpSceneCommand> {
         match self {
+            Self::SceneBatch { operations } => Ok(ClpSceneCommand::SceneBatch {
+                operations: operations
+                    .into_iter()
+                    .map(WireSceneBatchOperation::into_input)
+                    .collect::<Result<Vec<_>>>()?,
+            }),
             Self::CreateNode {
                 parent,
                 layer,
@@ -2601,6 +2644,168 @@ impl WireSceneCommand {
                     },
                 },
             }),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum WireSceneBatchNodeRef {
+    Handle(String),
+    Alias { alias: String },
+}
+
+impl WireSceneBatchNodeRef {
+    fn into_input(self) -> Result<SceneBatchNodeRef> {
+        match self {
+            Self::Handle(handle) => Ok(SceneBatchNodeRef::Handle(parse_node_handle(&handle)?)),
+            Self::Alias { alias } => Ok(SceneBatchNodeRef::Alias(alias)),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireSceneBatchNodeParent {
+    Root,
+    Node { node: WireSceneBatchNodeRef },
+}
+
+impl WireSceneBatchNodeParent {
+    fn into_input(self) -> Result<SceneBatchNodeParent> {
+        match self {
+            Self::Root => Ok(SceneBatchNodeParent::Root),
+            Self::Node { node } => Ok(SceneBatchNodeParent::Node(node.into_input()?)),
+        }
+    }
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct WireSceneBatchNodeChanges {
+    #[serde(default)]
+    properties: Option<WireNodePropertiesPatch>,
+    #[serde(default)]
+    parent: Option<WireSceneBatchNodeParent>,
+    #[serde(default)]
+    layer: Option<WireSceneLayer>,
+    #[serde(default)]
+    visual: Option<WireNodeVisual>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    text_style: Option<WireTextStyle>,
+}
+
+impl WireSceneBatchNodeChanges {
+    fn into_input(self) -> Result<SceneBatchNodeChanges> {
+        Ok(SceneBatchNodeChanges {
+            properties: self.properties.map(WireNodePropertiesPatch::into_patch),
+            parent: self
+                .parent
+                .map(WireSceneBatchNodeParent::into_input)
+                .transpose()?,
+            layer: self.layer.map(WireSceneLayer::into_scene),
+            visual: self.visual.map(WireNodeVisual::into_input).transpose()?,
+            text: self.text,
+            text_style: self.text_style.map(WireTextStyle::into_scene),
+        })
+    }
+
+    fn uses_image(&self) -> bool {
+        self.visual.as_ref().is_some_and(WireNodeVisual::uses_image)
+    }
+
+    const fn uses_text(&self) -> bool {
+        self.text.is_some() || self.text_style.is_some()
+    }
+
+    fn uses_overlap(&self) -> bool {
+        self.properties
+            .as_ref()
+            .is_some_and(|properties| properties.overlap_enabled.is_some())
+    }
+
+    fn uses_external_drop(&self) -> bool {
+        self.properties
+            .as_ref()
+            .is_some_and(|properties| properties.external_drop_enabled.is_some())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum WireSceneBatchOperation {
+    #[serde(rename = "create_node")]
+    Create {
+        alias: String,
+        #[serde(default)]
+        parent: Option<WireSceneBatchNodeRef>,
+        #[serde(default)]
+        layer: Option<WireSceneLayer>,
+        node: WireNodeInput,
+    },
+    #[serde(rename = "set_node")]
+    Set {
+        node: WireSceneBatchNodeRef,
+        changes: WireSceneBatchNodeChanges,
+    },
+    #[serde(rename = "remove_node")]
+    Remove { node: WireSceneBatchNodeRef },
+}
+
+impl WireSceneBatchOperation {
+    fn into_input(self) -> Result<SceneBatchOperation> {
+        match self {
+            Self::Create {
+                alias,
+                parent,
+                layer,
+                node,
+            } => Ok(SceneBatchOperation::CreateNode {
+                alias,
+                parent: parent.map(WireSceneBatchNodeRef::into_input).transpose()?,
+                layer: layer.map(WireSceneLayer::into_scene),
+                node: node.into_input()?,
+            }),
+            Self::Set { node, changes } => Ok(SceneBatchOperation::SetNode {
+                node: node.into_input()?,
+                changes: changes.into_input()?,
+            }),
+            Self::Remove { node } => Ok(SceneBatchOperation::RemoveNode {
+                node: node.into_input()?,
+            }),
+        }
+    }
+
+    fn uses_image(&self) -> bool {
+        match self {
+            Self::Create { node, .. } => node.uses_image(),
+            Self::Set { changes, .. } => changes.uses_image(),
+            Self::Remove { .. } => false,
+        }
+    }
+
+    const fn uses_text(&self) -> bool {
+        match self {
+            Self::Create { node, .. } => node.uses_text(),
+            Self::Set { changes, .. } => changes.uses_text(),
+            Self::Remove { .. } => false,
+        }
+    }
+
+    fn uses_overlap(&self) -> bool {
+        match self {
+            Self::Create { node, .. } => node.uses_overlap(),
+            Self::Set { changes, .. } => changes.uses_overlap(),
+            Self::Remove { .. } => false,
+        }
+    }
+
+    fn uses_external_drop(&self) -> bool {
+        match self {
+            Self::Create { node, .. } => node.uses_external_drop(),
+            Self::Set { changes, .. } => changes.uses_external_drop(),
+            Self::Remove { .. } => false,
         }
     }
 }
@@ -3164,6 +3369,7 @@ enum WireCapability {
     Text,
     Presentation,
     WindowMetadata,
+    SceneBatch,
 }
 
 impl WireCapability {
@@ -3178,6 +3384,7 @@ impl WireCapability {
             Self::Text => Capability::Text,
             Self::Presentation => Capability::Presentation,
             Self::WindowMetadata => Capability::WindowMetadata,
+            Self::SceneBatch => Capability::SceneBatch,
         }
     }
 }
@@ -3194,6 +3401,7 @@ impl From<Capability> for WireCapability {
             Capability::Text => Self::Text,
             Capability::Presentation => Self::Presentation,
             Capability::WindowMetadata => Self::WindowMetadata,
+            Capability::SceneBatch => Self::SceneBatch,
         }
     }
 }
@@ -4000,6 +4208,10 @@ impl From<FocusEvent> for WireFocusState {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireCommandResult {
+    SceneBatch {
+        nodes: BTreeMap<String, WireSceneBatchCreatedNode>,
+        operations: Vec<WireSceneBatchOperationResult>,
+    },
     Node {
         node: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -4024,9 +4236,58 @@ enum WireCommandResult {
     Acknowledged,
 }
 
+#[derive(Serialize)]
+struct WireSceneBatchCreatedNode {
+    node: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text_metrics: Option<WireTextMetrics>,
+}
+
+impl From<SceneBatchCreatedNode> for WireSceneBatchCreatedNode {
+    fn from(node: SceneBatchCreatedNode) -> Self {
+        Self {
+            node: node.node.to_string(),
+            text_metrics: node.text_metrics.map(Into::into),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireSceneBatchOperationResult {
+    Created {
+        alias: String,
+    },
+    Updated {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text_metrics: Option<WireTextMetrics>,
+    },
+    Removed,
+}
+
+impl From<SceneBatchOperationResult> for WireSceneBatchOperationResult {
+    fn from(result: SceneBatchOperationResult) -> Self {
+        match result {
+            SceneBatchOperationResult::Created { alias } => Self::Created { alias },
+            SceneBatchOperationResult::Updated { text_metrics } => Self::Updated {
+                text_metrics: text_metrics.map(Into::into),
+            },
+            SceneBatchOperationResult::Removed => Self::Removed,
+        }
+    }
+}
+
 impl From<ClpSceneCommandResult> for WireCommandResult {
     fn from(result: ClpSceneCommandResult) -> Self {
         match result {
+            ClpSceneCommandResult::SceneBatch(batch) => Self::SceneBatch {
+                nodes: batch
+                    .nodes
+                    .into_iter()
+                    .map(|(alias, node)| (alias, node.into()))
+                    .collect(),
+                operations: batch.operations.into_iter().map(Into::into).collect(),
+            },
             ClpSceneCommandResult::Node { node, text_metrics } => Self::Node {
                 node: node.to_string(),
                 text_metrics: text_metrics.map(Into::into),
@@ -4156,6 +4417,7 @@ fn capabilities_to_wire(capabilities: CapabilitySet) -> Vec<WireCapability> {
         Capability::Text,
         Capability::Presentation,
         Capability::WindowMetadata,
+        Capability::SceneBatch,
     ]
     .into_iter()
     .filter(|capability| capabilities.contains(*capability))
@@ -4237,15 +4499,24 @@ impl From<SessionCloseReason> for WireCloseReason {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::mpsc,
+    };
 
-    use interprocess::local_socket::{GenericNamespaced, ToNsName, prelude::LocalSocketStream};
+    use interprocess::{
+        TryClone as _,
+        local_socket::{GenericNamespaced, ToNsName, prelude::LocalSocketStream},
+    };
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
 
-    use crate::protocol::{ClientHello, ProgramInitContext, SessionManager};
     use crate::runtime::KeyEvent;
+    use crate::{
+        program_scene::SceneBatchResult,
+        protocol::{ClientHello, ProgramInitContext, SessionManager},
+    };
 
     use super::*;
 
@@ -4572,6 +4843,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validates_the_canonical_clp_v2_4_scene_batch_fixture_corpus() {
+        let fixture_bytes = include_bytes!("../protocol/fixtures/v2.4/fixtures.json");
+        let expected_hash = include_str!("../protocol/fixtures/v2.4/SHA256SUMS")
+            .split_whitespace()
+            .next()
+            .expect("fixture SHA256SUMS must contain a checksum");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fixture_bytes)),
+            expected_hash
+        );
+
+        let corpus: FixtureCorpus =
+            serde_json::from_str(include_str!("../protocol/fixtures/v2.4/fixtures.json"))
+                .expect("the CLP v2.4 fixture corpus must be valid JSON");
+        assert_eq!(corpus.format, "chymeral-clp-fixture-corpus");
+        assert_eq!(corpus.fixture_version, 1);
+        assert_eq!((corpus.protocol.major, corpus.protocol.minor), (2, 4));
+        assert_eq!(
+            corpus.transport.length_prefix,
+            "unsigned 32-bit big-endian payload length including the one-byte discriminator"
+        );
+        assert_eq!(corpus.transport.json_discriminator, "J");
+        assert_eq!(corpus.transport.binary_discriminator, "B");
+        assert_eq!(corpus.transport.maximum_frame_bytes, MAX_FRAME_BYTES);
+
+        let mut vector_ids = BTreeSet::new();
+        let mut client_message_types = BTreeSet::new();
+        let mut host_message_types = BTreeSet::new();
+        let mut scene_batch_count = 0;
+        for vector in corpus.vectors {
+            assert!(!vector.id.is_empty());
+            assert!(!vector.description.is_empty());
+            assert!(vector_ids.insert(vector.id));
+
+            let mut pending_request_ids = BTreeSet::new();
+            for frame in vector.frames {
+                match (frame.direction, frame.kind) {
+                    (FixtureDirection::ClientToHost, FixtureFrameKind::Json) => {
+                        assert!(frame.bytes_hex.is_none());
+                        let message = frame.message.expect("JSON frames need a message");
+                        let message_type = fixture_message_type(&message);
+                        client_message_types.insert(message_type.to_owned());
+                        let message: WireClientMessage = serde_json::from_value(message)
+                            .expect("client fixture messages must match the CLP wire type");
+                        if let WireClientMessage::Command {
+                            request_id,
+                            command,
+                        } = message
+                        {
+                            assert!(
+                                pending_request_ids.insert(request_id),
+                                "fixture command request IDs must be unique within a vector"
+                            );
+                            assert_eq!(command.upload_length().unwrap(), None);
+                            if let WireSceneCommand::SceneBatch { operations } = command.as_ref() {
+                                scene_batch_count += 1;
+                                assert_eq!(operations.len(), 5);
+                            }
+                        }
+                    }
+                    (FixtureDirection::HostToClient, FixtureFrameKind::Json) => {
+                        assert!(frame.bytes_hex.is_none());
+                        let message = frame.message.expect("JSON frames need a message");
+                        let message_type = fixture_host_message_type(&message);
+                        host_message_types.insert(message_type.to_owned());
+                        if matches!(message_type, "result" | "command_error") {
+                            let request_id = message
+                                .as_object()
+                                .and_then(|message| message.get("request_id"))
+                                .and_then(Value::as_str)
+                                .expect("command responses need a string request_id");
+                            assert!(
+                                pending_request_ids.remove(request_id),
+                                "fixture command response must follow its request in the same vector"
+                            );
+                        }
+                        if message_type == "result" {
+                            assert_eq!(message["result"]["kind"], "scene_batch");
+                            assert!(message["result"]["nodes"].get("temporary").is_none());
+                            assert_eq!(
+                                message["result"]["operations"].as_array().unwrap().len(),
+                                5
+                            );
+                        }
+                    }
+                    (FixtureDirection::ClientToHost, FixtureFrameKind::Binary)
+                    | (FixtureDirection::HostToClient, FixtureFrameKind::Binary) => {
+                        panic!("CLP v2.4 scene-batch fixtures do not use binary frames")
+                    }
+                }
+            }
+            assert!(
+                pending_request_ids.is_empty(),
+                "fixture vectors must not leave commands without a response"
+            );
+        }
+
+        assert_eq!(
+            vector_ids,
+            ["atomic-scene-batch"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert_eq!(scene_batch_count, 1);
+        assert_eq!(
+            client_message_types,
+            ["close", "command", "hello", "init_complete", "started"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert_eq!(
+            host_message_types,
+            ["closed", "init", "result", "start"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
     fn fixture_message_type(message: &Value) -> &str {
         message
             .as_object()
@@ -4655,6 +5048,7 @@ mod tests {
                     "text" => WireCapability::Text,
                     "presentation" => WireCapability::Presentation,
                     "window_metadata" => WireCapability::WindowMetadata,
+                    "scene_batch" => WireCapability::SceneBatch,
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -4668,6 +5062,27 @@ mod tests {
     struct IntermittentWriter {
         bytes: Vec<u8>,
         write_attempts: usize,
+    }
+
+    struct BoundedWriter {
+        bytes: Vec<u8>,
+        maximum_write_size: usize,
+        largest_write: usize,
+    }
+
+    impl Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.largest_write = self.largest_write.max(bytes.len());
+            if bytes.len() > self.maximum_write_size {
+                return Ok(0);
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl Write for IntermittentWriter {
@@ -4726,6 +5141,28 @@ mod tests {
         }
 
         assert_eq!(writer.bytes, expected);
+    }
+
+    #[test]
+    fn fragments_large_queued_output_for_bounded_transports() {
+        let message = json!({
+            "type": "result",
+            "payload": "x".repeat(MAX_RUNNING_FRAME_WRITE_CHUNK_BYTES * 3),
+        });
+        let expected = json_frame_bytes(&message).unwrap();
+        let mut frames = RunningFrameWriter::default();
+        frames.queue(&message).unwrap();
+        let mut writer = BoundedWriter {
+            bytes: Vec::new(),
+            maximum_write_size: MAX_RUNNING_FRAME_WRITE_CHUNK_BYTES,
+            largest_write: 0,
+        };
+
+        frames.flush(&mut writer).unwrap();
+
+        assert!(frames.is_empty());
+        assert_eq!(writer.bytes, expected);
+        assert_eq!(writer.largest_write, MAX_RUNNING_FRAME_WRITE_CHUNK_BYTES);
     }
 
     #[test]
@@ -4886,6 +5323,30 @@ mod tests {
 
     fn receive_host(stream: &mut LocalSocketStream) -> Value {
         receive_host_with_reader(stream, &mut FrameReader::default())
+    }
+
+    fn receive_host_async(
+        stream: &LocalSocketStream,
+    ) -> (
+        mpsc::Receiver<Result<Value, String>>,
+        thread::JoinHandle<()>,
+    ) {
+        let mut reader = stream.try_clone().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let join_handle = thread::spawn(move || {
+            let message = match FrameReader::default().read_next(&mut reader, None, None) {
+                Ok(FrameRead::Message(message)) => Ok(message),
+                Ok(FrameRead::Disconnected) => {
+                    Err("the CLP server disconnected before replying".to_owned())
+                }
+                Ok(FrameRead::Shutdown) => {
+                    Err("a standalone CLP client cannot receive host shutdown".to_owned())
+                }
+                Err(error) => Err(format!("could not read the CLP host response: {error:#}")),
+            };
+            let _ = sender.send(message);
+        });
+        (receiver, join_handle)
     }
 
     fn receive_host_with_reader(
@@ -6054,6 +6515,402 @@ mod tests {
 
         send_client(&mut client, WireClientMessage::Close);
         let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn forwards_scene_batches_and_serializes_their_atomic_result() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(
+            &mut client,
+            hello(&server, vec!["scene", "text", "scene_batch"]),
+        );
+        let init = receive_host(&mut client);
+        assert_eq!(
+            init["capabilities"],
+            json!(["scene", "text", "scene_batch"])
+        );
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "build-panel".to_owned(),
+                command: Box::new(WireSceneCommand::SceneBatch {
+                    operations: vec![
+                        WireSceneBatchOperation::Create {
+                            alias: "panel".to_owned(),
+                            parent: None,
+                            layer: Some(WireSceneLayer::Overlay),
+                            node: WireNodeInput::Rectangle {
+                                properties: WireNodeProperties {
+                                    x: 8.0,
+                                    y: 12.0,
+                                    width: 240.0,
+                                    height: 120.0,
+                                    visible: true,
+                                    clip_children: false,
+                                    z_index: 3,
+                                    overlap_enabled: false,
+                                    external_drop_enabled: false,
+                                    input_passthrough: false,
+                                },
+                                color: [36, 88, 216, 255],
+                            },
+                        },
+                        WireSceneBatchOperation::Create {
+                            alias: "label".to_owned(),
+                            parent: Some(WireSceneBatchNodeRef::Alias {
+                                alias: "panel".to_owned(),
+                            }),
+                            layer: None,
+                            node: WireNodeInput::Text {
+                                properties: WireTextNodeProperties {
+                                    x: 16.0,
+                                    y: 24.0,
+                                    visible: true,
+                                    clip_children: false,
+                                    z_index: 0,
+                                    overlap_enabled: false,
+                                    external_drop_enabled: false,
+                                    input_passthrough: false,
+                                },
+                                text: "Ready".to_owned(),
+                                style: WireTextStyle::default(),
+                            },
+                        },
+                        WireSceneBatchOperation::Set {
+                            node: WireSceneBatchNodeRef::Alias {
+                                alias: "panel".to_owned(),
+                            },
+                            changes: WireSceneBatchNodeChanges {
+                                properties: Some(WireNodePropertiesPatch {
+                                    x: Some(20.0),
+                                    y: None,
+                                    width: None,
+                                    height: None,
+                                    visible: None,
+                                    clip_children: Some(true),
+                                    z_index: None,
+                                    overlap_enabled: None,
+                                    external_drop_enabled: None,
+                                    input_passthrough: None,
+                                }),
+                                ..WireSceneBatchNodeChanges::default()
+                            },
+                        },
+                    ],
+                }),
+            },
+        );
+
+        let request = wait_for_host_command(&server);
+        assert_eq!(request.request_id, "build-panel");
+        assert_eq!(
+            request.command,
+            ClpSceneCommand::SceneBatch {
+                operations: vec![
+                    SceneBatchOperation::CreateNode {
+                        alias: "panel".to_owned(),
+                        parent: None,
+                        layer: Some(SceneLayer::Overlay),
+                        node: NodeInput::Rectangle {
+                            properties: NodePropertiesInput {
+                                x: 8.0,
+                                y: 12.0,
+                                width: 240.0,
+                                height: 120.0,
+                                visible: true,
+                                clip_children: false,
+                                z_index: 3,
+                                overlap_enabled: false,
+                                external_drop_enabled: false,
+                                input_passthrough: false,
+                            },
+                            color: [36, 88, 216, 255],
+                        },
+                    },
+                    SceneBatchOperation::CreateNode {
+                        alias: "label".to_owned(),
+                        parent: Some(SceneBatchNodeRef::Alias("panel".to_owned())),
+                        layer: None,
+                        node: NodeInput::Text {
+                            properties: TextNodePropertiesInput {
+                                x: 16.0,
+                                y: 24.0,
+                                visible: true,
+                                clip_children: false,
+                                z_index: 0,
+                                overlap_enabled: false,
+                                external_drop_enabled: false,
+                                input_passthrough: false,
+                            },
+                            text: "Ready".to_owned(),
+                            style: TextStyle::default(),
+                        },
+                    },
+                    SceneBatchOperation::SetNode {
+                        node: SceneBatchNodeRef::Alias("panel".to_owned()),
+                        changes: SceneBatchNodeChanges {
+                            properties: Some(NodePropertiesPatch {
+                                x: Some(20.0),
+                                clip_children: Some(true),
+                                ..NodePropertiesPatch::default()
+                            }),
+                            ..SceneBatchNodeChanges::default()
+                        },
+                    },
+                ],
+            }
+        );
+        request.respond(HostCommandResponse::Success(
+            ClpSceneCommandResult::SceneBatch(SceneBatchResult {
+                nodes: BTreeMap::from([
+                    (
+                        "label".to_owned(),
+                        SceneBatchCreatedNode {
+                            node: NodeHandle::new(2),
+                            text_metrics: Some(TextMetrics {
+                                columns: 5,
+                                rows: 1,
+                                width: 48.0,
+                                height: 20.0,
+                                cells: 5,
+                            }),
+                        },
+                    ),
+                    (
+                        "panel".to_owned(),
+                        SceneBatchCreatedNode {
+                            node: NodeHandle::new(1),
+                            text_metrics: None,
+                        },
+                    ),
+                ]),
+                operations: vec![
+                    SceneBatchOperationResult::Created {
+                        alias: "panel".to_owned(),
+                    },
+                    SceneBatchOperationResult::Created {
+                        alias: "label".to_owned(),
+                    },
+                    SceneBatchOperationResult::Updated { text_metrics: None },
+                ],
+            }),
+        ));
+
+        let result = receive_host(&mut client);
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["request_id"], "build-panel");
+        assert_eq!(
+            result["result"],
+            json!({
+                "kind": "scene_batch",
+                "nodes": {
+                    "label": {
+                        "node": "node-2",
+                        "text_metrics": {
+                            "columns": 5,
+                            "rows": 1,
+                            "width": 48.0,
+                            "height": 20.0,
+                        },
+                    },
+                    "panel": { "node": "node-1" },
+                },
+                "operations": [
+                    { "kind": "created", "alias": "panel" },
+                    { "kind": "created", "alias": "label" },
+                    { "kind": "updated" },
+                ],
+            })
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let _ = receive_host(&mut client);
+    }
+
+    #[test]
+    fn delivers_large_scene_batch_results_over_the_real_local_transport() {
+        const LARGE_BATCH_NODE_COUNT: u64 = 16;
+
+        let mut server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut client = connect(&server);
+        send_client(&mut client, hello(&server, vec!["scene", "scene_batch"]));
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut client);
+        send_client(&mut client, WireClientMessage::Started);
+
+        send_client(
+            &mut client,
+            WireClientMessage::Command {
+                request_id: "large-scene-batch".to_owned(),
+                command: Box::new(WireSceneCommand::SceneBatch {
+                    operations: vec![WireSceneBatchOperation::Remove {
+                        node: WireSceneBatchNodeRef::Handle("node-1".to_owned()),
+                    }],
+                }),
+            },
+        );
+
+        let request = wait_for_host_command(&server);
+        assert_eq!(request.request_id, "large-scene-batch");
+        let batch = SceneBatchResult {
+            nodes: (0..LARGE_BATCH_NODE_COUNT)
+                .map(|index| {
+                    let alias = format!("node-{index:02}-large-pipe");
+                    (
+                        alias.clone(),
+                        SceneBatchCreatedNode {
+                            node: NodeHandle::new(index + 1),
+                            text_metrics: None,
+                        },
+                    )
+                })
+                .collect(),
+            operations: (0..LARGE_BATCH_NODE_COUNT)
+                .map(|index| SceneBatchOperationResult::Created {
+                    alias: format!("node-{index:02}-large-pipe"),
+                })
+                .collect(),
+        };
+        let response = HostCommandResponse::Success(ClpSceneCommandResult::SceneBatch(batch));
+        let response_frame = json_frame_bytes(&command_response_message(
+            &request.request_id,
+            response.clone(),
+        ))
+        .unwrap();
+        assert!(
+            response_frame.len() > MAX_RUNNING_FRAME_WRITE_CHUNK_BYTES,
+            "the regression response must exceed the Windows named-pipe output buffer"
+        );
+        let (response_receiver, response_reader) = receive_host_async(&client);
+        request.respond(response);
+
+        let result = match response_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                response_reader.join().unwrap();
+                panic!("the CLP server could not deliver the large response: {error}");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                server.shutdown();
+                response_reader.join().unwrap();
+                panic!("the CLP server did not deliver the large response before the deadline");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                response_reader.join().unwrap();
+                panic!("the CLP response reader stopped before reporting a result");
+            }
+        };
+        response_reader.join().unwrap();
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["request_id"], "large-scene-batch");
+        assert_eq!(result["result"]["kind"], "scene_batch");
+        assert_eq!(
+            result["result"]["nodes"].as_object().unwrap().len(),
+            LARGE_BATCH_NODE_COUNT as usize
+        );
+        assert_eq!(
+            result["result"]["operations"].as_array().unwrap().len(),
+            LARGE_BATCH_NODE_COUNT as usize
+        );
+        assert_eq!(
+            result["result"]["nodes"]["node-15-large-pipe"]["node"],
+            "node-16"
+        );
+
+        send_client(&mut client, WireClientMessage::Close);
+        let closed = receive_host(&mut client);
+        assert_eq!(closed["type"], "closed");
+        wait_for_session_count(&server, 0);
+    }
+
+    #[test]
+    fn rejects_scene_batches_without_their_capability_or_with_an_oversized_envelope() {
+        let server = ClpServer::start(CapabilitySet::ALL).unwrap();
+        let mut denied_client = connect(&server);
+        send_client(&mut denied_client, hello(&server, vec!["scene"]));
+        let _ = receive_host(&mut denied_client);
+        send_client(&mut denied_client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut denied_client);
+        send_client(&mut denied_client, WireClientMessage::Started);
+        send_client(
+            &mut denied_client,
+            WireClientMessage::Command {
+                request_id: "denied-batch".to_owned(),
+                command: Box::new(WireSceneCommand::SceneBatch {
+                    operations: vec![WireSceneBatchOperation::Remove {
+                        node: WireSceneBatchNodeRef::Handle("node-1".to_owned()),
+                    }],
+                }),
+            },
+        );
+        let denied = receive_host(&mut denied_client);
+        assert_eq!(denied["type"], "command_error");
+        assert_eq!(denied["request_id"], "denied-batch");
+        assert_eq!(denied["code"], "capability_denied");
+        assert!(
+            !server
+                .drain_host_actions()
+                .into_iter()
+                .any(|action| matches!(action, HostAction::Command(_)))
+        );
+        send_client(&mut denied_client, WireClientMessage::Close);
+        let _ = receive_host(&mut denied_client);
+
+        let mut oversized_client = connect(&server);
+        send_client(
+            &mut oversized_client,
+            hello(&server, vec!["scene", "scene_batch"]),
+        );
+        let _ = receive_host(&mut oversized_client);
+        send_client(&mut oversized_client, WireClientMessage::InitComplete);
+        let _ = receive_host(&mut oversized_client);
+        send_client(&mut oversized_client, WireClientMessage::Started);
+        send_client(
+            &mut oversized_client,
+            WireClientMessage::Command {
+                request_id: "oversized-batch".to_owned(),
+                command: Box::new(WireSceneCommand::SceneBatch {
+                    operations: vec![WireSceneBatchOperation::Create {
+                        alias: "x".repeat(MAX_SCENE_BATCH_BYTES),
+                        parent: None,
+                        layer: Some(WireSceneLayer::Overlay),
+                        node: WireNodeInput::Empty {
+                            properties: WireNodeProperties {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 1.0,
+                                height: 1.0,
+                                visible: true,
+                                clip_children: false,
+                                z_index: 0,
+                                overlap_enabled: false,
+                                external_drop_enabled: false,
+                                input_passthrough: false,
+                            },
+                        },
+                    }],
+                }),
+            },
+        );
+        let oversized = receive_host(&mut oversized_client);
+        assert_eq!(oversized["type"], "command_error");
+        assert_eq!(oversized["request_id"], "oversized-batch");
+        assert_eq!(oversized["code"], "resource_limit");
+        assert!(
+            !server
+                .drain_host_actions()
+                .into_iter()
+                .any(|action| matches!(action, HostAction::Command(_)))
+        );
+
+        send_client(&mut oversized_client, WireClientMessage::Close);
+        let _ = receive_host(&mut oversized_client);
     }
 
     #[test]

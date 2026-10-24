@@ -29,6 +29,12 @@ pub const MAX_SESSION_TEXT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SESSION_TEXT_CELLS: usize = 1024 * 1024;
 pub const MAX_SESSION_TEXT_NODES: usize = 1024;
 pub const MAX_PRESENTATION_UPDATES: usize = 256;
+/// Maximum number of structural operations in one atomic CLP scene batch.
+pub const MAX_SCENE_BATCH_OPERATIONS: usize = 512;
+/// Maximum UTF-8 byte length of the JSON command envelope for one scene batch.
+pub const MAX_SCENE_BATCH_BYTES: usize = 512 * 1024;
+/// Maximum UTF-8 byte length of one batch-local node alias.
+pub const MAX_SCENE_BATCH_ALIAS_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeHandle(u64);
@@ -257,6 +263,85 @@ pub struct PresentationPacket {
     pub updates: Vec<PresentationUpdate>,
 }
 
+/// A reference used only while applying one atomic CLP scene batch.
+///
+/// Existing node handles remain session-owned and opaque. Aliases are local to
+/// the batch and may only refer to a node created by an earlier operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SceneBatchNodeRef {
+    Handle(NodeHandle),
+    Alias(String),
+}
+
+/// A structural parent relation used by a batch node update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SceneBatchNodeParent {
+    Root,
+    Node(SceneBatchNodeRef),
+}
+
+/// Partial node changes accepted inside an atomic CLP scene batch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SceneBatchNodeChanges {
+    pub properties: Option<NodePropertiesPatch>,
+    pub parent: Option<SceneBatchNodeParent>,
+    pub layer: Option<SceneLayer>,
+    pub visual: Option<NodeVisualInput>,
+    pub text: Option<String>,
+    pub text_style: Option<TextStyle>,
+}
+
+/// One ordered structural operation in an atomic CLP scene batch.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SceneBatchOperation {
+    CreateNode {
+        alias: String,
+        parent: Option<SceneBatchNodeRef>,
+        layer: Option<SceneLayer>,
+        node: NodeInput,
+    },
+    SetNode {
+        node: SceneBatchNodeRef,
+        changes: SceneBatchNodeChanges,
+    },
+    RemoveNode {
+        node: SceneBatchNodeRef,
+    },
+}
+
+impl SceneBatchOperation {
+    fn created_alias(&self) -> Option<&str> {
+        match self {
+            Self::CreateNode { alias, .. } => Some(alias),
+            Self::SetNode { .. } | Self::RemoveNode { .. } => None,
+        }
+    }
+}
+
+/// One created node returned by a successful atomic scene batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneBatchCreatedNode {
+    pub node: NodeHandle,
+    pub text_metrics: Option<TextMetrics>,
+}
+
+/// Outcome of one ordered operation in a successful atomic scene batch.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SceneBatchOperationResult {
+    Created { alias: String },
+    Updated { text_metrics: Option<TextMetrics> },
+    Removed,
+}
+
+/// Result of a successful atomic CLP scene batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneBatchResult {
+    /// Every retained batch alias and its opaque host node handle.
+    pub nodes: BTreeMap<String, SceneBatchCreatedNode>,
+    /// Ordered outcomes aligned with the submitted operations.
+    pub operations: Vec<SceneBatchOperationResult>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ContentInput {
     Empty,
@@ -347,6 +432,9 @@ pub struct WindowIcon {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClpSceneCommand {
+    SceneBatch {
+        operations: Vec<SceneBatchOperation>,
+    },
     CreateNode {
         parent: Option<NodeHandle>,
         layer: Option<SceneLayer>,
@@ -385,7 +473,8 @@ impl ClpSceneCommand {
     pub const fn is_mutating(&self) -> bool {
         matches!(
             self,
-            Self::CreateNode { .. }
+            Self::SceneBatch { .. }
+                | Self::CreateNode { .. }
                 | Self::SetNode { .. }
                 | Self::RemoveNode { .. }
                 | Self::UploadImage { .. }
@@ -396,6 +485,7 @@ impl ClpSceneCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClpSceneCommandResult {
+    SceneBatch(SceneBatchResult),
     Node {
         node: NodeHandle,
         text_metrics: Option<TextMetrics>,
@@ -495,6 +585,19 @@ pub enum SceneCommandResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProgramSceneError {
+    SceneBatchEmpty,
+    SceneBatchOperationLimitExceeded {
+        limit: usize,
+    },
+    SceneBatchAliasInvalid(&'static str),
+    SceneBatchAliasDuplicate(String),
+    SceneBatchAliasUnknown(String),
+    SceneBatchAliasRemoved(String),
+    SceneBatchOperation {
+        index: usize,
+        alias: Option<String>,
+        source: Box<ProgramSceneError>,
+    },
     InvalidNodeHandle(NodeHandle),
     InvalidImageHandle(ImageHandle),
     InvalidTextureHandle(TextureHandle),
@@ -502,14 +605,24 @@ pub enum ProgramSceneError {
     HandleNotOwned,
     ImageInUse(ImageHandle),
     WindowIconMustBeStaticRgba8(ImageHandle),
-    WindowIconDimensionLimitExceeded { limit: u32 },
-    WindowIconByteLimitExceeded { limit: usize },
+    WindowIconDimensionLimitExceeded {
+        limit: u32,
+    },
+    WindowIconByteLimitExceeded {
+        limit: usize,
+    },
     WindowMetadata(WindowMetadataError),
     TextureInUse(TextureHandle),
     AnimatedImageInUse(AnimatedImageHandle),
-    TextureDimensionLimitExceeded { limit: u32 },
-    TextureLimitExceeded { limit: usize },
-    SessionTextureLimitExceeded { limit: usize },
+    TextureDimensionLimitExceeded {
+        limit: u32,
+    },
+    TextureLimitExceeded {
+        limit: usize,
+    },
+    SessionTextureLimitExceeded {
+        limit: usize,
+    },
     Geometry(crate::scene::GeometryError),
     Scene(crate::scene::SceneError),
     Image(crate::scene::ImageNodeError),
@@ -521,11 +634,21 @@ pub enum ProgramSceneError {
     TextContentRequiresTextCommands(NodeHandle),
     NodeKindMismatch(NodeHandle),
     InvalidNodeChange(&'static str),
-    TextLimitExceeded { limit: usize },
-    SessionTextLimitExceeded { limit: usize },
-    SessionTextNodeLimitExceeded { limit: usize },
-    OverlapNodeLimitExceeded { limit: usize },
-    PresentationUpdateLimitExceeded { limit: usize },
+    TextLimitExceeded {
+        limit: usize,
+    },
+    SessionTextLimitExceeded {
+        limit: usize,
+    },
+    SessionTextNodeLimitExceeded {
+        limit: usize,
+    },
+    OverlapNodeLimitExceeded {
+        limit: usize,
+    },
+    PresentationUpdateLimitExceeded {
+        limit: usize,
+    },
     DuplicatePresentationNode(NodeHandle),
     InvalidPresentationUpdate(&'static str),
     HandleExhausted,
@@ -534,6 +657,50 @@ pub enum ProgramSceneError {
 impl Display for ProgramSceneError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SceneBatchEmpty => {
+                formatter.write_str("a scene batch must contain at least one operation")
+            }
+            Self::SceneBatchOperationLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "a scene batch may contain at most {limit} operations"
+                )
+            }
+            Self::SceneBatchAliasInvalid(reason) => {
+                write!(formatter, "a scene batch alias is invalid: {reason}")
+            }
+            Self::SceneBatchAliasDuplicate(alias) => {
+                write!(
+                    formatter,
+                    "the scene batch alias {alias:?} is declared more than once"
+                )
+            }
+            Self::SceneBatchAliasUnknown(alias) => {
+                write!(
+                    formatter,
+                    "the scene batch alias {alias:?} has not been declared"
+                )
+            }
+            Self::SceneBatchAliasRemoved(alias) => {
+                write!(
+                    formatter,
+                    "the scene batch alias {alias:?} does not retain a node"
+                )
+            }
+            Self::SceneBatchOperation {
+                index,
+                alias,
+                source,
+            } => {
+                if let Some(alias) = alias {
+                    write!(
+                        formatter,
+                        "scene batch operation {index} for alias {alias:?} failed: {source}"
+                    )
+                } else {
+                    write!(formatter, "scene batch operation {index} failed: {source}")
+                }
+            }
             Self::InvalidNodeHandle(handle) => write!(formatter, "{handle} is not valid"),
             Self::InvalidImageHandle(handle) => write!(formatter, "{handle} is not valid"),
             Self::InvalidTextureHandle(handle) => write!(formatter, "{handle} is not valid"),
@@ -722,6 +889,38 @@ struct OverlapPair {
     second: NodeHandle,
 }
 
+/// The portion of retained program-scene state that structural batch commands
+/// are allowed to mutate. Image uploads, animation decoding, and native window
+/// metadata intentionally remain outside M26 batches, so their stores do not
+/// need to be copied or rolled back here.
+struct SceneBatchSnapshot {
+    scene: Scene,
+    next_node_handle: u64,
+    nodes: BTreeMap<NodeHandle, OwnedNode>,
+    overlap_pairs: BTreeSet<OverlapPair>,
+    pending_overlap_events: Vec<SceneEvent>,
+}
+
+impl SceneBatchSnapshot {
+    fn capture(resources: &ProgramSceneResources, scene: &Scene) -> Self {
+        Self {
+            scene: scene.clone(),
+            next_node_handle: resources.next_node_handle,
+            nodes: resources.nodes.clone(),
+            overlap_pairs: resources.overlap_pairs.clone(),
+            pending_overlap_events: resources.pending_overlap_events.clone(),
+        }
+    }
+
+    fn restore(self, resources: &mut ProgramSceneResources, scene: &mut Scene) {
+        *scene = self.scene;
+        resources.next_node_handle = self.next_node_handle;
+        resources.nodes = self.nodes;
+        resources.overlap_pairs = self.overlap_pairs;
+        resources.pending_overlap_events = self.pending_overlap_events;
+    }
+}
+
 impl OverlapPair {
     fn new(session: SessionId, first: NodeHandle, second: NodeHandle) -> Self {
         debug_assert_ne!(first, second);
@@ -784,6 +983,9 @@ impl ProgramSceneResources {
         window_icon_supported: bool,
     ) -> Result<ClpSceneCommandResult, ProgramSceneError> {
         match command {
+            ClpSceneCommand::SceneBatch { operations } => Ok(ClpSceneCommandResult::SceneBatch(
+                self.execute_scene_batch(session, operations, scene, textures)?,
+            )),
             ClpSceneCommand::CreateNode {
                 parent,
                 layer,
@@ -887,6 +1089,207 @@ impl ProgramSceneResources {
                 })
             }
         }
+    }
+
+    /// Applies a bounded structural command sequence without allowing an
+    /// incomplete intermediate scene to escape the host event turn.
+    ///
+    /// Every individual operation still uses the established ownership and
+    /// scene validation path. A snapshot restores the retained state and
+    /// handle allocator if any operation fails. Overlap state is reset to its
+    /// pre-batch snapshot and reconciled once against the final scene, so the
+    /// client observes only the atomic transition rather than transient pairs.
+    fn execute_scene_batch(
+        &mut self,
+        session: SessionId,
+        operations: Vec<SceneBatchOperation>,
+        scene: &mut Scene,
+        textures: &mut TextureStore,
+    ) -> Result<SceneBatchResult, ProgramSceneError> {
+        if operations.is_empty() {
+            return Err(ProgramSceneError::SceneBatchEmpty);
+        }
+        if operations.len() > MAX_SCENE_BATCH_OPERATIONS {
+            return Err(ProgramSceneError::SceneBatchOperationLimitExceeded {
+                limit: MAX_SCENE_BATCH_OPERATIONS,
+            });
+        }
+
+        let operation_count = operations.len();
+        let snapshot = SceneBatchSnapshot::capture(self, scene);
+        let result = (|| {
+            let mut aliases = BTreeMap::new();
+            let mut nodes = BTreeMap::new();
+            let mut results = Vec::with_capacity(operation_count);
+
+            for (index, operation) in operations.into_iter().enumerate() {
+                let alias = operation.created_alias().map(str::to_owned);
+                let result = (|| -> Result<SceneBatchOperationResult, ProgramSceneError> {
+                    Ok(match operation {
+                        SceneBatchOperation::CreateNode {
+                            alias,
+                            parent,
+                            layer,
+                            node,
+                        } => {
+                            self.validate_scene_batch_alias(&alias)?;
+                            if aliases.contains_key(&alias) {
+                                return Err(ProgramSceneError::SceneBatchAliasDuplicate(alias));
+                            }
+                            let parent = parent
+                                .as_ref()
+                                .map(|parent| {
+                                    self.resolve_scene_batch_node(session, parent, &aliases)
+                                })
+                                .transpose()?;
+                            let ClpSceneCommandResult::Node { node, text_metrics } = self
+                                .create_clp_node(session, parent, layer, node, scene, textures)?
+                            else {
+                                unreachable!("creating a CLP node returns a node result")
+                            };
+                            aliases.insert(alias.clone(), node);
+                            nodes.insert(
+                                alias.clone(),
+                                SceneBatchCreatedNode { node, text_metrics },
+                            );
+                            SceneBatchOperationResult::Created { alias }
+                        }
+                        SceneBatchOperation::SetNode { node, changes } => {
+                            let node = self.resolve_scene_batch_node(session, &node, &aliases)?;
+                            let changes =
+                                self.resolve_scene_batch_changes(session, changes, &aliases)?;
+                            let ClpSceneCommandResult::NodeUpdated { text_metrics } =
+                                self.set_clp_node(session, node, changes, scene, textures)?
+                            else {
+                                unreachable!("updating a CLP node returns an update result")
+                            };
+                            SceneBatchOperationResult::Updated { text_metrics }
+                        }
+                        SceneBatchOperation::RemoveNode { node } => {
+                            let node = self.resolve_scene_batch_node(session, &node, &aliases)?;
+                            self.execute(
+                                session,
+                                SceneCommand::RemoveNode { node },
+                                scene,
+                                textures,
+                            )?;
+                            SceneBatchOperationResult::Removed
+                        }
+                    })
+                })()
+                .map_err(|source| ProgramSceneError::SceneBatchOperation {
+                    index,
+                    alias,
+                    source: Box::new(source),
+                })?;
+                results.push(result);
+            }
+
+            nodes.retain(|_, created| {
+                self.nodes.get(&created.node).is_some_and(|owned| {
+                    owned.session == session && scene.node(owned.node).is_some()
+                })
+            });
+
+            Ok(SceneBatchResult {
+                nodes,
+                operations: results,
+            })
+        })();
+
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                snapshot.restore(self, scene);
+                return Err(error);
+            }
+        };
+
+        self.overlap_pairs = snapshot.overlap_pairs.clone();
+        self.pending_overlap_events = snapshot.pending_overlap_events.clone();
+        if let Err(error) = self.reconcile_overlaps(session, scene) {
+            snapshot.restore(self, scene);
+            return Err(ProgramSceneError::SceneBatchOperation {
+                index: operation_count,
+                alias: None,
+                source: Box::new(error),
+            });
+        }
+        Ok(result)
+    }
+
+    fn validate_scene_batch_alias(&self, alias: &str) -> Result<(), ProgramSceneError> {
+        if alias.is_empty() {
+            return Err(ProgramSceneError::SceneBatchAliasInvalid(
+                "it must not be empty",
+            ));
+        }
+        if alias.len() > MAX_SCENE_BATCH_ALIAS_BYTES {
+            return Err(ProgramSceneError::SceneBatchAliasInvalid(
+                "it exceeds the byte limit",
+            ));
+        }
+        if alias.chars().any(char::is_control) {
+            return Err(ProgramSceneError::SceneBatchAliasInvalid(
+                "it must not contain control characters",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_scene_batch_node(
+        &self,
+        session: SessionId,
+        reference: &SceneBatchNodeRef,
+        aliases: &BTreeMap<String, NodeHandle>,
+    ) -> Result<NodeHandle, ProgramSceneError> {
+        match reference {
+            SceneBatchNodeRef::Handle(handle) => {
+                self.node_for(session, *handle)?;
+                Ok(*handle)
+            }
+            SceneBatchNodeRef::Alias(alias) => {
+                self.validate_scene_batch_alias(alias)?;
+                let handle = aliases
+                    .get(alias)
+                    .copied()
+                    .ok_or_else(|| ProgramSceneError::SceneBatchAliasUnknown(alias.clone()))?;
+                if self
+                    .nodes
+                    .get(&handle)
+                    .is_some_and(|owned| owned.session == session)
+                {
+                    Ok(handle)
+                } else {
+                    Err(ProgramSceneError::SceneBatchAliasRemoved(alias.clone()))
+                }
+            }
+        }
+    }
+
+    fn resolve_scene_batch_changes(
+        &self,
+        session: SessionId,
+        changes: SceneBatchNodeChanges,
+        aliases: &BTreeMap<String, NodeHandle>,
+    ) -> Result<NodeChanges, ProgramSceneError> {
+        let parent = changes
+            .parent
+            .map(|parent| match parent {
+                SceneBatchNodeParent::Root => Ok(NodeParent::Root),
+                SceneBatchNodeParent::Node(node) => self
+                    .resolve_scene_batch_node(session, &node, aliases)
+                    .map(NodeParent::Node),
+            })
+            .transpose()?;
+        Ok(NodeChanges {
+            properties: changes.properties,
+            parent,
+            layer: changes.layer,
+            visual: changes.visual,
+            text: changes.text,
+            text_style: changes.text_style,
+        })
     }
 
     pub fn set_window_metadata(
@@ -4124,6 +4527,641 @@ mod tests {
                 .unwrap(),
             ClpSceneCommandResult::Overlaps(vec![second])
         );
+    }
+
+    #[test]
+    fn clp_scene_batches_build_trees_and_return_alias_handles() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+
+        let result = resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![
+                        SceneBatchOperation::CreateNode {
+                            alias: "panel".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: NodeInput::Rectangle {
+                                properties: NodePropertiesInput {
+                                    x: 8.0,
+                                    y: 12.0,
+                                    width: 240.0,
+                                    height: 120.0,
+                                    visible: true,
+                                    clip_children: false,
+                                    z_index: 3,
+                                    overlap_enabled: false,
+                                    external_drop_enabled: false,
+                                    input_passthrough: false,
+                                },
+                                color: [36, 88, 216, 255],
+                            },
+                        },
+                        SceneBatchOperation::CreateNode {
+                            alias: "label".to_owned(),
+                            parent: Some(SceneBatchNodeRef::Alias("panel".to_owned())),
+                            layer: None,
+                            node: NodeInput::Text {
+                                properties: text_properties(16.0, 24.0),
+                                text: "Ready".to_owned(),
+                                style: TextStyle::default(),
+                            },
+                        },
+                        SceneBatchOperation::SetNode {
+                            node: SceneBatchNodeRef::Alias("panel".to_owned()),
+                            changes: SceneBatchNodeChanges {
+                                properties: Some(NodePropertiesPatch {
+                                    x: Some(20.0),
+                                    clip_children: Some(true),
+                                    ..NodePropertiesPatch::default()
+                                }),
+                                ..SceneBatchNodeChanges::default()
+                            },
+                        },
+                    ],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        let ClpSceneCommandResult::SceneBatch(batch) = result else {
+            unreachable!("a scene batch returns its created node handles")
+        };
+
+        assert_eq!(
+            batch.operations,
+            vec![
+                SceneBatchOperationResult::Created {
+                    alias: "panel".to_owned(),
+                },
+                SceneBatchOperationResult::Created {
+                    alias: "label".to_owned(),
+                },
+                SceneBatchOperationResult::Updated { text_metrics: None },
+            ]
+        );
+        let panel = batch.nodes.get("panel").unwrap().node;
+        let label = batch.nodes.get("label").unwrap().node;
+        let metrics = batch.nodes.get("label").unwrap().text_metrics.unwrap();
+        assert_eq!(panel, NodeHandle::new(1));
+        assert_eq!(label, NodeHandle::new(2));
+        assert_eq!(metrics.columns, 5);
+        assert_eq!(metrics.rows, 1);
+
+        let panel_node = resources.node_for(session, panel).unwrap();
+        let label_node = resources.node_for(session, label).unwrap();
+        assert_eq!(scene.len(), 2);
+        assert_eq!(scene.node(panel_node).unwrap().layer(), SceneLayer::Overlay);
+        assert_eq!(scene.node(label_node).unwrap().parent(), Some(panel_node));
+        assert_eq!(
+            scene.node(panel_node).unwrap().properties().transform.x(),
+            20.0
+        );
+        assert!(scene.node(panel_node).unwrap().properties().clip_children);
+    }
+
+    #[test]
+    fn clp_scene_batches_allow_temporary_nodes_to_be_removed() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+
+        let result = resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![
+                        SceneBatchOperation::CreateNode {
+                            alias: "temporary".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: NodeInput::Empty {
+                                properties: properties(),
+                            },
+                        },
+                        SceneBatchOperation::RemoveNode {
+                            node: SceneBatchNodeRef::Alias("temporary".to_owned()),
+                        },
+                    ],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        let ClpSceneCommandResult::SceneBatch(batch) = result else {
+            unreachable!("a scene batch returns its operation results")
+        };
+
+        assert!(batch.nodes.is_empty());
+        assert_eq!(
+            batch.operations,
+            vec![
+                SceneBatchOperationResult::Created {
+                    alias: "temporary".to_owned(),
+                },
+                SceneBatchOperationResult::Removed,
+            ]
+        );
+        assert!(scene.is_empty());
+
+        let error = resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![
+                        SceneBatchOperation::CreateNode {
+                            alias: "temporary".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: NodeInput::Empty {
+                                properties: properties(),
+                            },
+                        },
+                        SceneBatchOperation::RemoveNode {
+                            node: SceneBatchNodeRef::Alias("temporary".to_owned()),
+                        },
+                        SceneBatchOperation::SetNode {
+                            node: SceneBatchNodeRef::Alias("temporary".to_owned()),
+                            changes: SceneBatchNodeChanges::default(),
+                        },
+                    ],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProgramSceneError::SceneBatchOperation {
+                index: 2,
+                alias: None,
+                source,
+            } if matches!(*source, ProgramSceneError::SceneBatchAliasRemoved(ref alias) if alias == "temporary")
+        ));
+        assert!(scene.is_empty());
+    }
+
+    #[test]
+    fn clp_scene_batches_roll_back_all_state_and_handle_allocation_on_failure() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let existing = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: NodeInput::Rectangle {
+                        properties: properties(),
+                        color: [36, 88, 216, 255],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+        let before = scene.clone();
+
+        let error = resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![
+                        SceneBatchOperation::CreateNode {
+                            alias: "temporary".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: NodeInput::Empty {
+                                properties: properties(),
+                            },
+                        },
+                        SceneBatchOperation::SetNode {
+                            node: SceneBatchNodeRef::Handle(existing),
+                            changes: SceneBatchNodeChanges {
+                                properties: Some(NodePropertiesPatch {
+                                    x: Some(f64::NAN),
+                                    ..NodePropertiesPatch::default()
+                                }),
+                                ..SceneBatchNodeChanges::default()
+                            },
+                        },
+                    ],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap_err();
+        match error {
+            ProgramSceneError::SceneBatchOperation {
+                index,
+                alias,
+                source,
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(alias, None);
+                assert!(matches!(*source, ProgramSceneError::Geometry(_)));
+            }
+            error => panic!("expected a batch operation error, got {error:?}"),
+        }
+        assert_eq!(scene, before);
+
+        let next = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: NodeInput::Empty {
+                        properties: properties(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+        assert_eq!(next, NodeHandle::new(2));
+    }
+
+    #[test]
+    fn clp_scene_batches_do_not_retain_images_after_a_rejected_batch() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let image = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::UploadImage {
+                    image: ImageUpload::Rgba8 {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![255, 127, 0, 255],
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Image(image) => image,
+            _ => unreachable!(),
+        };
+
+        let error = resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![
+                        SceneBatchOperation::CreateNode {
+                            alias: "image".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: NodeInput::Image {
+                                properties: properties(),
+                                image,
+                                opacity: 1.0,
+                                contact_shape: ImageContactShape::Bounds,
+                            },
+                        },
+                        SceneBatchOperation::SetNode {
+                            node: SceneBatchNodeRef::Alias("image".to_owned()),
+                            changes: SceneBatchNodeChanges {
+                                properties: Some(NodePropertiesPatch {
+                                    x: Some(f64::NAN),
+                                    ..NodePropertiesPatch::default()
+                                }),
+                                ..SceneBatchNodeChanges::default()
+                            },
+                        },
+                    ],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProgramSceneError::SceneBatchOperation {
+                index: 1,
+                alias: None,
+                source,
+            } if matches!(*source, ProgramSceneError::Geometry(_))
+        ));
+        assert!(scene.is_empty());
+
+        assert_eq!(
+            resources
+                .execute_clp(
+                    session,
+                    ClpSceneCommand::RemoveImage { image },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            ClpSceneCommandResult::Acknowledged
+        );
+    }
+
+    #[test]
+    fn clp_scene_batches_preserve_session_ownership_when_rolling_back() {
+        let (session, foreign_session) = session_pair();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let foreign = match resources
+            .execute_clp(
+                foreign_session,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: NodeInput::Empty {
+                        properties: properties(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+        let before = scene.clone();
+
+        let error = resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![
+                        SceneBatchOperation::CreateNode {
+                            alias: "local".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: NodeInput::Empty {
+                                properties: properties(),
+                            },
+                        },
+                        SceneBatchOperation::SetNode {
+                            node: SceneBatchNodeRef::Handle(foreign),
+                            changes: SceneBatchNodeChanges::default(),
+                        },
+                    ],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProgramSceneError::SceneBatchOperation {
+                index: 1,
+                alias: None,
+                source,
+            } if matches!(*source, ProgramSceneError::HandleNotOwned)
+        ));
+        assert_eq!(scene, before);
+
+        let next = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: NodeInput::Empty {
+                        properties: properties(),
+                    },
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+        assert_eq!(next, NodeHandle::new(2));
+    }
+
+    #[test]
+    fn clp_scene_batches_require_prior_unique_aliases_and_respect_the_operation_limit() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+
+        let forward_reference = resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![SceneBatchOperation::CreateNode {
+                        alias: "child".to_owned(),
+                        parent: Some(SceneBatchNodeRef::Alias("parent".to_owned())),
+                        layer: None,
+                        node: NodeInput::Empty {
+                            properties: properties(),
+                        },
+                    }],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            forward_reference,
+            ProgramSceneError::SceneBatchOperation {
+                index: 0,
+                alias: Some(alias),
+                source,
+            } if alias == "child"
+                && matches!(*source, ProgramSceneError::SceneBatchAliasUnknown(ref parent) if parent == "parent")
+        ));
+        assert!(scene.is_empty());
+
+        let duplicate_alias = resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![
+                        SceneBatchOperation::CreateNode {
+                            alias: "same".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: NodeInput::Empty {
+                                properties: properties(),
+                            },
+                        },
+                        SceneBatchOperation::CreateNode {
+                            alias: "same".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: NodeInput::Empty {
+                                properties: properties(),
+                            },
+                        },
+                    ],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            duplicate_alias,
+            ProgramSceneError::SceneBatchOperation {
+                index: 1,
+                alias: Some(alias),
+                source,
+            } if alias == "same"
+                && matches!(*source, ProgramSceneError::SceneBatchAliasDuplicate(ref duplicate) if duplicate == "same")
+        ));
+        assert!(scene.is_empty());
+
+        let too_many_operations = (0..=MAX_SCENE_BATCH_OPERATIONS)
+            .map(|index| SceneBatchOperation::CreateNode {
+                alias: format!("node-{index}"),
+                parent: None,
+                layer: Some(SceneLayer::Overlay),
+                node: NodeInput::Empty {
+                    properties: properties(),
+                },
+            })
+            .collect();
+        assert_eq!(
+            resources.execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: too_many_operations,
+                },
+                &mut scene,
+                &mut textures,
+            ),
+            Err(ProgramSceneError::SceneBatchOperationLimitExceeded {
+                limit: MAX_SCENE_BATCH_OPERATIONS,
+            })
+        );
+        assert!(scene.is_empty());
+    }
+
+    #[test]
+    fn clp_scene_batches_emit_overlap_events_only_for_the_final_scene() {
+        let session = session();
+        let mut resources = ProgramSceneResources::new(u32::MAX);
+        let mut scene = Scene::new();
+        let mut textures = TextureStore::new();
+        let collider = |x| NodeInput::Empty {
+            properties: NodePropertiesInput {
+                x,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                visible: true,
+                clip_children: false,
+                z_index: 0,
+                overlap_enabled: true,
+                external_drop_enabled: false,
+                input_passthrough: false,
+            },
+        };
+        let anchor = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::CreateNode {
+                    parent: None,
+                    layer: Some(SceneLayer::Overlay),
+                    node: collider(0.0),
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::Node { node, .. } => node,
+            _ => unreachable!(),
+        };
+        assert!(resources.drain_overlap_events().is_empty());
+
+        let batch = match resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![
+                        SceneBatchOperation::CreateNode {
+                            alias: "transient".to_owned(),
+                            parent: None,
+                            layer: Some(SceneLayer::Overlay),
+                            node: collider(0.0),
+                        },
+                        SceneBatchOperation::SetNode {
+                            node: SceneBatchNodeRef::Alias("transient".to_owned()),
+                            changes: SceneBatchNodeChanges {
+                                properties: Some(NodePropertiesPatch {
+                                    x: Some(30.0),
+                                    ..NodePropertiesPatch::default()
+                                }),
+                                ..SceneBatchNodeChanges::default()
+                            },
+                        },
+                    ],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap()
+        {
+            ClpSceneCommandResult::SceneBatch(batch) => batch,
+            _ => unreachable!(),
+        };
+        let transient = batch.nodes.get("transient").unwrap().node;
+        assert!(resources.drain_overlap_events().is_empty());
+        assert_eq!(
+            resources
+                .execute_clp(
+                    session,
+                    ClpSceneCommand::IsOverlapping { node: anchor },
+                    &mut scene,
+                    &mut textures,
+                )
+                .unwrap(),
+            ClpSceneCommandResult::IsOverlapping(false)
+        );
+
+        resources
+            .execute_clp(
+                session,
+                ClpSceneCommand::SceneBatch {
+                    operations: vec![SceneBatchOperation::SetNode {
+                        node: SceneBatchNodeRef::Handle(transient),
+                        changes: SceneBatchNodeChanges {
+                            properties: Some(NodePropertiesPatch {
+                                x: Some(5.0),
+                                ..NodePropertiesPatch::default()
+                            }),
+                            ..SceneBatchNodeChanges::default()
+                        },
+                    }],
+                },
+                &mut scene,
+                &mut textures,
+            )
+            .unwrap();
+        assert!(matches!(
+            resources.drain_overlap_events().as_slice(),
+            [SceneEvent::OverlapEnter { .. }]
+        ));
     }
 
     #[test]

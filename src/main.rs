@@ -2114,6 +2114,12 @@ fn grid_size(size: PhysicalSize<u32>, font: &FontAppearance, scale_factor: f64) 
 
 fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
     match error {
+        ProgramSceneError::SceneBatchOperation { source, .. } => program_scene_error_code(source),
+        ProgramSceneError::SceneBatchEmpty
+        | ProgramSceneError::SceneBatchAliasInvalid(_)
+        | ProgramSceneError::SceneBatchAliasDuplicate(_)
+        | ProgramSceneError::SceneBatchAliasUnknown(_)
+        | ProgramSceneError::SceneBatchAliasRemoved(_) => "invalid_scene_batch",
         ProgramSceneError::InvalidNodeHandle(_)
         | ProgramSceneError::InvalidImageHandle(_)
         | ProgramSceneError::InvalidTextureHandle(_)
@@ -2133,7 +2139,8 @@ fn program_scene_error_code(error: &ProgramSceneError) -> &'static str {
         | ProgramSceneError::TextLimitExceeded { .. }
         | ProgramSceneError::SessionTextLimitExceeded { .. }
         | ProgramSceneError::SessionTextNodeLimitExceeded { .. }
-        | ProgramSceneError::PresentationUpdateLimitExceeded { .. } => "resource_limit",
+        | ProgramSceneError::PresentationUpdateLimitExceeded { .. }
+        | ProgramSceneError::SceneBatchOperationLimitExceeded { .. } => "resource_limit",
         ProgramSceneError::Geometry(_)
         | ProgramSceneError::Image(_)
         | ProgramSceneError::Texture(_)

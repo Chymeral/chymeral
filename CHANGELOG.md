@@ -6,6 +6,34 @@ the CLP protocol and language SDKs have independent version numbers.
 
 ## [Unreleased]
 
+### Added
+
+- CLP v2.4 `scene_batch`, a negotiated reliable command for a bounded atomic
+  retained-scene construction or structural revision. It supports ordered
+  create, update, and removal operations with batch-local aliases.
+- A 512-operation, 512 KiB JSON-envelope, and 128-byte alias contract;
+  rejected batches restore the retained scene, node ownership, allocator, and
+  overlap-delivery state.
+- A versioned CLP v2.4 fixture corpus with byte-checked atomic scene-batch
+  lifecycle, alias, result, and closure coverage for independent SDKs.
+
+### Changed
+
+- Successful scene batches reconcile only their final overlap state and request
+  one redraw. They do not imply compositor acknowledgement or physical scanout.
+
+### Fixed
+
+- Queued CLP host frames are emitted in bounded transport writes, so a
+  scene-batch response larger than the Windows named-pipe buffer reaches its
+  client instead of remaining pending indefinitely.
+
+### Compatibility
+
+- The unreleased Chymeral `1.7.0` development line implements CLP v2.4. It
+  continues to accept v2.0 and v2.1 clients without granting later negotiated
+  capabilities.
+
 ## [1.5.0] - 2026-10-22
 
 ### Added

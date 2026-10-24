@@ -4,7 +4,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 1);
+pub const CLP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 4);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion {
@@ -43,6 +43,7 @@ pub enum Capability {
     Text,
     Presentation,
     WindowMetadata,
+    SceneBatch,
 }
 
 impl Capability {
@@ -57,6 +58,7 @@ impl Capability {
             Self::Text => 1 << 6,
             Self::Presentation => 1 << 7,
             Self::WindowMetadata => 1 << 8,
+            Self::SceneBatch => 1 << 9,
         }
     }
 }
@@ -75,7 +77,8 @@ impl CapabilitySet {
             | Capability::ExternalDrop.bit()
             | Capability::Text.bit()
             | Capability::Presentation.bit()
-            | Capability::WindowMetadata.bit(),
+            | Capability::WindowMetadata.bit()
+            | Capability::SceneBatch.bit(),
     );
 
     pub const fn from_capabilities(capabilities: &[Capability]) -> Self {
@@ -430,7 +433,7 @@ impl SessionManager {
         }
 
         let session_id = self.allocate_session_id()?;
-        let requested_capabilities = if hello.protocol_version.minor() < 1 {
+        let mut requested_capabilities = if hello.protocol_version.minor() < 1 {
             // CLP v2.0 intentionally has neither the presentation lane nor
             // window metadata, even if a malformed or hand-written client
             // includes their newer names.
@@ -441,6 +444,12 @@ impl SessionManager {
         } else {
             hello.requested_capabilities
         };
+        if hello.protocol_version.minor() < 4 {
+            // Scene batches are introduced by CLP v2.4. A hand-written older
+            // hello must not obtain a capability whose command grammar it
+            // cannot represent.
+            requested_capabilities = requested_capabilities.without(Capability::SceneBatch);
+        }
         let capabilities = requested_capabilities.intersection(self.available_capabilities);
         self.sessions.insert(
             session_id,
@@ -767,6 +776,59 @@ mod tests {
                 .session_capabilities(session_id)
                 .unwrap()
                 .contains(Capability::WindowMetadata)
+        );
+    }
+
+    #[test]
+    fn reserves_scene_batch_for_v2_4_clients() {
+        let mut manager = SessionManager::default();
+        let requested = CapabilitySet::from_capabilities(&[
+            Capability::Scene,
+            Capability::Text,
+            Capability::SceneBatch,
+        ]);
+        let (legacy_session, legacy_message) = manager
+            .accept(
+                ClientHello {
+                    protocol_version: ProtocolVersion::new(2, 1),
+                    requested_capabilities: requested,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_message,
+            HostMessage::Init(ProgramInit {
+                protocol_version: ProtocolVersion::new(2, 1),
+                session_id: legacy_session,
+                granted_capabilities: requested.without(Capability::SceneBatch),
+                context: ProgramInitContext::default(),
+            })
+        );
+        assert!(
+            !manager
+                .session_capabilities(legacy_session)
+                .unwrap()
+                .contains(Capability::SceneBatch)
+        );
+
+        let (batch_session, batch_message) = manager
+            .accept(
+                ClientHello {
+                    protocol_version: CLP_PROTOCOL_VERSION,
+                    requested_capabilities: requested,
+                },
+                ProgramInitContext::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            batch_message,
+            HostMessage::Init(ProgramInit {
+                protocol_version: CLP_PROTOCOL_VERSION,
+                session_id: batch_session,
+                granted_capabilities: requested,
+                context: ProgramInitContext::default(),
+            })
         );
     }
 

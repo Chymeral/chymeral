@@ -53,18 +53,21 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 | M23 | Frame-paced scene presentation and CLP v2.1 fixtures. | Reliable structural commands remain ordered; bounded transient geometry is a newest-state mailbox committed at a renderer frame. |
 | M24 | CLP application window metadata. | Every session retains a bounded title/icon claim; newest live claim is visible and restores deterministically without granting desktop-window control. |
 | M25 | Chymeral `1.5.0` release integration. | CLP v2.1 and its two official SDK release lines are validated as a compatible feature release; Linux and Windows portable artifacts remain x86_64-only. |
+| M26 | Batched scene construction and atomic first presentation. | CLP v2.4 adds a bounded reliable structural revision with local aliases, all-or-nothing retained-state semantics, one redraw request, and no scanout claim. |
 
 ## CLP evolution
 
 CLP began as an internal lifecycle contract and became an actual local transport
 without exposing host memory, Rust types, graphics backend types, or a global
-socket. The released protocol is **v2.1**, which retains v2.0 compatibility and adds the opt-in
-`presentation` capability. CLP v2.0 has seven opt-in capabilities: `scene`,
-`images`, `input`, `timing`, `overlap`, `external_drop`, and `text`; v2.1 adds
-`presentation` for bounded transient geometry and `window_metadata` for
-session-owned native titles plus bounded static icons. M19 deliberately removed the
-v1.x and provisional v1.4 wire vocabularies before public SDK stability; the
-host provides no compatibility aliases.
+socket. The released protocol is **v2.1**, which retains v2.0 compatibility and
+adds the opt-in `presentation` capability. The `current-dev` line implements
+**v2.4**: v2.0 has seven opt-in capabilities (`scene`, `images`, `input`,
+`timing`, `overlap`, `external_drop`, and `text`); v2.1 adds `presentation` for
+bounded transient geometry and `window_metadata` for session-owned native
+titles plus bounded static icons; v2.4 adds `scene_batch` for reliable atomic
+structural revisions. M19 deliberately removed the v1.x and provisional v1.4
+wire vocabularies before public SDK stability; the host provides no
+compatibility aliases.
 
 The negotiated lifecycle is deliberately strict:
 
@@ -221,7 +224,46 @@ both title and dynamic icon updates. Native Wayland applies titles and reports
 explicit. The portable Linux launcher intentionally selects X11/Xwayland;
 native Wayland remains available when the binary is launched directly. ARM64,
 native-Wayland DnD, outgoing desktop DnD, and a stable `winit` upgrade remain
-out of scope until M26.
+out of scope until M27.
+
+## M26 batched scene construction
+
+M26 is implemented on `current-dev` as the additive CLP v2.4 `scene_batch`
+capability. Its reliable command carries one through 512 ordered structural
+operations and an entire JSON command envelope no larger than 512 KiB. Each
+`create_node` declares a unique local alias of at most 128 UTF-8 bytes without
+control characters; only a later operation may reference it. The vocabulary is
+deliberately limited to `create_node`, `set_node`, and `remove_node`, retaining
+the existing node, hierarchy, layer, resource, and capability rules rather
+than introducing a second scene model.
+
+The host snapshots the retained `Scene`, CLP node ownership, node-handle
+allocator, overlap pairs, and pending overlap notifications before applying a
+batch. A rejected operation restores that snapshot. A successful batch keeps
+only the final retained tree, rebuilds overlap state once from the prior
+baseline, and requests one redraw. This prevents transient overlap transitions
+and progressive construction from escaping the host event turn, but it does
+not claim a compositor acknowledgement or physical-display scanout.
+
+The Rust and Node SDKs expose a small typed `SceneBatch` builder plus explicit
+operation and alias-reference types. They validate local bounds before writing
+the command and return a capability error when the negotiated host lacks
+`scene_batch`; they never silently replay it as individual mutations. The core
+v2.4 fixture corpus is vendored byte-for-byte with its SHA-256 manifest by both
+SDKs and replayed through each public API. This preserves language-neutral
+conformance without adding a host plugin, widget toolkit, or virtual-DOM layer.
+
+Final Windows validation found an implementation-level transport boundary, not
+a CLP semantic failure: the local named-pipe listener has a 512-byte default
+output buffer, while a successful 13-operation scene-batch result was 1,433
+bytes. A nonblocking whole-frame write returned zero bytes indefinitely, which
+left the client waiting for its result before it could enter its input loop.
+`RunningFrameWriter` now sends queued frame bytes in 512-byte chunks. Framing
+still reconstructs the identical logical CLP message, and a bounded-transport
+regression test protects this behavior on every platform. The final Node probe
+passed on the Linux host and Windows VM: clicking anywhere within its covered
+panel focused the session, its status update completed, and `q` closed only the
+CLP session.
 
 ## Intentional boundaries
 

@@ -7,16 +7,17 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M25 are complete; M25 is release-ready after Linux and Windows acceptance.
+- M1–M26 are complete; M25 is released after Linux and Windows acceptance.
 - CLP v2.1 is frozen for the `1.5.0` release line. A v2.1 host continues to
   accept v2.0 clients without its additional capabilities.
 - `chymeral-rust-sdk` `1.5.0` and `@chymeral/node-sdk` `1.5.0` are the
   accepted release lines for the public CLP v2.1 APIs. Later protocol and SDK
   publications belong to their respective feature milestones.
-- M26 is the next unblocked milestone. Its batching capability necessarily
-  extends CLP and both supported SDKs, so its accepted publication target is
-  Chymeral `v1.7.0`, both SDKs `1.7.0`, and CLP `v2.4`; manifests remain at
-  their released versions until M26 is implemented and accepted.
+- M26 is accepted on `current-dev`. Its batching capability extends CLP and
+  both supported SDKs; the unpublished development target is Chymeral
+  `v1.7.0`, both SDKs `1.7.0`, and CLP `v2.4`. The released `main` line remains
+  at Chymeral and SDK `1.5.0` over CLP `v2.1` until a separately approved M26
+  release is prepared.
 - No phase below has started unless its status explicitly says otherwise.
 
 ### M25 release record
@@ -1542,7 +1543,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 
 ## M26 — Batched Scene Construction and Atomic First Presentation
 
-**Status:** Planned — next unblocked development milestone
+**Status:** Complete (validated 2026-10-24 on `current-dev`; unreleased)
 
 ### Scope
 
@@ -1550,13 +1551,12 @@ M20 must be complete and the v2.0 protocol contract must be stable.
   scene or a structural scene revision as one validated unit.
 - Commit an accepted unit without exposing its intermediate node-by-node
   construction to the user, then request one coherent first presentation.
-- Preserve the existing ordered `create_node` and `set_node` path as the
-  compatible, incremental control-plane fallback.
+- Preserve the existing ordered `create_node` and `set_node` path as an
+  explicit application-controlled incremental alternative.
 - Expose an ergonomic helper through supported SDKs so applications do not
   need to hand-roll a transport batch merely to avoid progressive first paint.
-- Measure application-to-host construction time separately from renderer
-  submission and physical scanout, using a representative multi-control CLP
-  application such as Foregit.
+- Keep construction semantics distinct from renderer submission and physical
+  scanout; the batch result requests one redraw but is not a timing promise.
 
 ### Rationale and boundary
 
@@ -1574,10 +1574,10 @@ robustness and conformance work.
   Rust and Node.js/TypeScript helpers. Once its implementation and validation
   are accepted, publish Chymeral `v1.7.0`, `chymeral-rust-sdk` `1.7.0`, and
   `@chymeral/node-sdk` `1.7.0` over CLP `v2.4`.
-- The capability is additive: a v2.4 host continues to accept v2.1 clients,
-  and a client without the new capability retains the ordered sequential path.
-  No released manifest, package, or fixture version changes merely because this
-  roadmap decision exists.
+- The capability is additive: a v2.4 host continues to accept v2.0 and v2.1
+  clients. An application without the new capability retains the ordinary
+  ordered sequential path only when it explicitly chooses it; SDKs do not
+  silently expand a batch into multiple commands.
 - M26 is intentionally independent of the stable-Wayland entry gate. It may
   proceed now to support early application adoption without waiting for M27.
 
@@ -1596,17 +1596,32 @@ robustness and conformance work.
 - Clients without the future capability remain fully functional through the
   existing sequential CLP v2.1 path.
 
-### Decisions deferred to implementation
+### Implemented technical decisions
 
-- The wire operation name, protocol revision, maximum operation count, byte
-  limit, resource-accounting model, and whether a unit may include only
-  creation or also structural removals/reparenting.
-- Whether the host commits directly at the next renderer opportunity or stages
-  an accepted unit until an explicit present request; the resulting observable
-  status vocabulary must be precise and must not claim physical scanout.
-- The SDK surface: a declarative scene-tree builder, an explicit transaction,
-  or both. It must remain a client-library convenience rather than a host
-  widget or plugin system.
+- **Negotiation and wire form:** CLP `v2.4` adds the additive `scene_batch`
+  capability and a reliable `scene_batch` command. The command contains ordered
+  `create_node`, `set_node`, and `remove_node` operations; it does not include
+  resources, metadata, subscriptions, or presentation packets.
+- **Bounds:** A batch has 1–512 operations, a complete JSON command envelope
+  no larger than 512 KiB, and UTF-8 aliases of 1–128 bytes without control
+  characters. An alias is unique, introduced by `create_node`, and may be used
+  only by a later operation. This makes parent-before-child construction
+  explicit and deterministic.
+- **Atomic result:** The host snapshots the retained scene, node ownership,
+  node allocator, and overlap-delivery state. It restores all of them on any
+  rejection, reconciles only the final overlap state on success, and requests
+  one redraw. The response includes ordered operation outcomes and handles for
+  aliases that remain live; temporary created-and-removed aliases are omitted.
+  This is not a compositor or physical-scanout guarantee.
+- **SDK surface:** Rust exposes typed `SceneBatch`, `SceneBatchOperation`,
+  `BatchNodeRef`, and `SceneBatchNodeChanges`; Node exposes the equivalent
+  typed `SceneBatch` builder and types. Neither is a VDOM, toolkit, or host
+  plugin. Both return a clear capability error when `scene_batch` is absent.
+- **Conformance:** The core owns a CLP v2.4 fixture corpus. Both SDKs vendor
+  its exact bytes and SHA-256 manifest, replay it through their public APIs,
+  and retain v2.0-only fallback negotiation without requesting `scene_batch`.
+  The Node SDK also carries a live `example:scene-batch` first-paint probe; it
+  builds a visible nested panel from one batch without introducing a toolkit.
 
 ### Acceptance criteria
 
@@ -1622,6 +1637,24 @@ robustness and conformance work.
 - Documentation records that batching improves first-paint experience by
   reducing serial IPC round trips; it does not promise a fixed render time or
   hide slow application logic.
+
+### Completion record
+
+- Core formatting, locked tests, clippy, Rustdoc, and release build passed.
+  Both SDKs passed their corresponding locked format, type/test, documentation,
+  and release/package gates; all three repositories replay the reviewed v2.4
+  fixture snapshot and SHA-256 manifest.
+- The Node `example:scene-batch` probe was manually accepted on the Linux host
+  and Windows VM. Its complete retained panel appears from one batch; a click
+  anywhere on the panel background or a child card focuses the owning CLP
+  session, acknowledges the input through `set_node`, and `q` closes only that
+  session while leaving the terminal alive.
+- Final Windows validation exposed the default 512-byte named-pipe output
+  buffer: a 1,433-byte scene-batch response could return a zero-byte write
+  forever when submitted as one transport write. `RunningFrameWriter` now
+  emits every queued CLP frame in bounded 512-byte chunks. The wire frame and
+  its atomic result remain unchanged; a regression test verifies a large frame
+  completes through a bounded transport.
 
 ## M27 — Stable Wayland Capability Upgrade
 
