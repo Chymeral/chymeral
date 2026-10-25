@@ -27,7 +27,7 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 
 | Milestone | Delivered foundation | Decisions established |
 | --- | --- | --- |
-| M1 | PTY terminal, ANSI/VT grid, `wgpu`/`glyphon` rendering, visual configuration, image/GIF background, and splash. | The terminal remains independently useful; graphical appearance is configuration, not an application API. |
+| M1 | PTY terminal, ANSI/VT grid, `wgpu`/`glyphon` rendering, visual configuration, image/GIF background, and the initial splash (retired in M26.2). | The terminal remains independently useful; graphical appearance is configuration, not an application API. |
 | M2 | Canonical `EngineEvent`; `Init`, `Start`, `Tick`, and `Frame` runtime lifecycle. | Runtime phases and frame timing are host-owned, and application-facing delivery must preserve that model. |
 | M3 | Retained scene graph. | Parent-before-child painting, deterministic sibling ordering, and distinct terminal/scene surfaces. |
 | M4 | Texture ownership and rendering resources. | Resources use opaque handles and must have explicit lifetime validation. |
@@ -289,6 +289,34 @@ documentation, package/build, and core Linux/Windows release gates passed
 after the extraction. The structure is deliberately considered complete here:
 further splitting of `main.rs`, wire schemas, or renderer lifecycle would add
 coupling rather than improve ordinary maintenance navigation.
+
+## M26.2 configuration surface cleanup
+
+M26.2 reduces persistent configuration to terminal appearance, explicit
+`scene_text.fonts` aliases, and diagnostic controls. The internal
+`[testing_tools.scene]` fixture has been removed end-to-end: no configuration
+model, parser, startup installer, retained nodes, helper textures, or tests
+remain. A retained graphical scene now begins exclusively when a CLP client
+creates it; the terminal grid remains a separate surface.
+
+The temporary `[appearance.startup_splash]` overlay has likewise been removed
+from parsing, static-image loading, window state, resize handling, timers, and
+tests. Terminal background images and animated GIF backgrounds remain intact;
+application branding remains available through the existing native-window and
+CLP scene mechanisms.
+
+Diagnostic shortcuts now live under `[diagnostics.shortcuts]`. Their event,
+tick, and frame defaults and behavior are unchanged. The old
+`[input.shortcuts]` name, together with both removed sections, has no alias or
+fallback: the strict top-level TOML schema rejects it so stale configuration
+cannot silently alter behavior. M26.2 changes no CLP v2.4 frame, capability,
+SDK export, or development version target.
+
+Linux and Windows both passed formatting, locked all-target tests,
+warnings-denied clippy, Rustdoc, and locked all-target release builds after
+the cleanup. The configuration template, manual, README, and unreleased
+changelog record the smaller supported surface and its intentionally breaking
+configuration migration.
 
 ## Intentional boundaries
 

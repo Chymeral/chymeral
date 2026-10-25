@@ -24,33 +24,11 @@ use wgpu::{
 };
 
 use crate::config::{Background, ImageFit, Rgb};
-use chymeral::resources::Texture as ResourceTexture;
 
 const MAX_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_GIF_FRAMES: usize = 300;
 const MAX_GIF_BYTES: u64 = 128 * 1024 * 1024;
-
-pub fn load_static_texture(path: &Path, max_dimension: u32) -> Result<ResourceTexture> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .context("startup splash image must use a PNG or JPEG extension")?;
-    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
-        bail!("startup splash image must use PNG or JPEG; animated images are not supported");
-    }
-
-    let mut reader = ImageReader::open(path)
-        .with_context(|| format!("could not open startup splash image {}", path.display()))?;
-    reader.limits(image_limits(max_dimension));
-    let image = reader
-        .decode()
-        .with_context(|| format!("could not decode startup splash image {}", path.display()))?
-        .into_rgba8();
-    ResourceTexture::from_rgba8(image.width(), image.height(), image.into_raw())
-        .map_err(anyhow::Error::from)
-}
 
 const IMAGE_SHADER: &str = r#"
 struct ImageTransform {
@@ -578,14 +556,11 @@ fn frame_delay((numerator, denominator): (u32, u32)) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, path::Path, time::Duration};
+    use std::{fs::File, time::Duration};
 
     use image::{Delay, Frame, Rgba, RgbaImage, codecs::gif::GifEncoder};
 
-    use super::{
-        DecodedImage, ImageFit, MAX_IMAGE_DIMENSION, image_transform, load_static_texture,
-        premultiply_alpha,
-    };
+    use super::{DecodedImage, ImageFit, MAX_IMAGE_DIMENSION, image_transform, premultiply_alpha};
 
     #[test]
     fn cover_crops_the_wider_axis() {
@@ -640,25 +615,5 @@ mod tests {
         assert_eq!(decoded.frames[1].duration, Duration::from_millis(80));
         assert_eq!(&decoded.frames[0].pixels[..4], &[128, 0, 0, 128]);
         assert_eq!(&decoded.frames[1].pixels[..4], &[0, 0, 128, 128]);
-    }
-
-    #[test]
-    fn loads_a_static_splash_without_premultiplying_its_alpha() {
-        let path = std::env::temp_dir().join(format!("chymeral-{}-splash.png", std::process::id()));
-        RgbaImage::from_pixel(2, 1, Rgba([200, 100, 50, 128]))
-            .save(&path)
-            .unwrap();
-
-        let texture = load_static_texture(&path, MAX_IMAGE_DIMENSION).unwrap();
-        std::fs::remove_file(&path).unwrap();
-
-        assert_eq!(texture.width(), 2);
-        assert_eq!(texture.height(), 1);
-        assert_eq!(&texture.pixels()[..4], &[200, 100, 50, 128]);
-    }
-
-    #[test]
-    fn rejects_animated_splash_extensions_before_opening_them() {
-        assert!(load_static_texture(Path::new("splash.gif"), MAX_IMAGE_DIMENSION).is_err());
     }
 }

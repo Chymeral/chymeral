@@ -27,10 +27,8 @@ use chymeral::{
     external_drop::{ExternalFile, TerminalQuoting, format_terminal_paths},
     program_scene::{ImageHandle, ProgramSceneError, ProgramSceneResources, WindowIcon},
     protocol::{Capability, CapabilitySet, ProgramInitContext, SessionId, WindowMetadataSupport},
-    resources::{Texture as ResourceTexture, TextureId, TextureStore},
-    scene::{
-        ImageNode, NodeContent, NodeId, NodeProperties, Point, Rect, Scene, SceneLayer, Transform,
-    },
+    resources::TextureStore,
+    scene::{NodeContent, NodeId, Point, Rect, Scene, SceneLayer},
     scene_text::{TextAlign, TextLayout, TextStyle, TextWeight, expand_tabs},
     transport::{ClpServer, HostAction, HostCommandResponse, PresentationSubmission},
 };
@@ -56,7 +54,7 @@ use winit::{
 
 use crate::{
     background::BackgroundRenderer,
-    config::{Appearance, FontAppearance, FontSource, Rgb, StartupSplash, TestingScene},
+    config::{Appearance, FontAppearance, FontSource, Rgb},
     diagnostics::{Diagnostics, DiagnosticsShortcuts},
     pty::Pty,
     scene_renderer::{ImageRenderer, ImageViewport},
@@ -121,12 +119,6 @@ impl Program for TerminalProgram {
     fn frame(&mut self, _: Duration) -> RuntimeResult<()> {
         Ok(())
     }
-}
-
-struct ActiveSplash {
-    node: NodeId,
-    texture: TextureId,
-    deadline: Instant,
 }
 
 struct PendingExternalDrop {
@@ -225,8 +217,6 @@ impl PresentationTrace {
 
 struct WindowStateOptions {
     appearance: Appearance,
-    startup_splash: Option<StartupSplash>,
-    testing_scene: Option<TestingScene>,
     diagnostics_shortcuts: DiagnosticsShortcuts,
     available_capabilities: CapabilitySet,
     fallback_window_icon: Option<Icon>,
@@ -263,7 +253,6 @@ struct WindowState {
     textures: TextureStore,
     program_scene_resources: ProgramSceneResources,
     image_renderer: ImageRenderer,
-    active_splash: Option<ActiveSplash>,
     pending_presentation_confirmations: Vec<PendingPresentationConfirmation>,
     presentation_trace: PresentationTrace,
     pending_resize: Option<PhysicalSize<u32>>,
@@ -292,8 +281,6 @@ impl WindowState {
     ) -> Result<Self> {
         let WindowStateOptions {
             appearance,
-            startup_splash,
-            testing_scene,
             diagnostics_shortcuts,
             available_capabilities,
             fallback_window_icon,
@@ -395,39 +382,8 @@ impl WindowState {
         scene_text_buffer.set_wrap(Wrap::None);
         let background =
             BackgroundRenderer::new(&device, &queue, &surface_config, &appearance.background)?;
-        let mut scene = Scene::new();
-        let mut textures = TextureStore::new();
-        if let Some(testing_scene) = testing_scene.as_ref() {
-            install_testing_scene(&mut scene, &mut textures, testing_scene)?;
-        }
-        let active_splash = if let Some(splash) = startup_splash {
-            let max_dimension = device.limits().max_texture_dimension_2d;
-            let texture = background::load_static_texture(&splash.path, max_dimension)?;
-            let texture_id = textures.insert(texture);
-            let texture = textures
-                .texture(texture_id)
-                .context("could not retrieve the newly registered splash texture")?;
-            let node = scene.create_root(splash_properties(
-                texture,
-                surface_config.width,
-                surface_config.height,
-                scale_factor,
-            )?);
-            scene.set_content(
-                node,
-                NodeContent::Image(ImageNode::new(texture_id, splash.opacity)?),
-            )?;
-            let deadline = Instant::now()
-                .checked_add(splash.duration)
-                .context("appearance.startup_splash.duration_ms exceeds the supported duration")?;
-            Some(ActiveSplash {
-                node,
-                texture: texture_id,
-                deadline,
-            })
-        } else {
-            None
-        };
+        let scene = Scene::new();
+        let textures = TextureStore::new();
         let image_renderer = ImageRenderer::new(&device, &surface_config);
         let max_program_texture_dimension = device.limits().max_texture_dimension_2d;
         let text_layout = TextLayout::new(
@@ -468,7 +424,6 @@ impl WindowState {
             program_scene_resources: ProgramSceneResources::new(max_program_texture_dimension)
                 .with_text_layout(text_layout),
             image_renderer,
-            active_splash,
             pending_presentation_confirmations: Vec::new(),
             presentation_trace: PresentationTrace::from_environment(),
             pending_resize: None,
@@ -705,7 +660,6 @@ impl WindowState {
             eprintln!("Chymeral: {error:#}");
         }
         self.background.resize(&self.queue, &self.surface_config);
-        self.center_splash();
         self.sync_terminal_text(false);
         self.clp_server.broadcast_resize(
             self.surface_config.width,
@@ -717,46 +671,6 @@ impl WindowState {
 
     fn next_resize_deadline(&self) -> Option<Instant> {
         self.pending_resize.as_ref().and(self.next_resize_update)
-    }
-
-    fn next_splash_deadline(&self) -> Option<Instant> {
-        self.active_splash.as_ref().map(|splash| splash.deadline)
-    }
-
-    fn advance_splash(&mut self, now: Instant) -> bool {
-        let Some(splash) = self.active_splash.as_ref() else {
-            return false;
-        };
-        if now < splash.deadline {
-            return false;
-        }
-        let Some(splash) = self.active_splash.take() else {
-            return false;
-        };
-        let _ = self.scene.remove_subtree(splash.node);
-        let _ = self.textures.remove(splash.texture);
-        self.reconcile_scene_interaction();
-        true
-    }
-
-    fn center_splash(&mut self) {
-        let Some(splash) = self.active_splash.as_ref() else {
-            return;
-        };
-        let Some(texture) = self.textures.texture(splash.texture) else {
-            return;
-        };
-        let Ok(properties) = splash_properties(
-            texture,
-            self.surface_config.width,
-            self.surface_config.height,
-            self.scale_factor,
-        ) else {
-            return;
-        };
-        if self.scene.set_properties(splash.node, properties).is_ok() {
-            self.reconcile_scene_interaction();
-        }
     }
 
     fn scale_factor_changed(&mut self, scale_factor: f64) {
@@ -1820,8 +1734,6 @@ struct ChymeralApp {
     modifiers: ModifiersState,
     event_proxy: EventLoopProxy<UserEvent>,
     appearance: Appearance,
-    startup_splash: Option<StartupSplash>,
-    testing_scene: Option<TestingScene>,
     diagnostics_shortcuts: DiagnosticsShortcuts,
     available_capabilities: CapabilitySet,
     window_icon_supported: bool,
@@ -1831,8 +1743,6 @@ impl ChymeralApp {
     fn new(
         event_proxy: EventLoopProxy<UserEvent>,
         appearance: Appearance,
-        startup_splash: Option<StartupSplash>,
-        testing_scene: Option<TestingScene>,
         diagnostics_shortcuts: DiagnosticsShortcuts,
         available_capabilities: CapabilitySet,
         window_icon_supported: bool,
@@ -1842,8 +1752,6 @@ impl ChymeralApp {
             modifiers: ModifiersState::default(),
             event_proxy,
             appearance,
-            startup_splash,
-            testing_scene,
             diagnostics_shortcuts,
             available_capabilities,
             window_icon_supported,
@@ -1892,8 +1800,6 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
             event_proxy,
             WindowStateOptions {
                 appearance: self.appearance.clone(),
-                startup_splash: self.startup_splash.clone(),
-                testing_scene: self.testing_scene.clone(),
                 diagnostics_shortcuts: self.diagnostics_shortcuts.clone(),
                 available_capabilities: self.available_capabilities,
                 fallback_window_icon,
@@ -2068,9 +1974,6 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
             if state.advance_scene_animations(now) && state.pending_resize.is_none() {
                 state.window.request_redraw();
             }
-            if state.advance_splash(now) && state.pending_resize.is_none() {
-                state.window.request_redraw();
-            }
             if state.diagnostics.needs_continuous_redraw() && state.pending_resize.is_none() {
                 state.window.request_redraw();
             }
@@ -2079,7 +1982,6 @@ impl ApplicationHandler<UserEvent> for ChymeralApp {
                 state.next_scene_animation_frame(),
                 state.next_resize_deadline(),
                 state.runtime.next_tick_deadline(),
-                state.next_splash_deadline(),
             ]
             .into_iter()
             .flatten()
@@ -2197,95 +2099,6 @@ fn physical_padding(scale_factor: f64) -> u32 {
     (PADDING * scale_factor)
         .round()
         .clamp(0.0, f64::from(u32::MAX)) as u32
-}
-
-fn install_testing_scene(
-    scene: &mut Scene,
-    textures: &mut TextureStore,
-    testing_scene: &TestingScene,
-) -> Result<()> {
-    let mut ids = HashMap::new();
-    let mut remaining = testing_scene.nodes.iter().collect::<Vec<_>>();
-    while !remaining.is_empty() {
-        let mut next = Vec::new();
-        let mut created = 0;
-        for testing_node in remaining {
-            let properties = testing_node_properties(testing_node)?;
-            let node = match testing_node.parent.as_deref() {
-                Some(parent) => match ids.get(parent) {
-                    Some(parent) => scene.create_child(*parent, properties)?,
-                    None => {
-                        next.push(testing_node);
-                        continue;
-                    }
-                },
-                None => scene.create_root_in_layer(
-                    properties,
-                    testing_node.layer.unwrap_or(SceneLayer::Overlay),
-                ),
-            };
-            let texture = ResourceTexture::from_rgba8(
-                1,
-                1,
-                vec![
-                    testing_node.color.red,
-                    testing_node.color.green,
-                    testing_node.color.blue,
-                    255,
-                ],
-            )?;
-            let texture = textures.insert(texture);
-            scene.set_content(
-                node,
-                NodeContent::Image(ImageNode::new(texture, testing_node.opacity)?),
-            )?;
-            ids.insert(testing_node.id.as_str(), node);
-            eprintln!(
-                "Chymeral: testing scene node {:?} uses {node:?}",
-                testing_node.id
-            );
-            created += 1;
-        }
-        if created == 0 {
-            anyhow::bail!("testing_tools.scene nodes could not resolve their parent hierarchy");
-        }
-        remaining = next;
-    }
-    Ok(())
-}
-
-fn testing_node_properties(testing_node: &config::TestingNode) -> Result<NodeProperties> {
-    Ok(NodeProperties {
-        transform: Transform::new(testing_node.x, testing_node.y)?,
-        bounds: Rect::new(0.0, 0.0, testing_node.width, testing_node.height)?,
-        clip_children: testing_node.clip_children,
-        z_index: testing_node.z_index,
-        ..NodeProperties::default()
-    })
-}
-
-fn splash_properties(
-    texture: &ResourceTexture,
-    surface_width: u32,
-    surface_height: u32,
-    scale_factor: f64,
-) -> Result<NodeProperties> {
-    if !scale_factor.is_finite() || scale_factor <= 0.0 {
-        anyhow::bail!("window scale factor must be a positive finite number");
-    }
-
-    let logical_width = f64::from(surface_width) / scale_factor;
-    let logical_height = f64::from(surface_height) / scale_factor;
-    let width = f64::from(texture.width());
-    let height = f64::from(texture.height());
-    Ok(NodeProperties {
-        transform: Transform::new(
-            (logical_width - width) / 2.0,
-            (logical_height - height) / 2.0,
-        )?,
-        bounds: Rect::new(0.0, 0.0, width, height)?,
-        ..NodeProperties::default()
-    })
 }
 
 fn select_surface_format(capabilities: &SurfaceCapabilities) -> Result<TextureFormat> {
@@ -2665,8 +2478,6 @@ fn main() -> Result<()> {
     let mut app = ChymeralApp::new(
         event_loop.create_proxy(),
         loaded_config.appearance,
-        loaded_config.startup_splash,
-        loaded_config.testing_scene,
         loaded_config.diagnostics,
         available_clp_capabilities(external_drop_supported),
         window_icon_supported,
@@ -2850,24 +2661,20 @@ mod tests {
     };
 
     use crate::{
-        TerminalProgram, available_clp_capabilities, bundled_window_icon,
-        config::{Appearance, Rgb, TestingNode, TestingScene},
+        TerminalProgram, available_clp_capabilities, bundled_window_icon, config::Appearance,
         engine_focus, engine_key, engine_modifiers, engine_pointer_button, engine_scroll_delta,
-        external_file_drop_position_from_physical, grid_size, install_testing_scene,
-        is_terminal_copy_shortcut, is_terminal_paste_shortcut, logical_pointer_position,
-        logical_scene_viewport, named_key_input, pty_size, select_present_mode,
-        select_surface_format, splash_properties, terminal_input, terminal_input_with_text,
-        terminal_paste_input, testing_node_properties,
+        external_file_drop_position_from_physical, grid_size, is_terminal_copy_shortcut,
+        is_terminal_paste_shortcut, logical_pointer_position, logical_scene_viewport,
+        named_key_input, pty_size, select_present_mode, select_surface_format, terminal_input,
+        terminal_input_with_text, terminal_paste_input,
     };
     use chymeral::{
         protocol::Capability,
-        resources::{Texture, TextureStore},
         runtime::{
             EngineEvent, FocusEvent, InitContext, Key as EngineKey, KeyEvent as EngineKeyEvent,
             KeyState, Modifiers as EngineModifiers, NamedKey as EngineNamedKey, PointerButton,
             Runtime, ScrollUnit, Vec2,
         },
-        scene::{Scene, SceneLayer},
     };
 
     #[test]
@@ -3141,90 +2948,5 @@ mod tests {
         assert_eq!(size.rows, 24);
         assert_eq!(size.pixel_width, 960);
         assert_eq!(size.pixel_height, 640);
-    }
-
-    #[test]
-    fn centers_a_splash_at_its_natural_logical_size() {
-        let texture = Texture::from_rgba8(20, 10, vec![0; 20 * 10 * 4]).unwrap();
-
-        let properties = splash_properties(&texture, 200, 120, 2.0).unwrap();
-
-        assert_eq!(properties.transform.x(), 40.0);
-        assert_eq!(properties.transform.y(), 25.0);
-        assert_eq!(
-            properties.bounds,
-            chymeral::scene::Rect::new(0.0, 0.0, 20.0, 10.0).unwrap()
-        );
-    }
-
-    #[test]
-    fn builds_testing_nodes_in_logical_scene_coordinates() {
-        let properties = testing_node_properties(&TestingNode {
-            id: "source".to_owned(),
-            parent: None,
-            x: 24.0,
-            y: 48.0,
-            width: 120.0,
-            height: 80.0,
-            color: Rgb::new(255, 102, 0),
-            opacity: 0.75,
-            clip_children: false,
-            z_index: 3,
-            layer: None,
-        })
-        .unwrap();
-
-        assert_eq!(properties.transform.x(), 24.0);
-        assert_eq!(properties.transform.y(), 48.0);
-        assert_eq!(
-            properties.bounds,
-            chymeral::scene::Rect::new(0.0, 0.0, 120.0, 80.0).unwrap()
-        );
-        assert_eq!(properties.z_index, 3);
-    }
-
-    #[test]
-    fn installs_testing_nodes_after_their_parent_even_when_declared_first() {
-        let testing_scene = TestingScene {
-            nodes: vec![
-                TestingNode {
-                    id: "child".to_owned(),
-                    parent: Some("root".to_owned()),
-                    x: 80.0,
-                    y: 0.0,
-                    width: 80.0,
-                    height: 80.0,
-                    color: Rgb::new(0, 102, 255),
-                    opacity: 1.0,
-                    clip_children: false,
-                    z_index: 1,
-                    layer: None,
-                },
-                TestingNode {
-                    id: "root".to_owned(),
-                    parent: None,
-                    x: 20.0,
-                    y: 40.0,
-                    width: 100.0,
-                    height: 100.0,
-                    color: Rgb::new(255, 102, 0),
-                    opacity: 0.5,
-                    clip_children: true,
-                    z_index: 0,
-                    layer: Some(SceneLayer::Underlay),
-                },
-            ],
-        };
-        let mut scene = Scene::new();
-        let mut textures = TextureStore::new();
-
-        install_testing_scene(&mut scene, &mut textures, &testing_scene).unwrap();
-
-        let root = scene.roots()[0];
-        let child = scene.node(root).unwrap().children()[0];
-        assert_eq!(scene.node(root).unwrap().layer(), SceneLayer::Underlay);
-        assert!(scene.node(root).unwrap().properties().clip_children);
-        assert_eq!(scene.node(child).unwrap().layer(), SceneLayer::Underlay);
-        assert_eq!(textures.len(), 2);
     }
 }

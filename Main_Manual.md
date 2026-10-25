@@ -103,8 +103,15 @@ Chymeral optionally reads `chymeral.toml`. The lookup order is:
 3. Windows: `%APPDATA%\chymeral\chymeral.toml`.
 
 An absent file uses the built-in defaults. Unknown TOML keys are rejected so a
-misspelled configuration cannot silently change behavior. Every relative path is
-resolved from the directory containing `chymeral.toml`.
+misspelled configuration cannot silently change behavior. Configuration has no
+compatibility aliases: the retired `[input.shortcuts]`,
+`[appearance.startup_splash]`, and `[testing_tools.scene]` sections are
+rejected. Every relative path is resolved from the directory containing
+`chymeral.toml`.
+
+To update an older file, remove the splash and testing-scene sections, then
+rename `[input.shortcuts]` to `[diagnostics.shortcuts]` without changing its
+three shortcut keys.
 
 On Linux, normal launches let `winit` select the active desktop backend. Setting
 `CHYMERAL_FORCE_X11=1` explicitly selects X11 for Chymeral's window. In a
@@ -140,19 +147,10 @@ path = "images/background.gif" # required for kind = "image"
 opacity = 0.72                 # 0.0 through 1.0
 fit = "cover"                 # "cover", "contain", or "stretch"
 
-[appearance.startup_splash]
-enabled = true
-image = "images/splash.png"
-duration_ms = 1500
-opacity = 1.0
-
-[input.shortcuts]
+[diagnostics.shortcuts]
 diagnostics_events = "Ctrl+Shift+E"
 diagnostics_ticks = "Ctrl+Shift+T"
 diagnostics_frames = "Ctrl+Shift+F"
-
-[testing_tools.scene]
-enabled = false
 ```
 
 For a file-backed font, set `source = "file"`, set `path`, and optionally set
@@ -176,23 +174,13 @@ the background. A transparent background requests a transparent window surface;
 if the active compositor cannot provide one, Chymeral continues with an opaque
 surface.
 
-The startup splash is an optional centered static PNG, JPG, or JPEG image.
-It disappears after `duration_ms`; GIF and other animated assets are not valid
-for the splash.
-
-### 4.2 Diagnostics and built-in scene fixtures
+### 4.2 Diagnostics
 
 The three configurable diagnostic shortcuts open modal event, tick, and frame
 views. `Escape` returns to the terminal, and keys typed while a diagnostic view
 is open are not sent to the shell. Their defaults are `Ctrl+Shift+E`,
 `Ctrl+Shift+T`, and `Ctrl+Shift+F`; the shortcuts must be distinct and include a
 modifier.
-
-`[testing_tools.scene]` is an internal visual fixture, disabled by default. It
-can create colored test nodes before a CLP application is attached. Each node
-has `id`, optional `parent`, `x`, `y`, `width`, `height`, `color`, `opacity`,
-`clip_children`, `z_index`, and an optional root-only `layer` (`underlay` or
-`overlay`). It is a test aid, not part of the CLP application API.
 
 ## 5. CLP sessions
 
@@ -783,9 +771,8 @@ they conform to the negotiated protocol and session rules.
 
 ## 10. Operational testing
 
-Use the configuration fixture only for visual internal checks. For CLP behavior,
-start Chymeral, open its terminal, then run a conformance client from an SDK
-repository. For Rust:
+For CLP behavior, start Chymeral, open its terminal, then run a conformance
+client from an SDK repository. For Rust:
 
 ```text
 cargo run --locked --example clp_conformance

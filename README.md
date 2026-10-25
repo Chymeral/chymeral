@@ -44,7 +44,7 @@ not become a host-loaded plugin.
 ## Current capabilities
 
 - PTY terminal with ANSI/VT rendering, configurable font and visual
-  appearance, image or animated GIF background, and optional startup splash.
+  appearance, and image or animated GIF background.
 - Retained 2D scene graph with roots, children, clipping, deterministic
   stacking, rectangles, unified RGBA8/GIF images, and intrinsic text nodes.
 - Alpha-aware image hit testing, hover, focus, drag-and-drop, passthrough

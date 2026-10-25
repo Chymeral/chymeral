@@ -22,6 +22,10 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
   preserves the accepted Chymeral `1.7.0`, SDK `1.7.0`, and CLP `v2.4`
   behavior while improving source navigation, module boundaries, and rationale
   documentation.
+- M26.2 is complete as a focused configuration-surface cleanup. It removes
+  the retired static-scene fixture and startup splash, renames diagnostic
+  shortcuts to their own top-level section, and keeps Chymeral `1.7.0`, both
+  SDKs `1.7.0`, and CLP `v2.4` unchanged.
 - No phase below has started unless its status explicitly says otherwise.
 
 ### M25 release record
@@ -1866,6 +1870,69 @@ documentation, and release-build/package checks. Before M26.1 is accepted:
   language support.
 - No Foregit changes; it is an independent application and may adopt the
   resulting source conventions later.
+
+## M26.2 — Configuration Surface Cleanup
+
+**Status:** Complete; host-only configuration cleanup, no CLP or SDK change
+
+### Purpose
+
+Reduce Chymeral's persistent configuration to terminal appearance, explicit
+scene-text font aliases, and diagnostic controls. A configuration file must not
+create an internal scene or inject a temporary host visual that is unrelated to
+the terminal or to a CLP client.
+
+### Accepted decisions
+
+- Remove `[testing_tools.scene]` completely: its parser, configuration model,
+  startup installation, runtime helper code, tests, template, and manual text.
+  It was a private visual fixture, not an application surface.
+- Remove `[appearance.startup_splash]` completely: its parser, configuration
+  model, image loading path, window state, timer, tests, template, and manual
+  text. Startup branding belongs to the window and a client-owned CLP scene,
+  not to a transient configuration overlay.
+- Rename `[input.shortcuts]` to `[diagnostics.shortcuts]`. Keep
+  `diagnostics_events`, `diagnostics_ticks`, and `diagnostics_frames` with the
+  same defaults, validation, and runtime behavior.
+- Do not provide aliases, fallback parsing, or migration shims. The retired
+  tables are rejected by the strict TOML schema so stale configuration cannot
+  appear to work while silently changing behavior.
+- Keep `terminal.font`, `terminal.foreground`, `terminal.background`, and
+  `scene_text.fonts` unchanged, including file-backed fonts, face indices,
+  background GIF behavior, opacity, fitting, and diagnostics shortcuts.
+
+### Non-goals and invariants
+
+- No CLP frame, capability, error, scene, rendering, terminal, or SDK API
+  changes belong to this cleanup.
+- Chymeral remains at the unpublished `1.7.0` development target; both SDKs
+  remain at `1.7.0`, and CLP remains `v2.4`.
+- No SDK checkout, fixture corpus, package publication, portable distribution,
+  or Foregit change is required.
+
+### Validation gates
+
+- Configuration unit tests accept `[diagnostics.shortcuts]` and reject each
+  retired section.
+- Linux and Windows pass locked formatting, complete tests, warnings-denied
+  clippy, documentation, and release-build gates.
+- The template and manual contain no retired configuration keys or claims.
+
+### Completion record
+
+- The configuration parser now accepts `[diagnostics.shortcuts]` and has a
+  regression test rejecting each retired section through the strict top-level
+  TOML schema.
+- The splash image decoder, timer, resize centering, retained-node setup, and
+  static testing-scene installation have been removed with their dedicated
+  unit coverage; normal image and animated-GIF backgrounds remain unchanged.
+- Linux and Windows each passed `cargo fmt --check`, locked all-target tests,
+  warnings-denied clippy, Rustdoc without dependencies, and the locked
+  all-target release build. The core suites reported 171 library tests, 59
+  binary tests, and the inherited CLP lifecycle integration test on both
+  targets.
+- The template, main manual, README, and unreleased changelog now describe the
+  smaller configuration surface and the intentionally breaking section rename.
 
 ## M27 — Stable Wayland Capability Upgrade
 

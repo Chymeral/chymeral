@@ -21,6 +21,10 @@ the CLP protocol and language SDKs have independent version numbers.
 
 - Successful scene batches reconcile only their final overlap state and request
   one redraw. They do not imply compositor acknowledgement or physical scanout.
+- Configuration now contains only terminal appearance, explicit scene-text font
+  aliases, and diagnostic controls. The internal `[testing_tools.scene]` and
+  `[appearance.startup_splash]` sections have been removed; diagnostic
+  shortcuts now live under `[diagnostics.shortcuts]`.
 
 ### Fixed
 
@@ -33,6 +37,9 @@ the CLP protocol and language SDKs have independent version numbers.
 - The unreleased Chymeral `1.7.0` development line implements CLP v2.4. It
   continues to accept v2.0 and v2.1 clients without granting later negotiated
   capabilities.
+- The retired `[testing_tools.scene]`, `[appearance.startup_splash]`, and
+  `[input.shortcuts]` configuration sections are deliberately rejected; no
+  compatibility aliases or sequential fallback are provided.
 
 ## [1.5.0] - 2026-10-22
 
