@@ -1759,12 +1759,16 @@ src/
   established path.
 - `program_scene/model.rs` is a real private module for scene handles,
   command/input types, patches, and errors. `program_scene.rs` re-exports the
-  established public paths unchanged while retaining resource ownership and
-  execution in its facade.
+  established public paths unchanged while retaining the scene-resource state
+  layout and construction entry points in its facade.
 - `program_scene/execution.rs` owns ordered CLP and legacy command execution
   plus presentation commits. Batch execution reaches only its two retained
   node helpers through parent-private visibility; resource ownership remains
   outside the command-facing module.
+- `program_scene/resources.rs` owns session cleanup, ownership lookups,
+  quotas, text accounting, overlap state, alpha-contact synchronization, and
+  retained content resolution. The facade holds the state layout, while
+  sibling modules reach only the narrow parent-private helpers they require.
 - The Rust SDK root remains its documented public surface. Its client, wire
   schema, framing, and private tests are source-separated while retaining the
   crate-root API and Rustdoc paths.
