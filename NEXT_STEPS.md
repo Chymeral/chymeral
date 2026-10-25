@@ -1754,9 +1754,13 @@ src/
   `program_scene/batch.rs` owns the M26 snapshot, rollback, alias validation,
   and commit path.
 - `transport/notifications.rs` owns per-session subscriptions, bounded queue
-  coalescing, delivery gaps, and metrics. The transport facade retains the
-  listener/session lifecycle and re-exports `ClpNotificationMetrics` at its
-  established path.
+  coalescing, delivery gaps, and metrics. The transport facade re-exports
+  `ClpNotificationMetrics` at its established path.
+- `transport/server.rs` owns local endpoint allocation, connection admission,
+  authenticated handshake, the bounded running-session output loop, and
+  shutdown/cleanup mechanics. `transport.rs` retains only the established
+  host-facing types and narrow re-exports; test-only parent-private helpers do
+  not widen the public transport surface.
 - `program_scene/model.rs` is a real private module for scene handles,
   command/input types, patches, and errors. `program_scene.rs` re-exports the
   established public paths unchanged while retaining the scene-resource state
