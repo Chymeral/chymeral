@@ -27,7 +27,7 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 
 | Milestone | Delivered foundation | Decisions established |
 | --- | --- | --- |
-| M1 | PTY terminal, ANSI/VT grid, `wgpu`/`glyphon` rendering, visual configuration, image/GIF background, and splash. | The terminal remains independently useful; graphical appearance is configuration, not an application API. |
+| M1 | PTY terminal, ANSI/VT grid, `wgpu`/`glyphon` rendering, visual configuration, image/GIF background, and the initial splash (retired in M26.2). | The terminal remains independently useful; graphical appearance is configuration, not an application API. |
 | M2 | Canonical `EngineEvent`; `Init`, `Start`, `Tick`, and `Frame` runtime lifecycle. | Runtime phases and frame timing are host-owned, and application-facing delivery must preserve that model. |
 | M3 | Retained scene graph. | Parent-before-child painting, deterministic sibling ordering, and distinct terminal/scene surfaces. |
 | M4 | Texture ownership and rendering resources. | Resources use opaque handles and must have explicit lifetime validation. |
@@ -53,18 +53,21 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 | M23 | Frame-paced scene presentation and CLP v2.1 fixtures. | Reliable structural commands remain ordered; bounded transient geometry is a newest-state mailbox committed at a renderer frame. |
 | M24 | CLP application window metadata. | Every session retains a bounded title/icon claim; newest live claim is visible and restores deterministically without granting desktop-window control. |
 | M25 | Chymeral `1.5.0` release integration. | CLP v2.1 and its two official SDK release lines are validated as a compatible feature release; Linux and Windows portable artifacts remain x86_64-only. |
+| M26 | Batched scene construction and atomic first presentation. | CLP v2.4 adds a bounded reliable structural revision with local aliases, all-or-nothing retained-state semantics, one redraw request, and no scanout claim. |
 
 ## CLP evolution
 
 CLP began as an internal lifecycle contract and became an actual local transport
 without exposing host memory, Rust types, graphics backend types, or a global
-socket. The released protocol is **v2.1**, which retains v2.0 compatibility and adds the opt-in
-`presentation` capability. CLP v2.0 has seven opt-in capabilities: `scene`,
-`images`, `input`, `timing`, `overlap`, `external_drop`, and `text`; v2.1 adds
-`presentation` for bounded transient geometry and `window_metadata` for
-session-owned native titles plus bounded static icons. M19 deliberately removed the
-v1.x and provisional v1.4 wire vocabularies before public SDK stability; the
-host provides no compatibility aliases.
+socket. The released protocol is **v2.1**, which retains v2.0 compatibility and
+adds the opt-in `presentation` capability. The `current-dev` line implements
+**v2.4**: v2.0 has seven opt-in capabilities (`scene`, `images`, `input`,
+`timing`, `overlap`, `external_drop`, and `text`); v2.1 adds `presentation` for
+bounded transient geometry and `window_metadata` for session-owned native
+titles plus bounded static icons; v2.4 adds `scene_batch` for reliable atomic
+structural revisions. M19 deliberately removed the v1.x and provisional v1.4
+wire vocabularies before public SDK stability; the host provides no
+compatibility aliases.
 
 The negotiated lifecycle is deliberately strict:
 
@@ -221,7 +224,99 @@ both title and dynamic icon updates. Native Wayland applies titles and reports
 explicit. The portable Linux launcher intentionally selects X11/Xwayland;
 native Wayland remains available when the binary is launched directly. ARM64,
 native-Wayland DnD, outgoing desktop DnD, and a stable `winit` upgrade remain
-out of scope until M26.
+out of scope until M27.
+
+## M26 batched scene construction
+
+M26 is implemented on `current-dev` as the additive CLP v2.4 `scene_batch`
+capability. Its reliable command carries one through 512 ordered structural
+operations and an entire JSON command envelope no larger than 512 KiB. Each
+`create_node` declares a unique local alias of at most 128 UTF-8 bytes without
+control characters; only a later operation may reference it. The vocabulary is
+deliberately limited to `create_node`, `set_node`, and `remove_node`, retaining
+the existing node, hierarchy, layer, resource, and capability rules rather
+than introducing a second scene model.
+
+The host snapshots the retained `Scene`, CLP node ownership, node-handle
+allocator, overlap pairs, and pending overlap notifications before applying a
+batch. A rejected operation restores that snapshot. A successful batch keeps
+only the final retained tree, rebuilds overlap state once from the prior
+baseline, and requests one redraw. This prevents transient overlap transitions
+and progressive construction from escaping the host event turn, but it does
+not claim a compositor acknowledgement or physical-display scanout.
+
+The Rust and Node SDKs expose a small typed `SceneBatch` builder plus explicit
+operation and alias-reference types. They validate local bounds before writing
+the command and return a capability error when the negotiated host lacks
+`scene_batch`; they never silently replay it as individual mutations. The core
+v2.4 fixture corpus is vendored byte-for-byte with its SHA-256 manifest by both
+SDKs and replayed through each public API. This preserves language-neutral
+conformance without adding a host plugin, widget toolkit, or virtual-DOM layer.
+
+Final Windows validation found an implementation-level transport boundary, not
+a CLP semantic failure: the local named-pipe listener has a 512-byte default
+output buffer, while a successful 13-operation scene-batch result was 1,433
+bytes. A nonblocking whole-frame write returned zero bytes indefinitely, which
+left the client waiting for its result before it could enter its input loop.
+`RunningFrameWriter` now sends queued frame bytes in 512-byte chunks. Framing
+still reconstructs the identical logical CLP message, and a bounded-transport
+regression test protects this behavior on every platform. The final Node probe
+passed on the Linux host and Windows VM: clicking anywhere within its covered
+panel focused the session, its status update completed, and `q` closed only the
+CLP session.
+
+## M26.1 internal maintainability structure
+
+M26.1 is an internal-only follow-up to M26 on `current-dev`; it changes no CLP
+v2.4 frame, capability, limit, public SDK export, or release version. The
+core now keeps `transport.rs` as the host-facing facade while `framing`,
+`notifications`, and `server` isolate local framing, bounded delivery, and
+listener/session lifecycle respectively. `program_scene.rs` similarly retains
+state layout and re-exports while `model`, `resources`, `batch`, and
+`execution` separate contract types, ownership and quotas, transactional
+rollback, and ordered command/presentation work.
+
+The Rust SDK keeps its crate root as the documented public surface while its
+client, wire schema, framing, and private tests are separately navigable. The
+Node SDK likewise retains `index.ts` as its only package entry point while
+client orchestration, codec, validation, transport, and batch construction are
+isolated internally. Private test access uses parent-private visibility only;
+these source paths are not new supported imports.
+
+The three vendored v2.0, v2.1, and v2.4 fixture corpora remain byte-identical
+with matching SHA-256 manifests. Formatting, test, warnings-denied lint,
+documentation, package/build, and core Linux/Windows release gates passed
+after the extraction. The structure is deliberately considered complete here:
+further splitting of `main.rs`, wire schemas, or renderer lifecycle would add
+coupling rather than improve ordinary maintenance navigation.
+
+## M26.2 configuration surface cleanup
+
+M26.2 reduces persistent configuration to terminal appearance, explicit
+`scene_text.fonts` aliases, and diagnostic controls. The internal
+`[testing_tools.scene]` fixture has been removed end-to-end: no configuration
+model, parser, startup installer, retained nodes, helper textures, or tests
+remain. A retained graphical scene now begins exclusively when a CLP client
+creates it; the terminal grid remains a separate surface.
+
+The temporary `[appearance.startup_splash]` overlay has likewise been removed
+from parsing, static-image loading, window state, resize handling, timers, and
+tests. Terminal background images and animated GIF backgrounds remain intact;
+application branding remains available through the existing native-window and
+CLP scene mechanisms.
+
+Diagnostic shortcuts now live under `[diagnostics.shortcuts]`. Their event,
+tick, and frame defaults and behavior are unchanged. The old
+`[input.shortcuts]` name, together with both removed sections, has no alias or
+fallback: the strict top-level TOML schema rejects it so stale configuration
+cannot silently alter behavior. M26.2 changes no CLP v2.4 frame, capability,
+SDK export, or development version target.
+
+Linux and Windows both passed formatting, locked all-target tests,
+warnings-denied clippy, Rustdoc, and locked all-target release builds after
+the cleanup. The configuration template, manual, README, and unreleased
+changelog record the smaller supported surface and its intentionally breaking
+configuration migration.
 
 ## Intentional boundaries
 

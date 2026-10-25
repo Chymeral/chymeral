@@ -1,9 +1,9 @@
 # Chymeral Main Manual
 
-This manual describes CLP v2.1 as delivered in Chymeral `1.5.0`. A v2.1 host
-continues to accept CLP v2.0 clients, which retain their existing behavior
-without the v2.1-only capabilities. It is written for terminal users,
-application authors, and SDK implementers.
+This manual describes CLP v2.4 in the Chymeral `1.7.0` development line. A
+v2.4 host continues to accept v2.0 and v2.1 clients, which retain their
+existing behavior without later capabilities. It is written for terminal
+users, application authors, and SDK implementers.
 For the design and milestone history, see the [Technical Journal](Technical_Journal.md).
 
 ## 1. Product model
@@ -103,8 +103,20 @@ Chymeral optionally reads `chymeral.toml`. The lookup order is:
 3. Windows: `%APPDATA%\chymeral\chymeral.toml`.
 
 An absent file uses the built-in defaults. Unknown TOML keys are rejected so a
-misspelled configuration cannot silently change behavior. Every relative path is
-resolved from the directory containing `chymeral.toml`.
+misspelled configuration cannot silently change behavior. Configuration has no
+compatibility aliases: the retired `[input.shortcuts]`,
+`[appearance.startup_splash]`, and `[testing_tools.scene]` sections are
+rejected. Every relative path is resolved from the directory containing
+`chymeral.toml`.
+
+The supported configuration surface is deliberately limited to
+`[terminal.font]`, `[terminal.foreground]`, `[terminal.background]`, optional
+`[scene_text.fonts.<alias>]`, and `[diagnostics.shortcuts]`. It does not
+describe, launch, or prebuild application scenes.
+
+To update an older file, remove the splash and testing-scene sections, then
+rename `[input.shortcuts]` to `[diagnostics.shortcuts]` without changing its
+three shortcut keys.
 
 On Linux, normal launches let `winit` select the active desktop backend. Setting
 `CHYMERAL_FORCE_X11=1` explicitly selects X11 for Chymeral's window. In a
@@ -140,19 +152,10 @@ path = "images/background.gif" # required for kind = "image"
 opacity = 0.72                 # 0.0 through 1.0
 fit = "cover"                 # "cover", "contain", or "stretch"
 
-[appearance.startup_splash]
-enabled = true
-image = "images/splash.png"
-duration_ms = 1500
-opacity = 1.0
-
-[input.shortcuts]
+[diagnostics.shortcuts]
 diagnostics_events = "Ctrl+Shift+E"
 diagnostics_ticks = "Ctrl+Shift+T"
 diagnostics_frames = "Ctrl+Shift+F"
-
-[testing_tools.scene]
-enabled = false
 ```
 
 For a file-backed font, set `source = "file"`, set `path`, and optionally set
@@ -176,11 +179,7 @@ the background. A transparent background requests a transparent window surface;
 if the active compositor cannot provide one, Chymeral continues with an opaque
 surface.
 
-The startup splash is an optional centered static PNG, JPG, or JPEG image.
-It disappears after `duration_ms`; GIF and other animated assets are not valid
-for the splash.
-
-### 4.2 Diagnostics and built-in scene fixtures
+### 4.2 Diagnostics
 
 The three configurable diagnostic shortcuts open modal event, tick, and frame
 views. `Escape` returns to the terminal, and keys typed while a diagnostic view
@@ -188,20 +187,15 @@ is open are not sent to the shell. Their defaults are `Ctrl+Shift+E`,
 `Ctrl+Shift+T`, and `Ctrl+Shift+F`; the shortcuts must be distinct and include a
 modifier.
 
-`[testing_tools.scene]` is an internal visual fixture, disabled by default. It
-can create colored test nodes before a CLP application is attached. Each node
-has `id`, optional `parent`, `x`, `y`, `width`, `height`, `color`, `opacity`,
-`clip_children`, `z_index`, and an optional root-only `layer` (`underlay` or
-`overlay`). It is a test aid, not part of the CLP application API.
-
 ## 5. CLP sessions
 
 **CLP** means *Chymeral Link Protocol*. It is a versioned, language-neutral
-contract between a Chymeral window and an application process. The released
-contract is **CLP v2.1**, including presentation and application-window-
-metadata extensions. A v2.1 host accepts v2.0 clients without granting those
-two additional capabilities. Neither version accepts CLP v1.x clients or
-provides command aliases for their prior vocabulary.
+contract between a Chymeral window and an application process. The
+`current-dev` contract is **CLP v2.4**, including presentation,
+application-window-metadata, and atomic-scene-batch extensions. A v2.4 host
+accepts v2.0 and v2.1 clients without granting later capabilities. No supported
+version accepts CLP v1.x clients or provides command aliases for their prior
+vocabulary.
 
 When Chymeral starts its shell, the shell and its descendants inherit two
 private variables:
@@ -258,6 +252,7 @@ intersection with its supported set:
 | `text` | Creating and changing intrinsic scene-text nodes; also requires `scene`. |
 | `presentation` | CLP v2.1 bounded, coalesced geometry packets committed at a renderer frame; also requires `scene`. |
 | `window_metadata` | CLP v2.1 session-owned native title and bounded static RGBA8 icon claim. |
+| `scene_batch` | CLP v2.4 reliable, bounded atomic scene construction or structural revision; also requires `scene`. |
 
 After the lifecycle handshake, a client may replace its subscription set:
 
@@ -320,6 +315,7 @@ upload_image      remove_image
 is_overlapping    get_overlaps
 present_scene (CLP v2.1)
 set_window_metadata (CLP v2.1)
+scene_batch (CLP v2.4)
 ```
 
 Each session owns one implicit retained scene tree. `create_node` creates a
@@ -368,7 +364,71 @@ limits before applying a command. An individual static image is limited to
 64 MiB of RGBA8 data; the combined static-image and decoded-GIF total is
 limited to 128 MiB per session, in addition to GPU limits.
 
-### 6.1 Frame-paced presentation (CLP v2.1)
+### 6.1 Atomic scene batches (CLP v2.4)
+
+`scene_batch` is the reliable structural path for a complete first scene or a
+coherent retained-scene revision. Request both `scene` and `scene_batch`, then
+send one ordinary command envelope containing ordered `create_node`,
+`set_node`, and `remove_node` operations:
+
+```json
+{
+  "type": "command",
+  "request_id": "initial-panel",
+  "command": {
+    "op": "scene_batch",
+    "operations": [
+      {
+        "op": "create_node",
+        "alias": "panel",
+        "layer": "overlay",
+        "node": { "kind": "rectangle", "properties": { "x": 8, "y": 12, "width": 240, "height": 120 }, "color": [36, 88, 216, 255] }
+      },
+      {
+        "op": "create_node",
+        "alias": "label",
+        "parent": { "alias": "panel" },
+        "node": { "kind": "text", "properties": { "x": 16, "y": 24 }, "text": "Ready", "style": {} }
+      },
+      {
+        "op": "set_node",
+        "node": { "alias": "panel" },
+        "changes": { "properties": { "clip_children": true } }
+      }
+    ]
+  }
+}
+```
+
+Every `create_node` declares a unique UTF-8 alias; aliases contain no control
+characters and are limited to 128 bytes. A later operation may refer to that
+alias as `{ "alias": "name" }`, while an existing node uses its ordinary
+`"node-N"` handle. Aliases must be declared earlier in the same batch, so
+parents naturally precede their children. A child must omit `layer`; the usual
+root-layer and hierarchy rules remain unchanged.
+
+A batch contains one through 512 operations and its complete JSON command
+envelope is limited to 512 KiB. It may use image, text, overlap, or external
+drop properties only when the corresponding already-negotiated capability is
+also granted. Image upload/removal, window metadata, subscriptions, and
+`present_scene` remain separate operations.
+
+Chymeral validates the full revision, restores the prior retained scene and
+node-handle allocation if any operation fails, and exposes no intermediate
+tree. It reconciles overlap transitions only against the final scene. A
+successful batch requests one redraw, but neither the command result nor its
+response promises a compositor or physical-display scanout. The ordered result
+contains one outcome per operation and a `nodes` map for aliases that remain
+live after commit; a temporary alias created and removed in the same batch is
+therefore absent from that map.
+
+The capability deliberately has no automatic sequential fallback. If
+`scene_batch` is absent, an SDK returns a capability error and the application
+must explicitly choose its own incremental `create_node`/`set_node` path. This
+avoids silently turning a requested atomic first paint into visible progressive
+assembly.
+
+### 6.2 Frame-paced presentation (CLP v2.1)
 
 `present_scene` is a separate, opt-in visual lane for continuous state such as
 dragging a viewport, scrolling a scene subtree, or moving a related control.
@@ -433,11 +493,12 @@ physical scanout as unavailable because neither has a portable host timestamp.
 Command rejection uses a stable machine-readable `code` plus a diagnostic
 message. The v2 codes are `unsupported_version`, `capability_denied`,
 `invalid_command`, `invalid_handle`, `not_owner`, `image_in_use`,
-`resource_limit`, `invalid_argument`, `invalid_node_change`, `host_capacity`,
-`host_unavailable`, and `protocol_violation`. Clients should branch only on the
-code; messages are for people and diagnostics.
+`resource_limit`, `invalid_argument`, `invalid_node_change`,
+`invalid_scene_batch`, `host_capacity`, `host_unavailable`, and
+`protocol_violation`. Clients should branch only on the code; messages are for
+people and diagnostics.
 
-### 6.2 Application window metadata (CLP v2.1)
+### 6.3 Application window metadata (CLP v2.1)
 
 With `window_metadata`, a session may supply the title and icon identifying its
 ordinary program inside the native Chymeral window. This is intentionally not
@@ -485,7 +546,7 @@ icon instead. Chymeral does not force X11 for this feature. CLP v2.0 clients
 cannot request `window_metadata` and retain ordinary terminal title/icon
 behavior.
 
-### 6.3 Intrinsic scene text
+### 6.4 Intrinsic scene text
 
 With `scene` and `text`, an application creates a `text` node through
 `create_node`. Its origin is the upper-left corner of the first cell, not the
@@ -511,7 +572,7 @@ A session retains at most 16 MiB of text, 1 Mi terminal cells, and 1,024 text
 nodes. These limits prevent a client from exhausting host memory or rendering
 resources.
 
-### 6.4 Animated scene images
+### 6.5 Animated scene images
 
 With `images`, a client uploads encoded GIF bytes through the same
 `upload_image` operation used for RGBA8 images. It declares
@@ -636,6 +697,11 @@ extends that method for `presentation` and `window_metadata`. It includes an
 accepted frame packet, a rejected intrinsic-text bounds update, and title/icon
 patch preservation and clearing.
 
+The versioned [CLP v2.4 fixture corpus](protocol/fixtures/v2.4/README.md)
+adds an atomic `scene_batch` construction vector. It verifies local aliases,
+parent-before-child ordering, the ordered result, and a clean close through the
+same framed transport.
+
 ### Rust
 
 For a released version, add the crate from `crates.io` to an application
@@ -652,6 +718,10 @@ For local development, add a path dependency to an application project:
 [dependencies]
 chymeral-rust-sdk = { path = "../chymeral-rust-sdk" }
 ```
+
+The published `1.5.x` crate implements CLP v2.1. Until the `1.7.0` release is
+published, use the `current-dev` SDK checkout through the path dependency to
+exercise CLP v2.4 scene batches.
 
 Run the application from a Chymeral terminal, then connect and create a node:
 
@@ -679,13 +749,13 @@ fn main() -> chymeral_rust_sdk::Result<()> {
 }
 ```
 
-The stable `1.5.0` SDK exposes typed CLP v2.1 capabilities, session and
-opaque-handle types, nodes, atomic node changes, unified images, subscriptions,
-notifications, close reasons, client errors, alpha image contact, generic node
-input passthrough, frame-paced presentation, and application window metadata.
-`clp_conformance` exercises lifecycle, timing, images, text, scene mutation,
-and overlap against a live Chymeral endpoint, including both RGBA8 and GIF
-image uploads.
+The `1.7.0` development SDK line exposes typed CLP v2.4 capabilities, session
+and opaque-handle types, nodes, `SceneBatch`, atomic node changes, unified
+images, subscriptions, notifications, close reasons, client errors, alpha
+image contact, generic node input passthrough, frame-paced presentation, and
+application window metadata. `clp_conformance` exercises lifecycle, timing,
+images, text, scene mutation, batches, and overlap against a live Chymeral
+endpoint, including both RGBA8 and GIF image uploads.
 
 ### Node.js and TypeScript
 
@@ -707,12 +777,11 @@ they conform to the negotiated protocol and session rules.
 
 ## 10. Operational testing
 
-Use the configuration fixture only for visual internal checks. For CLP behavior,
-start Chymeral, open its terminal, then run a conformance client from an SDK
-repository. For Rust:
+For CLP behavior, start Chymeral, open its terminal, then run a conformance
+client from an SDK repository. For Rust:
 
 ```text
-cargo run --locked --example clp_conformance
+cargo run --locked --release --example clp_conformance
 ```
 
 For the CLP v2.1 presentation path, launch Chymeral with
@@ -726,6 +795,22 @@ Click the blue panel once to focus the probe, move the pointer, scroll, resize
 the window, then press `b` for its 180-update 60 Hz burst and `q` to print the
 observed application-submit-to-host-status summary. Compare the probe output
 with the host trace; neither is physical input-to-photon timing.
+
+For CLP v2.4 scene batches, run either SDK conformance client from a Chymeral
+terminal. Each client creates, updates, and removes retained nodes through an
+atomic batch, checks the returned aliases, and then removes its remaining
+resources before closing only its own session. The host and both SDK test suites
+also replay the exact v2.4 fixture corpus. For a visible first-paint check from
+the Node SDK checkout, run:
+
+```text
+npm run example:scene-batch
+```
+
+It creates a complete panel of nested rectangles and text through one batch.
+Confirm it appears as one coherent composition rather than visible serial
+assembly, then click it to focus the session and press `q`. This closes only
+the probe session, leaving the terminal open.
 
 For CLP v2.1 application window metadata, run the Node SDK probe from a
 Chymeral terminal:
@@ -753,8 +838,9 @@ Each conformance client must return successfully to the same terminal without
 closing the surrounding Chymeral terminal.
 
 To validate alpha image contact and node passthrough interactively, run the
-Rust client with `cargo run --locked --example clp_conformance -- --manual` or
-the Node client with `npm run example:conformance -- --manual`. The manual
+Rust client with
+`cargo run --locked --release --example clp_conformance -- --manual` or the
+Node client with `npm run example:conformance -- --manual`. The manual
 scenario shows a blue target, an orange alpha-frame image, a pink GIF tile that
 alternates between opaque and transparent, and a visible white band with
 `input_passthrough`. The terminal identifies each directed scene event and the
@@ -762,7 +848,9 @@ GIF's overlap transitions: the orange rim must target the image; its transparent
 center and the white band must target the blue node; the pink tile must target
 only while visible. Where `external_drop` is granted, dropping a desktop file
 on those regions follows the same routing. Click a scene node and press `q` to
-close only the client session.
+close only the client session. Both conformance clients print the CLP version
+actually negotiated with the host rather than inferring it from the feature
+being tested.
 
 ## 11. Boundaries and next steps
 
@@ -774,9 +862,10 @@ conformance suite without changing the ordinary-program model at the center of
 Chymeral. An IDL remains deferred until it removes real duplication that the
 fixtures and independent SDKs cannot address.
 
-The current stable source baseline is Chymeral `1.5.0`, which implements CLP
-v2.1. The separate Rust reference binding and Node binding are both `1.5.0`;
-their package versions do not version the protocol or the terminal application.
-The host Rust crate exists to share implementation between the executable and
-its tests. It is not a supported application-development API: programs should
-use CLP directly or a language SDK.
+The current stable source baseline on `main` is Chymeral `1.5.0`, which
+implements CLP v2.1. The `current-dev` branch prepares Chymeral and the two
+supported SDKs at `1.7.0` over CLP v2.4; their package versions do not version
+the protocol or the terminal application. The host Rust crate exists to share
+implementation between the executable and its tests. It is not a supported
+application-development API: programs should use CLP directly or a language
+SDK.

@@ -661,13 +661,13 @@ impl Display for SceneError {
 
 impl Error for SceneError {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Slot {
     generation: u64,
     node: Option<Node>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
     slots: Vec<Slot>,
     free_slots: Vec<usize>,

@@ -1,12 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use chymeral::scene::SceneLayer;
 use serde::Deserialize;
 
 use crate::diagnostics::{DiagnosticsShortcuts, Shortcut};
@@ -100,33 +98,6 @@ pub enum Background {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct StartupSplash {
-    pub path: PathBuf,
-    pub duration: Duration,
-    pub opacity: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TestingScene {
-    pub nodes: Vec<TestingNode>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TestingNode {
-    pub id: String,
-    pub parent: Option<String>,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-    pub color: Rgb,
-    pub opacity: f32,
-    pub clip_children: bool,
-    pub z_index: i32,
-    pub layer: Option<SceneLayer>,
-}
-
 impl Background {
     pub fn opacity(&self) -> f32 {
         match self {
@@ -150,9 +121,7 @@ pub enum ImageFit {
 
 pub struct LoadedConfig {
     pub appearance: Appearance,
-    pub startup_splash: Option<StartupSplash>,
     pub diagnostics: DiagnosticsShortcuts,
-    pub testing_scene: Option<TestingScene>,
     pub path: Option<PathBuf>,
 }
 
@@ -160,9 +129,7 @@ pub fn load() -> Result<LoadedConfig> {
     let Some(path) = config_path() else {
         return Ok(LoadedConfig {
             appearance: Appearance::default(),
-            startup_splash: None,
             diagnostics: DiagnosticsShortcuts::default(),
-            testing_scene: None,
             path: None,
         });
     };
@@ -170,9 +137,7 @@ pub fn load() -> Result<LoadedConfig> {
     if !path.exists() {
         return Ok(LoadedConfig {
             appearance: Appearance::default(),
-            startup_splash: None,
             diagnostics: DiagnosticsShortcuts::default(),
-            testing_scene: None,
             path: None,
         });
     }
@@ -185,9 +150,7 @@ pub fn load() -> Result<LoadedConfig> {
 
     Ok(LoadedConfig {
         appearance: parsed.appearance,
-        startup_splash: parsed.startup_splash,
         diagnostics: parsed.diagnostics,
-        testing_scene: parsed.testing_scene,
         path: Some(path),
     })
 }
@@ -227,27 +190,21 @@ fn parse(contents: &str, base_directory: &Path) -> Result<Appearance> {
 
 struct ParsedConfig {
     appearance: Appearance,
-    startup_splash: Option<StartupSplash>,
     diagnostics: DiagnosticsShortcuts,
-    testing_scene: Option<TestingScene>,
 }
 
 fn parse_config(contents: &str, base_directory: &Path) -> Result<ParsedConfig> {
     let raw: RawConfig = toml::from_str(contents).context("could not parse TOML")?;
     let RawConfig {
         terminal,
-        appearance,
         scene_text,
-        input,
-        testing_tools,
+        diagnostics,
     } = raw;
     let mut terminal = terminal.into_appearance(base_directory)?;
     terminal.scene_text_fonts = scene_text.into_fonts(base_directory)?;
     Ok(ParsedConfig {
         appearance: terminal,
-        startup_splash: appearance.into_startup_splash(base_directory)?,
-        diagnostics: input.shortcuts.into_shortcuts()?,
-        testing_scene: testing_tools.into_scene()?,
+        diagnostics: diagnostics.shortcuts.into_shortcuts()?,
     })
 }
 
@@ -257,13 +214,9 @@ struct RawConfig {
     #[serde(default)]
     terminal: RawTerminal,
     #[serde(default)]
-    appearance: RawAppearance,
-    #[serde(default)]
     scene_text: RawSceneText,
     #[serde(default)]
-    input: RawInput,
-    #[serde(default)]
-    testing_tools: RawTestingTools,
+    diagnostics: RawDiagnostics,
 }
 
 #[derive(Default, Deserialize)]
@@ -303,218 +256,14 @@ struct RawSceneTextFont {
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTestingTools {
+struct RawDiagnostics {
     #[serde(default)]
-    scene: RawTestingScene,
-}
-
-impl RawTestingTools {
-    fn into_scene(self) -> Result<Option<TestingScene>> {
-        self.scene.into_scene()
-    }
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTestingScene {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    nodes: Vec<RawTestingNode>,
-}
-
-impl RawTestingScene {
-    fn into_scene(self) -> Result<Option<TestingScene>> {
-        if !self.enabled {
-            return Ok(None);
-        }
-        if self.nodes.is_empty() {
-            bail!("testing_tools.scene.nodes must contain at least one node when enabled = true");
-        }
-
-        let mut ids = HashSet::new();
-        let nodes = self
-            .nodes
-            .into_iter()
-            .map(|node| node.into_node(&mut ids))
-            .collect::<Result<Vec<_>>>()?;
-        validate_testing_hierarchy(&nodes)?;
-        Ok(Some(TestingScene { nodes }))
-    }
+    shortcuts: RawDiagnosticsShortcuts,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTestingNode {
-    id: String,
-    parent: Option<String>,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    color: String,
-    #[serde(default = "default_opacity")]
-    opacity: f32,
-    #[serde(default)]
-    clip_children: bool,
-    #[serde(default)]
-    z_index: i32,
-    layer: Option<RawSceneLayer>,
-}
-
-impl RawTestingNode {
-    fn into_node(self, ids: &mut HashSet<String>) -> Result<TestingNode> {
-        let id = self.id.trim().to_owned();
-        if id.is_empty() {
-            bail!("testing_tools.scene.nodes[].id must not be empty");
-        }
-        if !ids.insert(id.clone()) {
-            bail!("testing_tools.scene.nodes[].id {id:?} is duplicated");
-        }
-        let parent = self.parent.map(|parent| parent.trim().to_owned());
-        if parent.as_ref().is_some_and(String::is_empty) {
-            bail!("testing_tools.scene.nodes[].parent must not be empty");
-        }
-        if parent.is_some() && self.layer.is_some() {
-            bail!("testing_tools.scene.nodes[].layer is only valid on root nodes");
-        }
-        validate_finite("testing_tools.scene.nodes[].x", self.x)?;
-        validate_finite("testing_tools.scene.nodes[].y", self.y)?;
-        validate_positive_f64("testing_tools.scene.nodes[].width", self.width)?;
-        validate_positive_f64("testing_tools.scene.nodes[].height", self.height)?;
-        if !(self.x + self.width).is_finite() || !(self.y + self.height).is_finite() {
-            bail!("testing_tools.scene.nodes[] bounds must remain finite");
-        }
-        if !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
-            bail!("testing_tools.scene.nodes[].opacity must be between 0.0 and 1.0");
-        }
-        Ok(TestingNode {
-            id,
-            parent,
-            x: self.x,
-            y: self.y,
-            width: self.width,
-            height: self.height,
-            color: parse_hex_color("testing_tools.scene.nodes[].color", &self.color)?,
-            opacity: self.opacity,
-            clip_children: self.clip_children,
-            z_index: self.z_index,
-            layer: self.layer.map(RawSceneLayer::into_layer),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum RawSceneLayer {
-    Underlay,
-    Overlay,
-}
-
-impl RawSceneLayer {
-    const fn into_layer(self) -> SceneLayer {
-        match self {
-            Self::Underlay => SceneLayer::Underlay,
-            Self::Overlay => SceneLayer::Overlay,
-        }
-    }
-}
-
-fn validate_testing_hierarchy(nodes: &[TestingNode]) -> Result<()> {
-    let parents = nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node.parent.as_deref()))
-        .collect::<HashMap<_, _>>();
-    for node in nodes {
-        let mut visited = HashSet::new();
-        let mut current = Some(node.id.as_str());
-        while let Some(id) = current {
-            if !visited.insert(id) {
-                bail!("testing_tools.scene.nodes contain a parent cycle at {id:?}");
-            }
-            current = parents
-                .get(id)
-                .with_context(|| {
-                    format!("testing_tools.scene.nodes[].parent references unknown node {id:?}")
-                })?
-                .to_owned();
-        }
-    }
-    Ok(())
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawAppearance {
-    #[serde(default)]
-    startup_splash: RawStartupSplash,
-}
-
-impl RawAppearance {
-    fn into_startup_splash(self, base_directory: &Path) -> Result<Option<StartupSplash>> {
-        self.startup_splash.into_splash(base_directory)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawStartupSplash {
-    #[serde(default)]
-    enabled: bool,
-    image: Option<PathBuf>,
-    #[serde(default = "default_splash_duration_ms")]
-    duration_ms: u64,
-    #[serde(default = "default_opacity")]
-    opacity: f32,
-}
-
-impl Default for RawStartupSplash {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            image: None,
-            duration_ms: default_splash_duration_ms(),
-            opacity: default_opacity(),
-        }
-    }
-}
-
-impl RawStartupSplash {
-    fn into_splash(self, base_directory: &Path) -> Result<Option<StartupSplash>> {
-        if !self.enabled {
-            return Ok(None);
-        }
-        let path = self
-            .image
-            .context("appearance.startup_splash.image is required when enabled = true")?;
-        if self.duration_ms == 0 {
-            bail!("appearance.startup_splash.duration_ms must be greater than zero");
-        }
-        if !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
-            bail!("appearance.startup_splash.opacity must be between 0.0 and 1.0");
-        }
-        Ok(Some(StartupSplash {
-            path: resolve_path(base_directory, path),
-            duration: Duration::from_millis(self.duration_ms),
-            opacity: self.opacity,
-        }))
-    }
-}
-
-fn default_splash_duration_ms() -> u64 {
-    1_500
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawInput {
-    #[serde(default)]
-    shortcuts: RawShortcuts,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawShortcuts {
+struct RawDiagnosticsShortcuts {
     #[serde(default = "default_events_shortcut")]
     diagnostics_events: String,
     #[serde(default = "default_ticks_shortcut")]
@@ -523,7 +272,7 @@ struct RawShortcuts {
     diagnostics_frames: String,
 }
 
-impl Default for RawShortcuts {
+impl Default for RawDiagnosticsShortcuts {
     fn default() -> Self {
         Self {
             diagnostics_events: default_events_shortcut(),
@@ -533,16 +282,19 @@ impl Default for RawShortcuts {
     }
 }
 
-impl RawShortcuts {
+impl RawDiagnosticsShortcuts {
     fn into_shortcuts(self) -> Result<DiagnosticsShortcuts> {
         let shortcuts = DiagnosticsShortcuts {
             events: parse_shortcut(
-                "input.shortcuts.diagnostics_events",
+                "diagnostics.shortcuts.diagnostics_events",
                 &self.diagnostics_events,
             )?,
-            ticks: parse_shortcut("input.shortcuts.diagnostics_ticks", &self.diagnostics_ticks)?,
+            ticks: parse_shortcut(
+                "diagnostics.shortcuts.diagnostics_ticks",
+                &self.diagnostics_ticks,
+            )?,
             frames: parse_shortcut(
-                "input.shortcuts.diagnostics_frames",
+                "diagnostics.shortcuts.diagnostics_frames",
                 &self.diagnostics_frames,
             )?,
         };
@@ -550,7 +302,7 @@ impl RawShortcuts {
             || shortcuts.events == shortcuts.frames
             || shortcuts.ticks == shortcuts.frames
         {
-            bail!("input.shortcuts diagnostics shortcuts must be distinct");
+            bail!("diagnostics.shortcuts diagnostics shortcuts must be distinct");
         }
         Ok(shortcuts)
     }
@@ -818,27 +570,13 @@ fn validate_positive(name: &str, value: f32) -> Result<()> {
     Ok(())
 }
 
-fn validate_finite(name: &str, value: f64) -> Result<()> {
-    if !value.is_finite() {
-        bail!("{name} must be finite");
-    }
-    Ok(())
-}
-
-fn validate_positive_f64(name: &str, value: f64) -> Result<()> {
-    if !value.is_finite() || value <= 0.0 {
-        bail!("{name} must be a positive finite number");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::Duration};
+    use std::path::Path;
 
     use super::{
-        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, SceneLayer, StartupSplash,
-        TestingNode, TestingScene, parse, parse_config, parse_hex_color,
+        Background, CellWidth, FontSource, Foreground, ImageFit, Rgb, parse, parse_config,
+        parse_hex_color,
     };
     use crate::diagnostics::Shortcut;
 
@@ -996,7 +734,7 @@ mod tests {
     fn loads_diagnostics_shortcuts() {
         let config = parse_config(
             r#"
-                [input.shortcuts]
+                [diagnostics.shortcuts]
                 diagnostics_events = "Alt+E"
                 diagnostics_ticks = "Ctrl+T"
                 diagnostics_frames = "Super+F"
@@ -1014,11 +752,20 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_maintained_configuration_template() {
+        parse_config(
+            include_str!("../chymeral.toml.example"),
+            Path::new("/tmp/chymeral-config"),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn rejects_an_unmodified_diagnostics_shortcut() {
         assert!(
             parse_config(
                 r#"
-                [input.shortcuts]
+                [diagnostics.shortcuts]
                 diagnostics_events = "E"
             "#,
                 Path::new("/tmp/chymeral-config"),
@@ -1032,7 +779,7 @@ mod tests {
         assert!(
             parse_config(
                 r#"
-                [input.shortcuts]
+                [diagnostics.shortcuts]
                 diagnostics_events = "Ctrl+Shift+E"
                 diagnostics_ticks = "Ctrl+Shift+E"
             "#,
@@ -1043,250 +790,20 @@ mod tests {
     }
 
     #[test]
-    fn loads_an_enabled_relative_startup_splash() {
-        let config = parse_config(
-            r#"
-                [appearance.startup_splash]
-                enabled = true
-                image = "images/splash.png"
-                duration_ms = 1250
-                opacity = 0.65
-            "#,
-            Path::new("/tmp/chymeral-config"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.startup_splash,
-            Some(StartupSplash {
-                path: "/tmp/chymeral-config/images/splash.png".into(),
-                duration: Duration::from_millis(1250),
-                opacity: 0.65,
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_an_incomplete_or_invalid_startup_splash() {
+    fn rejects_retired_configuration_sections() {
         for contents in [
             r#"
                 [appearance.startup_splash]
-                enabled = true
+                enabled = false
             "#,
             r#"
-                [appearance.startup_splash]
-                enabled = true
-                image = "splash.png"
-                duration_ms = 0
+                [testing_tools.scene]
+                enabled = false
             "#,
             r#"
-                [appearance.startup_splash]
-                enabled = true
-                image = "splash.png"
-                opacity = 1.1
+                [input.shortcuts]
+                diagnostics_events = "Ctrl+Shift+E"
             "#,
-        ] {
-            assert!(parse_config(contents, Path::new("/tmp/chymeral-config")).is_err());
-        }
-    }
-
-    #[test]
-    fn loads_a_testing_scene_with_distinct_named_nodes() {
-        let config = parse_config(
-            r##"
-                [testing_tools.scene]
-                enabled = true
-
-                [[testing_tools.scene.nodes]]
-                id = "source"
-                x = 24.0
-                y = 48.0
-                width = 120.0
-                height = 80.0
-                color = "#FF6600"
-                opacity = 0.75
-                z_index = 1
-
-                [[testing_tools.scene.nodes]]
-                id = "target"
-                x = 200.0
-                y = 48.0
-                width = 120.0
-                height = 80.0
-                color = "#0066FF"
-            "##,
-            Path::new("/tmp/chymeral-config"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.testing_scene,
-            Some(TestingScene {
-                nodes: vec![
-                    TestingNode {
-                        id: "source".to_owned(),
-                        parent: None,
-                        x: 24.0,
-                        y: 48.0,
-                        width: 120.0,
-                        height: 80.0,
-                        color: Rgb::new(255, 102, 0),
-                        opacity: 0.75,
-                        clip_children: false,
-                        z_index: 1,
-                        layer: None,
-                    },
-                    TestingNode {
-                        id: "target".to_owned(),
-                        parent: None,
-                        x: 200.0,
-                        y: 48.0,
-                        width: 120.0,
-                        height: 80.0,
-                        color: Rgb::new(0, 102, 255),
-                        opacity: 1.0,
-                        clip_children: false,
-                        z_index: 0,
-                        layer: None,
-                    },
-                ],
-            })
-        );
-    }
-
-    #[test]
-    fn loads_testing_scene_hierarchy_and_root_layer() {
-        let config = parse_config(
-            r##"
-                [testing_tools.scene]
-                enabled = true
-
-                [[testing_tools.scene.nodes]]
-                id = "panel"
-                x = 24.0
-                y = 48.0
-                width = 120.0
-                height = 80.0
-                color = "#112233"
-                clip_children = true
-                layer = "underlay"
-
-                [[testing_tools.scene.nodes]]
-                id = "child"
-                parent = "panel"
-                x = 100.0
-                y = 12.0
-                width = 40.0
-                height = 40.0
-                color = "#445566"
-            "##,
-            Path::new("/tmp/chymeral-config"),
-        )
-        .unwrap();
-        let scene = config.testing_scene.unwrap();
-
-        assert_eq!(scene.nodes[0].layer, Some(SceneLayer::Underlay));
-        assert!(scene.nodes[0].clip_children);
-        assert_eq!(scene.nodes[1].parent.as_deref(), Some("panel"));
-        assert_eq!(scene.nodes[1].layer, None);
-    }
-
-    #[test]
-    fn rejects_an_invalid_enabled_testing_scene() {
-        for contents in [
-            r#"
-                [testing_tools.scene]
-                enabled = true
-            "#,
-            r##"
-                [testing_tools.scene]
-                enabled = true
-
-                [[testing_tools.scene.nodes]]
-                id = "same"
-                x = 0.0
-                y = 0.0
-                width = 10.0
-                height = 10.0
-                color = "#FFFFFF"
-
-                [[testing_tools.scene.nodes]]
-                id = "same"
-                x = 20.0
-                y = 0.0
-                width = 10.0
-                height = 10.0
-                color = "#FFFFFF"
-            "##,
-            r##"
-                [testing_tools.scene]
-                enabled = true
-
-                [[testing_tools.scene.nodes]]
-                id = "broken"
-                x = 0.0
-                y = 0.0
-                width = 0.0
-                height = 10.0
-                color = "#FFFFFF"
-            "##,
-            r##"
-                [testing_tools.scene]
-                enabled = true
-
-                [[testing_tools.scene.nodes]]
-                id = "child"
-                parent = "missing"
-                x = 0.0
-                y = 0.0
-                width = 10.0
-                height = 10.0
-                color = "#FFFFFF"
-            "##,
-            r##"
-                [testing_tools.scene]
-                enabled = true
-
-                [[testing_tools.scene.nodes]]
-                id = "first"
-                parent = "second"
-                x = 0.0
-                y = 0.0
-                width = 10.0
-                height = 10.0
-                color = "#FFFFFF"
-
-                [[testing_tools.scene.nodes]]
-                id = "second"
-                parent = "first"
-                x = 20.0
-                y = 0.0
-                width = 10.0
-                height = 10.0
-                color = "#FFFFFF"
-            "##,
-            r##"
-                [testing_tools.scene]
-                enabled = true
-
-                [[testing_tools.scene.nodes]]
-                id = "root"
-                x = 0.0
-                y = 0.0
-                width = 10.0
-                height = 10.0
-                color = "#FFFFFF"
-
-                [[testing_tools.scene.nodes]]
-                id = "child"
-                parent = "root"
-                layer = "underlay"
-                x = 0.0
-                y = 0.0
-                width = 10.0
-                height = 10.0
-                color = "#FFFFFF"
-            "##,
         ] {
             assert!(parse_config(contents, Path::new("/tmp/chymeral-config")).is_err());
         }

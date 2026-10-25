@@ -35,67 +35,9 @@ opacity = 0.92
 # fit = "cover"
 # fit can also be "contain" or "stretch".
 
-# Optional visual startup splash. The image is centered above the terminal and
-# disappears automatically. Static PNG and JPEG images are supported.
-[appearance.startup_splash]
-enabled = false
-# image = "images/chymeral-splash.png"
-# duration_ms = 1500
-# opacity = 1.0
-
-[input.shortcuts]
+[diagnostics.shortcuts]
 # Internal diagnostic shortcuts. Each opens a modal view; Escape returns to the
 # terminal. Characters typed while a view is open are not sent to the shell.
 diagnostics_events = "Ctrl+Shift+E"
 diagnostics_ticks = "Ctrl+Shift+T"
 diagnostics_frames = "Ctrl+Shift+F"
-
-# Internal test tools. They are disabled by default. Nodes are drawn over the
-# terminal in logical pixels and participate in hit testing, focus, and
-# drag-and-drop.
-[testing_tools.scene]
-enabled = false
-
-# An underlay is drawn behind terminal text and every overlay.
-# [[testing_tools.scene.nodes]]
-# id = "underlay"
-# x = 24.0
-# y = 48.0
-# width = 280.0
-# height = 150.0
-# color = "#0EA5E9"
-# opacity = 0.55
-# layer = "underlay"
-
-# [[testing_tools.scene.nodes]]
-# id = "source"
-# x = 48.0
-# y = 72.0
-# width = 160.0
-# height = 96.0
-# color = "#F97316"
-# opacity = 0.85
-# z_index = 0
-# layer = "overlay" # Roots only: "underlay" or "overlay".
-# clip_children = true
-
-# [[testing_tools.scene.nodes]]
-# id = "target"
-# x = 288.0
-# y = 72.0
-# width = 160.0
-# height = 96.0
-# color = "#2563EB"
-# opacity = 0.85
-# z_index = 0
-
-# To test clipping, a child uses local coordinates relative to its parent.
-# [[testing_tools.scene.nodes]]
-# id = "clipped-child"
-# parent = "source"
-# x = 120.0
-# y = 24.0
-# width = 96.0
-# height = 48.0
-# color = "#A855F7"
-# opacity = 0.9

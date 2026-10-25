@@ -1,0 +1,234 @@
+{
+  "format": "chymeral-clp-fixture-corpus",
+  "fixture_version": 1,
+  "protocol": {
+    "major": 2,
+    "minor": 4
+  },
+  "transport": {
+    "length_prefix": "unsigned 32-bit big-endian payload length including the one-byte discriminator",
+    "json_discriminator": "J",
+    "binary_discriminator": "B",
+    "maximum_frame_bytes": 1048576
+  },
+  "vectors": [
+    {
+      "id": "atomic-scene-batch",
+      "description": "A v2.4 client constructs and updates a retained panel and text child through local aliases, removes a temporary node before commit, receives only surviving handles in one ordered result, then closes cleanly.",
+      "frames": [
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "hello",
+            "protocol": {
+              "major": 2,
+              "minor": 4
+            },
+            "token": "fixture-token-not-a-secret",
+            "capabilities": ["scene", "text", "scene_batch"]
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "init",
+            "protocol": {
+              "major": 2,
+              "minor": 4
+            },
+            "session_id": "session-1",
+            "capabilities": ["scene", "text", "scene_batch"],
+            "context": {
+              "arguments": ["--fixture-scene-batch"],
+              "initial_commands": []
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "init_complete"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "start",
+            "session_id": "session-1"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "started"
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "command",
+            "request_id": "fixture-scene-batch",
+            "command": {
+              "op": "scene_batch",
+              "operations": [
+                {
+                  "op": "create_node",
+                  "alias": "panel",
+                  "layer": "overlay",
+                  "node": {
+                    "kind": "rectangle",
+                    "properties": {
+                      "x": 8.0,
+                      "y": 12.0,
+                      "width": 240.0,
+                      "height": 120.0,
+                      "visible": true,
+                      "clip_children": false,
+                      "z_index": 3,
+                      "overlap_enabled": false,
+                      "external_drop_enabled": false,
+                      "input_passthrough": false
+                    },
+                    "color": [36, 88, 216, 255]
+                  }
+                },
+                {
+                  "op": "create_node",
+                  "alias": "label",
+                  "parent": {
+                    "alias": "panel"
+                  },
+                  "node": {
+                    "kind": "text",
+                    "properties": {
+                      "x": 16.0,
+                      "y": 24.0,
+                      "visible": true,
+                      "clip_children": false,
+                      "z_index": 0,
+                      "overlap_enabled": false,
+                      "external_drop_enabled": false,
+                      "input_passthrough": false
+                    },
+                    "text": "Ready",
+                    "style": {
+                      "weight": "normal",
+                      "align": "start"
+                    }
+                  }
+                },
+                {
+                  "op": "set_node",
+                  "node": {
+                    "alias": "panel"
+                  },
+                  "changes": {
+                    "properties": {
+                      "x": 20.0,
+                      "clip_children": true
+                    }
+                  }
+                },
+                {
+                  "op": "create_node",
+                  "alias": "temporary",
+                  "layer": "overlay",
+                  "node": {
+                    "kind": "empty",
+                    "properties": {
+                      "x": 0.0,
+                      "y": 0.0,
+                      "width": 1.0,
+                      "height": 1.0,
+                      "visible": false,
+                      "clip_children": false,
+                      "z_index": 0,
+                      "overlap_enabled": false,
+                      "external_drop_enabled": false,
+                      "input_passthrough": false
+                    }
+                  }
+                },
+                {
+                  "op": "remove_node",
+                  "node": {
+                    "alias": "temporary"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "result",
+            "request_id": "fixture-scene-batch",
+            "result": {
+              "kind": "scene_batch",
+              "nodes": {
+                "label": {
+                  "node": "node-2",
+                  "text_metrics": {
+                    "columns": 5,
+                    "rows": 1,
+                    "width": 48.0,
+                    "height": 20.0
+                  }
+                },
+                "panel": {
+                  "node": "node-1"
+                }
+              },
+              "operations": [
+                {
+                  "kind": "created",
+                  "alias": "panel"
+                },
+                {
+                  "kind": "created",
+                  "alias": "label"
+                },
+                {
+                  "kind": "updated"
+                },
+                {
+                  "kind": "created",
+                  "alias": "temporary"
+                },
+                {
+                  "kind": "removed"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "direction": "client_to_host",
+          "kind": "json",
+          "message": {
+            "type": "close"
+          }
+        },
+        {
+          "direction": "host_to_client",
+          "kind": "json",
+          "message": {
+            "type": "closed",
+            "session_id": "session-1",
+            "reason": {
+              "kind": "client_requested"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
