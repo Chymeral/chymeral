@@ -18,9 +18,10 @@ must be summarized into [Technical_Journal.md](Technical_Journal.md).
   `v1.7.0`, both SDKs `1.7.0`, and CLP `v2.4`. The released `main` line remains
   at Chymeral and SDK `1.5.0` over CLP `v2.1` until a separately approved M26
   release is prepared.
-- M26.1 is the active internal maintainability pass after M26. It preserves
-  the accepted Chymeral `1.7.0`, SDK `1.7.0`, and CLP `v2.4` behavior while
-  improving source navigation, module boundaries, and rationale documentation.
+- M26.1 is complete as the internal maintainability pass after M26. It
+  preserves the accepted Chymeral `1.7.0`, SDK `1.7.0`, and CLP `v2.4`
+  behavior while improving source navigation, module boundaries, and rationale
+  documentation.
 - No phase below has started unless its status explicitly says otherwise.
 
 ### M25 release record
@@ -1661,10 +1662,11 @@ robustness and conformance work.
 
 ## M26.1 — Internal Maintainability Structure
 
-**Status:** In progress; internal-only, no protocol or public API change
+**Status:** Complete; internal-only, no protocol or public API change
 
-**Progress:** Baseline validation and the first core/SDK source extractions are
-complete. The remaining work continues through small mechanical moves only.
+**Progress:** The target source map, rationale comments, fixture verification,
+and Linux/Windows validation gates are complete. No observable behavior,
+protocol form, public SDK export, or release version changed.
 
 ### Purpose
 

@@ -265,6 +265,31 @@ passed on the Linux host and Windows VM: clicking anywhere within its covered
 panel focused the session, its status update completed, and `q` closed only the
 CLP session.
 
+## M26.1 internal maintainability structure
+
+M26.1 is an internal-only follow-up to M26 on `current-dev`; it changes no CLP
+v2.4 frame, capability, limit, public SDK export, or release version. The
+core now keeps `transport.rs` as the host-facing facade while `framing`,
+`notifications`, and `server` isolate local framing, bounded delivery, and
+listener/session lifecycle respectively. `program_scene.rs` similarly retains
+state layout and re-exports while `model`, `resources`, `batch`, and
+`execution` separate contract types, ownership and quotas, transactional
+rollback, and ordered command/presentation work.
+
+The Rust SDK keeps its crate root as the documented public surface while its
+client, wire schema, framing, and private tests are separately navigable. The
+Node SDK likewise retains `index.ts` as its only package entry point while
+client orchestration, codec, validation, transport, and batch construction are
+isolated internally. Private test access uses parent-private visibility only;
+these source paths are not new supported imports.
+
+The three vendored v2.0, v2.1, and v2.4 fixture corpora remain byte-identical
+with matching SHA-256 manifests. Formatting, test, warnings-denied lint,
+documentation, package/build, and core Linux/Windows release gates passed
+after the extraction. The structure is deliberately considered complete here:
+further splitting of `main.rs`, wire schemas, or renderer lifecycle would add
+coupling rather than improve ordinary maintenance navigation.
+
 ## Intentional boundaries
 
 The following are deferred, not accidental omissions:
