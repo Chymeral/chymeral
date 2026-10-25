@@ -74,6 +74,11 @@ host continues to accept v2.0 and v2.1 clients without granting later
 capabilities. See the v2.4 sections in the [Main Manual](Main_Manual.md) and
 the [v2.4 fixture corpus](protocol/fixtures/v2.4/README.md).
 
+This development line also keeps configuration intentionally narrow: terminal
+appearance, explicit scene-text font aliases, and diagnostic shortcuts. It is
+not an application-scene or startup-scripting format; the former testing-scene
+and startup-splash sections have been retired without compatibility aliases.
+
 ## Downloads
 
 The quickest way to use Chymeral is a portable edition from the

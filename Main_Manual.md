@@ -109,6 +109,11 @@ compatibility aliases: the retired `[input.shortcuts]`,
 rejected. Every relative path is resolved from the directory containing
 `chymeral.toml`.
 
+The supported configuration surface is deliberately limited to
+`[terminal.font]`, `[terminal.foreground]`, `[terminal.background]`, optional
+`[scene_text.fonts.<alias>]`, and `[diagnostics.shortcuts]`. It does not
+describe, launch, or prebuild application scenes.
+
 To update an older file, remove the splash and testing-scene sections, then
 rename `[input.shortcuts]` to `[diagnostics.shortcuts]` without changing its
 three shortcut keys.
@@ -185,11 +190,12 @@ modifier.
 ## 5. CLP sessions
 
 **CLP** means *Chymeral Link Protocol*. It is a versioned, language-neutral
-contract between a Chymeral window and an application process. The released
-contract is **CLP v2.4**, including presentation, application-window-metadata,
-and atomic-scene-batch extensions. A v2.4 host accepts v2.0 and v2.1 clients
-without granting later capabilities. No supported version accepts CLP v1.x
-clients or provides command aliases for their prior vocabulary.
+contract between a Chymeral window and an application process. The
+`current-dev` contract is **CLP v2.4**, including presentation,
+application-window-metadata, and atomic-scene-batch extensions. A v2.4 host
+accepts v2.0 and v2.1 clients without granting later capabilities. No supported
+version accepts CLP v1.x clients or provides command aliases for their prior
+vocabulary.
 
 When Chymeral starts its shell, the shell and its descendants inherit two
 private variables:
@@ -775,7 +781,7 @@ For CLP behavior, start Chymeral, open its terminal, then run a conformance
 client from an SDK repository. For Rust:
 
 ```text
-cargo run --locked --example clp_conformance
+cargo run --locked --release --example clp_conformance
 ```
 
 For the CLP v2.1 presentation path, launch Chymeral with
@@ -832,8 +838,9 @@ Each conformance client must return successfully to the same terminal without
 closing the surrounding Chymeral terminal.
 
 To validate alpha image contact and node passthrough interactively, run the
-Rust client with `cargo run --locked --example clp_conformance -- --manual` or
-the Node client with `npm run example:conformance -- --manual`. The manual
+Rust client with
+`cargo run --locked --release --example clp_conformance -- --manual` or the
+Node client with `npm run example:conformance -- --manual`. The manual
 scenario shows a blue target, an orange alpha-frame image, a pink GIF tile that
 alternates between opaque and transparent, and a visible white band with
 `input_passthrough`. The terminal identifies each directed scene event and the
@@ -841,7 +848,9 @@ GIF's overlap transitions: the orange rim must target the image; its transparent
 center and the white band must target the blue node; the pink tile must target
 only while visible. Where `external_drop` is granted, dropping a desktop file
 on those regions follows the same routing. Click a scene node and press `q` to
-close only the client session.
+close only the client session. Both conformance clients print the CLP version
+actually negotiated with the host rather than inferring it from the feature
+being tested.
 
 ## 11. Boundaries and next steps
 
