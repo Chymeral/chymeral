@@ -1,10 +1,10 @@
 //! Session-owned retained-scene state for CLP applications.
 //!
-//! This module translates language-neutral CLP scene commands into the
-//! renderer's scene graph while preserving opaque ownership boundaries,
-//! resource quotas, and interaction state. Its public types are host-internal
-//! representations used by the transport and executable rather than a stable
-//! Rust application API.
+//! This facade owns retained-scene state layout and re-exports its host-internal
+//! model. Private sibling modules translate language-neutral CLP scene commands
+//! into the renderer's scene graph while preserving opaque ownership boundaries,
+//! resource quotas, and interaction state. The types here are used by the
+//! transport and executable rather than a stable Rust application API.
 //!
 //! Scene batches are the transactional boundary: structural node mutations
 //! either commit together or restore their captured scene state. Image upload,

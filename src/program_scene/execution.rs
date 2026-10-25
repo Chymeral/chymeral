@@ -2,7 +2,7 @@
 //!
 //! This module owns the command-facing mutation path. Ownership lookups,
 //! quota accounting, overlap reconciliation, and resource cleanup stay in
-//! the parent facade so every command continues to use one retained state.
+//! the sibling `resources` module so every command uses one retained state.
 
 use super::*;
 

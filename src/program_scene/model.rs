@@ -1,8 +1,8 @@
 //! Public retained-scene handles, commands, patches, and error model.
 //!
 //! These types describe the host-internal scene contract consumed by the CLP
-//! transport and renderer. Resource ownership and command execution remain in
-//! the parent module so this file stays free of retained-state mutation.
+//! transport and renderer. Resource ownership and command execution live in
+//! sibling modules so this file stays free of retained-state mutation.
 
 use std::{
     collections::BTreeMap,
