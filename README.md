@@ -60,21 +60,19 @@ not become a host-loaded plugin.
   [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) for
   Node.js and TypeScript applications.
 
-## Development target: Chymeral 1.7.0
+## Current release: Chymeral 1.7.0
 
-The `current-dev` branch prepares Chymeral `1.7.0` with **CLP `v2.4`**. It
-retains the opt-in
-`presentation` capability for bounded transient geometry at the renderer frame
-boundary, plus session-owned `window_metadata` for native application titles
-and bounded static icons. The new `scene_batch` capability applies a bounded
-create/update/remove revision as one retained-scene state and requests one
-redraw; it does not promise display scanout timing. All three capabilities
-leave the acknowledged incremental `set_node` control plane intact. A v2.4
-host continues to accept v2.0 and v2.1 clients without granting later
-capabilities. See the v2.4 sections in the [Main Manual](Main_Manual.md) and
-the [v2.4 fixture corpus](protocol/fixtures/v2.4/README.md).
+Chymeral `1.7.0` implements **CLP `v2.4`**. Its accumulated runtime includes
+bounded frame-paced `presentation`, session-owned `window_metadata` for native
+titles and static icons, and reliable atomic `scene_batch` revisions alongside
+the acknowledged incremental `set_node` control plane. A scene batch applies a
+bounded create/update/remove revision as one retained-scene state and requests
+one redraw; it does not promise display scanout timing. The host accepts
+compatible earlier clients but grants only the capabilities they negotiate. See
+the v2.4 sections in the [Main Manual](Main_Manual.md) and the
+[v2.4 fixture corpus](protocol/fixtures/v2.4/README.md).
 
-This development line also keeps configuration intentionally narrow: terminal
+This release keeps configuration intentionally narrow: terminal
 appearance, explicit scene-text font aliases, and diagnostic shortcuts. It is
 not an application-scene or startup-scripting format; the former testing-scene
 and startup-splash sections have been retired without compatibility aliases.
@@ -132,12 +130,8 @@ may be relative to the configuration file.
 - [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) — the
   separate Node.js and TypeScript client, published on
   [npm](https://www.npmjs.com/package/@chymeral/node-sdk).
-- [CLP v2.0 fixture corpus](protocol/fixtures/v2.0/README.md) — portable,
-  language-neutral framed-message vectors for SDK conformance work.
-- [CLP v2.1 fixture corpus](protocol/fixtures/v2.1/README.md) — versioned
-  conformance vectors for frame presentation and application window metadata.
 - [CLP v2.4 fixture corpus](protocol/fixtures/v2.4/README.md) — versioned
-  conformance vectors for reliable atomic scene batches.
+  conformance vectors for the current complete CLP contract.
 - [Contributing guide](CONTRIBUTING.md) — setup, checks, and protocol-change
   expectations for collaborators.
 - [Changelog](CHANGELOG.md) — released behavior and compatibility notes.
@@ -145,13 +139,13 @@ may be relative to the configuration file.
 
 ## Project state
 
-Chymeral `1.5.0` remains the current stable release on `main`. The
-`current-dev` branch prepares the independent `1.7.0` application and SDK
-lines over CLP v2.4. The application is distributed as a terminal program,
-CLP is the language-neutral contract, and each SDK is one client
-implementation. Linux and Windows manual acceptance has passed for the stable
-line, including native-Wayland title behavior and its documented dynamic-icon
-limitation. Portable editions are available from
+Chymeral `1.7.0` is the current stable release on `main`. The independently
+versioned official Rust and Node SDK releases are also at `1.7.0` and implement
+CLP v2.4. The application is distributed as a terminal program, CLP is the
+language-neutral contract, and each SDK is one client implementation. Linux
+and Windows manual acceptance has passed, including native-Wayland title
+behavior and its documented dynamic-icon limitation. Portable editions are
+available from
 [GitHub Releases](https://github.com/Chymeral/chymeral/releases/latest).
 
 ## License

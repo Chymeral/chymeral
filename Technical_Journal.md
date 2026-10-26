@@ -3,7 +3,9 @@
 This document preserves the technical record that previously lived in the
 project README. It is a development journal and architectural reference, not
 the product introduction. Use the [Main Manual](Main_Manual.md) for current
-operation and public behavior.
+operation and public behavior. The current public baseline is Chymeral `1.7.0`
+with CLP v2.4; numbered milestone and release references below are historical
+records, not current guidance.
 
 ## Product decisions retained
 
@@ -59,15 +61,11 @@ terminal uses a PTY and a dedicated ANSI/VT state and grid.
 
 CLP began as an internal lifecycle contract and became an actual local transport
 without exposing host memory, Rust types, graphics backend types, or a global
-socket. The released protocol is **v2.1**, which retains v2.0 compatibility and
-adds the opt-in `presentation` capability. The `current-dev` line implements
-**v2.4**: v2.0 has seven opt-in capabilities (`scene`, `images`, `input`,
-`timing`, `overlap`, `external_drop`, and `text`); v2.1 adds `presentation` for
-bounded transient geometry and `window_metadata` for session-owned native
-titles plus bounded static icons; v2.4 adds `scene_batch` for reliable atomic
-structural revisions. M19 deliberately removed the v1.x and provisional v1.4
-wire vocabularies before public SDK stability; the host provides no
-compatibility aliases.
+socket. The current released contract is **v2.4**. It accumulates the opt-in
+`scene`, `images`, `input`, `timing`, `overlap`, `external_drop`, `text`,
+`presentation`, `window_metadata`, and `scene_batch` capabilities. The latter
+provides reliable atomic structural revisions; the host provides no legacy
+command aliases.
 
 The negotiated lifecycle is deliberately strict:
 
@@ -228,8 +226,8 @@ out of scope until M27.
 
 ## M26 batched scene construction
 
-M26 is implemented on `current-dev` as the additive CLP v2.4 `scene_batch`
-capability. Its reliable command carries one through 512 ordered structural
+M26 adds the CLP v2.4 `scene_batch` capability. Its reliable command carries
+one through 512 ordered structural
 operations and an entire JSON command envelope no larger than 512 KiB. Each
 `create_node` declares a unique local alias of at most 128 UTF-8 bytes without
 control characters; only a later operation may reference it. The vocabulary is
@@ -267,8 +265,8 @@ CLP session.
 
 ## M26.1 internal maintainability structure
 
-M26.1 is an internal-only follow-up to M26 on `current-dev`; it changes no CLP
-v2.4 frame, capability, limit, public SDK export, or release version. The
+M26.1 is an internal-only follow-up to M26; it changes no CLP v2.4 frame,
+capability, limit, public SDK export, or release version. The
 core now keeps `transport.rs` as the host-facing facade while `framing`,
 `notifications`, and `server` isolate local framing, bounded delivery, and
 listener/session lifecycle respectively. `program_scene.rs` similarly retains

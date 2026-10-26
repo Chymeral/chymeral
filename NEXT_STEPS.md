@@ -1,23 +1,22 @@
 # Chymeral Next Steps
 
 This is the working execution record for the milestones that follow M14. It is
-not the public product manual and it is not a historical record yet. Once a
-milestone is accepted, its confirmed technical decisions and validation evidence
-must be summarized into [Technical_Journal.md](Technical_Journal.md).
+not the public product manual. The current public baseline is Chymeral `1.7.0`
+with CLP v2.4; earlier milestone sections are retained as planning and
+acceptance context, not as current product guidance. Confirmed technical
+decisions and validation evidence are summarized into
+[Technical_Journal.md](Technical_Journal.md).
 
 ## Current baseline
 
-- M1–M26 are complete; M25 is released after Linux and Windows acceptance.
-- CLP v2.1 is frozen for the `1.5.0` release line. A v2.1 host continues to
-  accept v2.0 clients without its additional capabilities.
-- `chymeral-rust-sdk` `1.5.0` and `@chymeral/node-sdk` `1.5.0` are the
-  accepted release lines for the public CLP v2.1 APIs. Later protocol and SDK
-  publications belong to their respective feature milestones.
-- M26 is accepted on `current-dev`. Its batching capability extends CLP and
-  both supported SDKs; the unpublished development target is Chymeral
-  `v1.7.0`, both SDKs `1.7.0`, and CLP `v2.4`. The released `main` line remains
-  at Chymeral and SDK `1.5.0` over CLP `v2.1` until a separately approved M26
-  release is prepared.
+- M1–M26 are complete. Chymeral `1.7.0`, `chymeral-rust-sdk` `1.7.0`, and
+  `@chymeral/node-sdk` `1.7.0` are released after Linux and Windows acceptance.
+- CLP v2.4 is the current public contract. It combines retained scenes,
+  images, text, input, timing, overlap, external drops, frame presentation,
+  window metadata, and reliable atomic `scene_batch` revisions under one
+  capability-negotiated model.
+- M26 is accepted and released on `main`; this record tracks subsequent work
+  from the released `1.7.0` baseline.
 - M26.1 is complete as the internal maintainability pass after M26. It
   preserves the accepted Chymeral `1.7.0`, SDK `1.7.0`, and CLP `v2.4`
   behavior while improving source navigation, module boundaries, and rationale
@@ -1551,7 +1550,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 
 ## M26 — Batched Scene Construction and Atomic First Presentation
 
-**Status:** Complete (validated 2026-10-24 on `current-dev`; unreleased)
+**Status:** Complete (validated 2026-10-24; released 2026-10-25 as `1.7.0`)
 
 ### Scope
 
@@ -1905,8 +1904,8 @@ the terminal or to a CLP client.
 
 - No CLP frame, capability, error, scene, rendering, terminal, or SDK API
   changes belong to this cleanup.
-- Chymeral remains at the unpublished `1.7.0` development target; both SDKs
-  remain at `1.7.0`, and CLP remains `v2.4`.
+- This cleanup preserves the released Chymeral and SDK `1.7.0` lines and CLP
+  `v2.4` without changing their public contract.
 - No SDK checkout, fixture corpus, package publication, portable distribution,
   or Foregit change is required.
 
@@ -1931,8 +1930,8 @@ the terminal or to a CLP client.
   all-target release build. The core suites reported 171 library tests, 59
   binary tests, and the inherited CLP lifecycle integration test on both
   targets.
-- The template, main manual, README, and unreleased changelog now describe the
-  smaller configuration surface and the intentionally breaking section rename.
+- The template, main manual, README, and release changelog describe the smaller
+  configuration surface and the intentionally breaking section rename.
 
 ## M27 — Stable Wayland Capability Upgrade
 
