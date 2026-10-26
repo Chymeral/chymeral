@@ -1,8 +1,9 @@
-# CLP v2.1 fixture corpus
+# Archived CLP v2.1 fixture corpus
 
-`fixtures.json` is the portable, machine-readable regression corpus for the
-CLP v2.1 extension. It supplements, but never rewrites, the frozen
-[v2.0 corpus](../v2.0/README.md).
+`fixtures.json` is an archived, machine-readable compatibility-regression
+corpus. The active public conformance reference is the
+[CLP v2.4 fixture corpus](../v2.4/README.md). This retained snapshot
+supplements, but never rewrites, the frozen [v2.0 corpus](../v2.0/README.md).
 
 The normative contract remains the core repository's
 [`Main_Manual.md`](../../../Main_Manual.md). This corpus is not an IDL, schema
@@ -69,8 +70,6 @@ presentation IDs in this corpus are application supplied and must remain exact.
 4. Keep focused protocol tests and a live Chymeral conformance executable. The
    corpus complements both.
 
-Both official SDKs vendor this exact snapshot and test it independently. CLP
-v2.1 hosts still accept v2.0 clients; those clients simply cannot obtain the
-`presentation` or `window_metadata` capabilities and remain on the ordered
-command lane. This corpus is released with Chymeral `1.5.0` as the portable
-conformance reference for CLP v2.1.
+Both official SDKs vendor this exact snapshot and test it independently. This
+archived corpus remains for compatibility regression; the v2.4 corpus is the
+portable public conformance reference for the complete current contract.

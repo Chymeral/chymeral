@@ -50,9 +50,9 @@ validation and correlation rules.
 the structural transition as one retained-scene state and requests one redraw;
 it does not report physical scanout timing. If the capability is absent, an SDK
 must report that condition rather than silently replaying the batch as visible
-sequential commands. CLP v2.4 hosts continue to accept v2.0 and v2.1 clients;
-those clients cannot obtain `scene_batch` and retain their established command
-paths.
+sequential commands. CLP v2.4 hosts continue to accept compatible earlier
+clients; those clients cannot obtain `scene_batch` and retain their established
+command paths.
 
 ## Using it in an SDK
 
@@ -67,5 +67,5 @@ paths.
    corpus complements both.
 
 Both official SDKs vendor this exact snapshot and test it independently. This
-corpus is prepared for the Chymeral `1.7.0` release as the portable conformance
-reference for CLP v2.4.
+corpus is the portable conformance reference released with Chymeral `1.7.0` for
+CLP v2.4.
