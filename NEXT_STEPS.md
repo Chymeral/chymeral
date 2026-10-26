@@ -1,7 +1,7 @@
 # Chymeral Next Steps
 
 This is the working execution record for the milestones that follow M14. It is
-not the public product manual. The current public baseline is Chymeral `1.7.0`
+not the public product manual. The current public baseline is Chymeral `1.7.1`
 with CLP v2.4; earlier milestone sections are retained as planning and
 acceptance context, not as current product guidance. Confirmed technical
 decisions and validation evidence are summarized into
@@ -9,22 +9,22 @@ decisions and validation evidence are summarized into
 
 ## Current baseline
 
-- M1–M26 are complete. Chymeral `1.7.0`, `chymeral-rust-sdk` `1.7.0`, and
-  `@chymeral/node-sdk` `1.7.0` are released after Linux and Windows acceptance.
+- M1–M26 are complete. Chymeral `1.7.1`, `chymeral-rust-sdk` `1.7.1`, and
+  `@chymeral/node-sdk` `1.7.1` are released after Linux and Windows acceptance.
 - CLP v2.4 is the current public contract. It combines retained scenes,
   images, text, input, timing, overlap, external drops, frame presentation,
   window metadata, and reliable atomic `scene_batch` revisions under one
   capability-negotiated model.
 - M26 is accepted and released on `main`; this record tracks subsequent work
-  from the released `1.7.0` baseline.
+  from the released `1.7.1` baseline.
 - M26.1 is complete as the internal maintainability pass after M26. It
-  preserves the accepted Chymeral `1.7.0`, SDK `1.7.0`, and CLP `v2.4`
+  preserves the accepted Chymeral `1.7.1`, SDK `1.7.1`, and CLP `v2.4`
   behavior while improving source navigation, module boundaries, and rationale
   documentation.
 - M26.2 is complete as a focused configuration-surface cleanup. It removes
   the retired static-scene fixture and startup splash, renames diagnostic
-  shortcuts to their own top-level section, and keeps Chymeral `1.7.0`, both
-  SDKs `1.7.0`, and CLP `v2.4` unchanged.
+  shortcuts to their own top-level section, and keeps Chymeral `1.7.1`, both
+  SDKs `1.7.1`, and CLP `v2.4` unchanged.
 - No phase below has started unless its status explicitly says otherwise.
 
 ### M25 release record
@@ -1293,7 +1293,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
    prototype and trace show the required behavior. M25 releases the result as
    Chymeral and supported SDK `1.5.0` lines over CLP v2.1; CLP v2.0 clients
    remain on the reliable path unchanged. M26 is planned as the additive CLP
-   `v2.4` and coordinated `1.7.0` release, while M27 remains an independently
+   `v2.4` and coordinated `1.7.1` release, while M27 remains an independently
    gated platform milestone. Their coordinated SDK `2.0.0` publication is
    reserved for M28.
 
@@ -1550,7 +1550,7 @@ M20 must be complete and the v2.0 protocol contract must be stable.
 
 ## M26 — Batched Scene Construction and Atomic First Presentation
 
-**Status:** Complete (validated 2026-10-24; released 2026-10-25 as `1.7.0`)
+**Status:** Complete (validated 2026-10-24; released 2026-10-26 as `1.7.1`)
 
 ### Scope
 
@@ -1579,8 +1579,8 @@ robustness and conformance work.
 
 - M26 necessarily adds a negotiated CLP capability, wire fixtures, and public
   Rust and Node.js/TypeScript helpers. Once its implementation and validation
-  are accepted, publish Chymeral `v1.7.0`, `chymeral-rust-sdk` `1.7.0`, and
-  `@chymeral/node-sdk` `1.7.0` over CLP `v2.4`.
+  are accepted, publish Chymeral `v1.7.1`, `chymeral-rust-sdk` `1.7.1`, and
+  `@chymeral/node-sdk` `1.7.1` over CLP `v2.4`.
 - The capability is additive: a v2.4 host continues to accept v2.0 and v2.1
   clients. An application without the new capability retains the ordinary
   ordered sequential path only when it explicitly chooses it; SDKs do not
@@ -1904,7 +1904,7 @@ the terminal or to a CLP client.
 
 - No CLP frame, capability, error, scene, rendering, terminal, or SDK API
   changes belong to this cleanup.
-- This cleanup preserves the released Chymeral and SDK `1.7.0` lines and CLP
+- This cleanup preserves the released Chymeral and SDK `1.7.1` lines and CLP
   `v2.4` without changing their public contract.
 - No SDK checkout, fixture corpus, package publication, portable distribution,
   or Foregit change is required.
@@ -1961,7 +1961,7 @@ the terminal or to a CLP client.
 
 ### Release boundary
 
-- M27 follows M26 and does not implicitly revise the accepted M26 `1.7.0` /
+- M27 follows M26 and does not implicitly revise the accepted M26 `1.7.1` /
   CLP `v2.4` contract. Any later protocol or SDK version is decided only after
   the stable upstream API and real-desktop behavior are known.
 

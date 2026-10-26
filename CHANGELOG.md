@@ -4,12 +4,12 @@ All notable user-visible changes to Chymeral are recorded here. This project
 uses [Semantic Versioning](https://semver.org/) for the terminal application;
 the CLP protocol and language SDKs have independent version numbers.
 
-The current release is `1.7.0` with CLP v2.4. Earlier headings are retained as
+The current release is `1.7.1` with CLP v2.4. Earlier headings are retained as
 a chronological archive and do not describe the current public contract.
 
 ## [Unreleased]
 
-## [1.7.0] - 2026-10-25
+## [1.7.1] - 2026-10-26
 
 ### Added
 
@@ -39,7 +39,7 @@ a chronological archive and do not describe the current public contract.
 
 ### Compatibility
 
-- Chymeral `1.7.0` implements CLP v2.4 and continues to accept v2.0 and v2.1
+- Chymeral `1.7.1` implements CLP v2.4 and continues to accept v2.0 and v2.1
   clients without granting later negotiated capabilities.
 - The retired `[testing_tools.scene]`, `[appearance.startup_splash]`, and
   `[input.shortcuts]` configuration sections are deliberately rejected; no

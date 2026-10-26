@@ -67,5 +67,5 @@ command paths.
    corpus complements both.
 
 Both official SDKs vendor this exact snapshot and test it independently. This
-corpus is the portable conformance reference released with Chymeral `1.7.0` for
+corpus is the portable conformance reference released with Chymeral `1.7.1` for
 CLP v2.4.

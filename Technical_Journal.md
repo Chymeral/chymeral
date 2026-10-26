@@ -3,7 +3,7 @@
 This document preserves the technical record that previously lived in the
 project README. It is a development journal and architectural reference, not
 the product introduction. Use the [Main Manual](Main_Manual.md) for current
-operation and public behavior. The current public baseline is Chymeral `1.7.0`
+operation and public behavior. The current public baseline is Chymeral `1.7.1`
 with CLP v2.4; numbered milestone and release references below are historical
 records, not current guidance.
 
