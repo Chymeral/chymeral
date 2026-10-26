@@ -1,6 +1,6 @@
 # Chymeral Main Manual
 
-This manual describes the released Chymeral `1.7.0` and its complete CLP v2.4
+This manual describes the released Chymeral `1.7.1` and its complete CLP v2.4
 contract. The host accepts compatible earlier clients while granting only the
 capabilities each session negotiates. It is written for terminal users,
 application authors, and SDK implementers.
@@ -736,7 +736,7 @@ fn main() -> chymeral_rust_sdk::Result<()> {
 }
 ```
 
-The `1.7.0` SDK release exposes typed CLP v2.4 capabilities, session and
+The `1.7.1` SDK release exposes typed CLP v2.4 capabilities, session and
 opaque-handle types, nodes, `SceneBatch`, atomic node changes, unified images,
 subscriptions, notifications, close reasons, client errors, alpha image
 contact, generic node input passthrough, frame-paced presentation, and
@@ -849,8 +849,8 @@ conformance suite without changing the ordinary-program model at the center of
 Chymeral. An IDL remains deferred until it removes real duplication that the
 fixtures and independent SDKs cannot address.
 
-The current stable source baseline on `main` is Chymeral `1.7.0`, which
-implements CLP v2.4. The two supported SDKs also publish `1.7.0` releases;
+The current stable source baseline on `main` is Chymeral `1.7.1`, which
+implements CLP v2.4. The two supported SDKs also publish `1.7.1` releases;
 their package versions do not version the protocol or the terminal application.
 The host Rust crate exists to share implementation between the executable and
 its tests. It is not a supported application-development API: programs should

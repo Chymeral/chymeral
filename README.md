@@ -60,9 +60,9 @@ not become a host-loaded plugin.
   [Chymeral Node SDK](https://github.com/Chymeral/chymeral-node-sdk) for
   Node.js and TypeScript applications.
 
-## Current release: Chymeral 1.7.0
+## Current release: Chymeral 1.7.1
 
-Chymeral `1.7.0` implements **CLP `v2.4`**. Its accumulated runtime includes
+Chymeral `1.7.1` implements **CLP `v2.4`**. Its accumulated runtime includes
 bounded frame-paced `presentation`, session-owned `window_metadata` for native
 titles and static icons, and reliable atomic `scene_batch` revisions alongside
 the acknowledged incremental `set_node` control plane. A scene batch applies a
@@ -139,8 +139,8 @@ may be relative to the configuration file.
 
 ## Project state
 
-Chymeral `1.7.0` is the current stable release on `main`. The independently
-versioned official Rust and Node SDK releases are also at `1.7.0` and implement
+Chymeral `1.7.1` is the current stable release on `main`. The independently
+versioned official Rust and Node SDK releases are also at `1.7.1` and implement
 CLP v2.4. The application is distributed as a terminal program, CLP is the
 language-neutral contract, and each SDK is one client implementation. Linux
 and Windows manual acceptance has passed, including native-Wayland title
